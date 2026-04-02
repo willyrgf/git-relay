@@ -1,4 +1,4 @@
-# RFC: Git Relay — Git-First Edge Relay with Tarball Compatibility for Nix Fetchers
+# RFC: Git Relay — Git-First Edge Relay with Explicit Nix Input Migration
 
 **Status:** Draft  
 **Date:** 2026-04-02  
@@ -6,22 +6,25 @@
 
 ## 1. Summary
 
-This RFC proposes **Git Relay**, a Git-first edge service that becomes the standard local or nearby endpoint for source retrieval and source publication.
+This RFC proposes **Git Relay**, a Git-first edge service that becomes the standard local or nearby endpoint for Git source retrieval and source publication.
 
-Git Relay has two primary responsibilities:
+Git Relay has three core responsibilities:
 
 1. **Git relay and cache** for native Git transports (`ssh`, `http`, `https` via smart HTTP).
-2. **Tarball compatibility** for source fetchers that refer to Git-hosted repositories but do not use Git on the wire, especially Nix flake fetchers such as `github:`, `gitlab:`, and `sourcehut:`.
+2. **Single-endpoint push acceptance** for repositories that should accept writes through the relay and replicate them upstream asynchronously.
+3. **Explicit Nix input migration tooling** for direct flake inputs that currently use shorthand archive fetchers such as `github:`, `gitlab:`, and `sourcehut:`.
 
-The service is designed to be as transparent as possible after one-time bootstrap. Users keep using normal Git remotes and normal Nix commands. The relay centralizes:
+The key architectural decision in this RFC is:
 
-- read-through caching,
-- offline reuse of previously seen source content,
-- single-endpoint push acceptance,
-- asynchronous replication to upstream Git remotes,
-- and compatibility coverage for tarball-based forge fetchers.
+> **Git Relay is a Git-only foundation. It does not include a tarball compatibility plane in the foundational architecture or MVP.**
 
-The recommended architecture is **Git-first**, not Nix-first and not generic network interception. Git remains the core protocol boundary and the authoritative model for repositories. A small tarball compatibility module exists only to cover fetchers that never become Git traffic.
+Instead of trying to transparently intercept existing shorthand tarball fetches, Git Relay treats Nix compatibility as a migration problem:
+
+- machine bootstrap installs Git URL rewrite rules,
+- repository migration rewrites direct flake inputs to Git URLs,
+- and lock files are re-generated under the new transport semantics.
+
+This keeps the product Git-first, preserves a single protocol boundary, and avoids making archive compatibility a foundational requirement before it is proven necessary.
 
 ## 2. Problem Statement
 
@@ -66,7 +69,14 @@ That spreads infrastructure policy into every client and every repository clone.
 
 ### 2.5 The Git/Nix mismatch
 
-Some source consumers use real Git transports, while others use tarball-based fetchers for repositories hosted on Git forges. This means a pure Git relay does not fully cover all source access patterns.
+Some source consumers use real Git transports, while others use shorthand fetchers for Git-hosted repositories that resolve to archive downloads rather than Git protocol traffic.
+
+For Git Relay, this mismatch splits into two different problems:
+
+1. **Direct inputs owned by the adopting repository**, which can be migrated deliberately to Git URLs.
+2. **Transitive third-party inputs**, which may still use shorthand fetchers outside the adopting repository’s direct control.
+
+This RFC addresses the first problem directly and treats the second as a bounded MVP gap rather than as a reason to build a second data plane immediately.
 
 ## 3. Background and Constraints
 
@@ -82,41 +92,56 @@ Git already ships restricted SSH command support via `git-shell`, smart HTTP ser
 
 Git supports `url.<base>.insteadOf` and `url.<base>.pushInsteadOf`, which makes it possible to route normal-looking remote URLs through a relay without retraining users.
 
-### 3.4 Nix forge shorthands are not always Git on the wire
+### 3.4 Nix supports direct Git-based flake inputs
 
-Nix flake references such as `github:`, `gitlab:`, and `sourcehut:` refer to Git-hosted repositories, but the fetchers are documented as tarball-based for those shorthand forms. Their locked form records exact source-tree fetch information, including `narHash`.
+Nix flake inputs can use Git transports directly, including `git+ssh://` and `git+https://`. When direct inputs are expressed this way, they become visible to Git Relay through normal Git transport interception.
 
-### 3.5 Therefore, full coverage requires two planes
+### 3.5 Migration can change lock semantics and `narHash`
 
-A pure Git transport relay covers all real Git URLs, but it does not see tarball-based forge fetchers. To provide full source transparency, the system must add a narrow compatibility layer for tarball fetchers while keeping Git as the main product boundary.
+Migrating a direct flake input from a shorthand archive fetcher to a Git fetcher changes the transport semantics used to materialize the source tree. The resulting locked metadata, including `narHash`, may change and must be regenerated rather than preserved by assumption.
+
+### 3.6 Direct-input migration and transitive shorthand coverage are different requirements
+
+If Git Relay is allowed to modify `flake.nix` and `flake.lock`, then direct-input coverage does not require a tarball plane.
+
+Transitive third-party shorthand inputs remain a separate problem. They can sometimes be reduced with `follows` or explicit overrides, but they are not guaranteed to disappear entirely in MVP.
+
+### 3.7 The foundational architecture should optimize for one protocol boundary
+
+The highest-risk part of this product is correctness at the Git boundary: clone, fetch, push, authorization, and crash-safe replication. The RFC should optimize for getting that boundary correct first.
 
 ## 4. Goals
 
-1. Provide a single standard local or nearby endpoint for source access.
+1. Provide a single standard local or nearby endpoint for Git source access.
 2. Preserve normal Git semantics for clone, fetch, and push.
-3. Make repeated source access local after the first successful fetch.
-4. Improve offline and degraded-network behavior for already-seen source content.
+3. Make repeated Git source access local after the first successful fetch.
+4. Improve offline and degraded-network behavior for already-seen Git content.
 5. Centralize push replication behind a single client-facing endpoint.
-6. Keep the product Git-first while still covering tarball-only forge fetchers used by Nix.
-7. Require only one-time bootstrap, after which the relay is mostly invisible.
+6. Provide explicit migration tooling for direct Nix flake inputs that should route through the relay.
+7. Keep bootstrap and migration understandable, explicit, and reviewable.
 
 ## 5. Non-Goals
 
 1. Reimplement Git protocol semantics in a custom server.
-2. Replace Git with a Nix-specific source protocol.
-3. Perform broad, generic TLS interception for all outbound traffic by default.
-4. Provide full multi-tenant enterprise authorization in the first version.
-5. Guarantee offline success for source content that has never been seen before.
-6. Cover Git LFS in the MVP.
-7. Build a distributed cluster in the MVP.
+2. Preserve unmodified `github:` / `gitlab:` / `sourcehut:` direct inputs in place.
+3. Guarantee interception of all transitive shorthand-based Nix fetches in MVP.
+4. Perform broad, generic TLS interception for all outbound traffic by default.
+5. Provide full multi-tenant enterprise authorization in the first version.
+6. Guarantee offline success for source content that has never been seen before.
+7. Cover Git LFS in the MVP.
+8. Build a distributed cluster in the MVP.
 
 ## 6. Proposed Solution
 
 The recommended solution is:
 
-> **A Git-first edge relay with a narrow tarball compatibility module.**
+> **A Git-first edge relay with explicit Nix input migration, not a two-plane Git-plus-tarball system.**
 
-The product has one control plane and two data planes.
+The product has:
+
+- one control plane,
+- one Git data plane,
+- and one repository migration workflow.
 
 ### 6.1 Control plane
 
@@ -126,6 +151,7 @@ A daemon responsible for:
 - repository policy,
 - metadata storage,
 - cache state,
+- push journaling,
 - replication jobs,
 - observability,
 - and administration.
@@ -140,43 +166,42 @@ A native Git server layer for real Git transports.
 - Local bare repositories as the authoritative on-disk representation.
 - Native `git-upload-pack` and `git-receive-pack` for serving and receiving.
 
-### 6.3 Tarball compatibility plane
+### 6.3 Repository migration workflow
 
-A small read-only HTTP service for source fetchers that name Git-hosted repositories but do not use Git on the wire.
+A CLI workflow responsible for migrating direct flake inputs that should route through the relay.
 
 Its responsibilities are:
 
-- identify supported forge fetcher requests,
-- resolve them to a logical repository and revision,
-- fetch or replay compatible archive content,
-- optionally hydrate the Git cache in the background,
-- and provide a relay-owned tarball surface for controlled environments.
+- identify direct shorthand-based flake inputs,
+- rewrite them to Git URLs according to policy,
+- update lock files under the new transport semantics,
+- surface a reviewable diff,
+- and refuse unsafe mutations by default, such as mutating a dirty worktree without explicit confirmation.
 
-This module exists because some consumers fetch source trees as tarballs while still conceptually referring to Git-hosted repositories.
+This workflow is explicit. It is not hidden behind silent install-time file mutation.
 
 ## 7. Recommended Architecture
 
 ### 7.1 Technology choices
 
-- **Language:** Go
+- **Implementation language:** intentionally deferred in this RFC
 - **SSH ingress:** OpenSSH
 - **Git server primitives:** system Git
 - **HTTP Git support:** `git-http-backend`
-- **Metadata and job state:** SQLite
+- **Metadata and push journal:** SQLite
 - **Object storage:** filesystem bare repositories
-- **Archive cache:** filesystem-backed content-addressed archive cache
 
-### 7.2 Why Go
+### 7.2 Why implementation language is deferred
 
-Go is a strong fit for the control plane:
+This RFC is deciding the product boundary and protocol architecture, not the final implementation language.
 
-- static binaries,
-- strong standard library for network daemons,
-- solid SQLite ecosystem,
-- simple operational model,
-- and good fit for filesystem and process orchestration.
+The foundational decision is to use:
 
-Go should orchestrate. System Git should perform Git operations.
+- system Git for Git correctness,
+- OpenSSH for SSH ingress,
+- and SQLite plus filesystem storage for local durability.
+
+Go and Rust are both viable implementation options for the control plane. Language selection should follow the stabilization of protocol, migration, and durability requirements rather than precede them.
 
 ### 7.3 Why not a pure Git reimplementation
 
@@ -188,6 +213,19 @@ The product’s hardest requirement is correctness at the Git boundary. The safe
 - hooks,
 - pack negotiation,
 - and repository maintenance.
+
+### 7.4 Why not include tarball compatibility in the foundational architecture
+
+Given the accepted product constraint that Git Relay may migrate `flake.nix` and `flake.lock`, a mandatory tarball plane is no longer the simplest path to product success.
+
+Adding archive compatibility now would:
+
+- add a second data plane,
+- add a second cache domain,
+- reintroduce compatibility questions around archive semantics,
+- and distract the foundational RFC from the Git boundary that actually needs to be proven first.
+
+Tarball compatibility may be revisited later if migrated direct inputs plus explicit transitive overrides are insufficient in practice.
 
 ## 8. Repository Model
 
@@ -213,34 +251,49 @@ Properties:
 - local bare repository is canonical for relay clients,
 - upstreams are replication targets,
 - relay enforces push policy before ref updates,
+- acknowledged pushes are durably journaled before success is returned,
 - and replication proceeds after local acceptance.
 
-This distinction is important because fetch-mirror semantics write upstream refs directly into local `refs/`, which is correct for mirrors but dangerous for write-accepting repositories.
+This distinction is important because cache-only refresh semantics and write-accepting repository semantics are not the same thing.
 
 ## 9. Identity Model
 
-The relay should normalize all inputs onto a logical repository identity such as:
+Git Relay should separate at least three identities.
+
+### 9.1 Repository identity
+
+A canonical logical repository identity such as:
 
 - `github.com/org/repo.git`
 - `gitlab.com/group/repo.git`
 - `git.example.com/team/repo.git`
 
-Transport-specific ingress is then mapped onto that identity.
+Repository identity:
 
-Examples:
+- excludes transport scheme,
+- excludes username,
+- normalizes optional `.git` suffix according to policy,
+- and maps multiple ingress forms onto one canonical path.
 
-- `git@github.com:org/repo.git`
-- `ssh://git@github.com/org/repo.git`
-- `https://github.com/org/repo.git`
-- tarball fetcher metadata for `github:org/repo`
+### 9.2 Source-tree identity
 
-All of these may refer to the same logical repository, but they do not necessarily share the same auth path.
+A source-tree identity consists of:
 
-## 10. Transparent Interception Model
+- repository identity,
+- resolved object identity such as commit SHA,
+- and optional subtree selection when relevant.
 
-### 10.1 Primary mechanism: Git URL rewriting
+This identity is what read caching and Nix migration ultimately care about.
 
-For real Git traffic, the relay should use Git’s native URL rewriting support.
+### 9.3 Upstream auth identity
+
+Different ingress paths may refer to the same repository while using different authentication mechanisms or credentials. Auth identity must therefore remain separate from repository identity.
+
+## 10. Transparent Interception and Migration Model
+
+### 10.1 Machine bootstrap: Git URL rewriting
+
+For real Git traffic, the relay uses Git’s native URL rewriting support.
 
 Example:
 
@@ -248,47 +301,77 @@ Example:
 [url "ssh://git@127.0.0.1:4222/ssh/github.com/"]
     insteadOf = git@github.com:
     insteadOf = ssh://git@github.com/
+    pushInsteadOf = git@github.com:
+    pushInsteadOf = ssh://git@github.com/
 
 [url "https://127.0.0.1:4318/https/github.com/"]
     insteadOf = https://github.com/
-
-[url "ssh://git@127.0.0.1:4222/ssh/github.com/"]
-    pushInsteadOf = git@github.com:
-    pushInsteadOf = ssh://git@github.com/
 ```
 
-This makes the relay effectively invisible for Git users after bootstrap.
+This is machine bootstrap. It is written to user or system Git configuration and makes Git Relay effectively invisible for Git traffic after setup.
 
-### 10.2 Secondary mechanism: scoped archive compatibility
+### 10.2 Repository migration: direct flake input rewriting
 
-For tarball-only fetchers, the relay cannot rely on Git URL rewriting because no Git session is created. The compatibility plane must therefore provide one of the following:
+Direct flake inputs that currently use shorthand archive-based references are migrated explicitly to Git URLs.
 
-1. explicit relay-owned archive URLs for controlled environments, or
-2. a narrowly scoped archive interception mode for the specific forge archive paths that the system needs to cover.
+Example:
 
-Generic network interception is not the main mechanism and should remain opt-in.
+```nix
+# Before
+inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+# After
+inputs.nixpkgs.url = "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
+```
+
+Alternative policy:
+
+```nix
+inputs.my-private-repo.url = "git+ssh://git@github.com/my-org/my-private-repo?ref=main";
+```
+
+The migration target is policy-driven:
+
+- `git+https://` is a strong default for public repositories and CI portability,
+- `git+ssh://` remains appropriate when SSH-based auth or developer parity is the stronger requirement.
+
+### 10.3 Transitive shorthand behavior
+
+MVP guarantees relay coverage for:
+
+- Git operations,
+- and direct flake inputs that have been migrated to Git URLs.
+
+MVP does not guarantee full coverage for transitive third-party shorthand inputs embedded in downstream flakes. Those cases may be reduced with:
+
+- `follows`,
+- direct overrides,
+- or explicit project policy.
+
+They are not solved by the foundational architecture.
 
 ## 11. Read Path
 
 ### 11.1 Git clone/fetch over SSH or smart HTTP
 
 1. Client connects to relay.
-2. Relay parses requested service and logical repository.
-3. Relay resolves policy.
+2. Relay parses requested service and repository identity.
+3. Relay resolves repository policy and freshness policy.
 4. Relay checks local repository state.
-5. If content is already present, serve locally.
-6. If content is missing and policy allows upstream access, fetch from upstream.
+5. If required objects are present and freshness policy allows, serve locally.
+6. If required objects are missing or freshness policy requires refresh, perform a singleflight upstream refresh when policy allows.
 7. Persist new objects locally.
 8. Serve response using native Git server-side commands.
 
-### 11.2 Tarball fetch path
+Freshness policy must be explicit per repository class. The relay must not advertise ref state blindly without a defined refresh rule.
 
-1. Client requests a supported archive representation.
-2. Compatibility plane resolves logical repository, revision, and source-tree identity.
-3. If archive or source tree is cached and valid, serve locally.
-4. Otherwise fetch from upstream archive endpoint or derive a compatible archive from the corresponding Git state when safe to do so.
-5. Store compatibility metadata and archive content.
-6. Optionally hydrate or refresh the Git cache for the same repository.
+### 11.2 Migrated Nix input fetch path
+
+1. Repository migration rewrites direct flake inputs to Git URLs.
+2. Nix resolves those inputs through Git transport.
+3. Git URL rewriting routes the traffic through the relay when local policy applies.
+4. The relay serves the fetch through the same Git read path described above.
+5. Locked metadata is derived from the Git fetch path and the post-migration lock state, not from the previous shorthand tarball semantics.
 
 ## 12. Write Path
 
@@ -305,14 +388,15 @@ Flow:
 2. Relay invokes native `git-receive-pack` against the local authoritative bare repository.
 3. Hooks validate ACLs, protected refs, and fast-forward rules.
 4. Local refs update if validation succeeds.
-5. Replication jobs are durably queued.
-6. Background workers push the accepted ref updates to configured upstream remotes.
+5. Relay persists a durable push journal entry that records the accepted ref changes and required replication work.
+6. Success is returned only after the push journal is durable.
+7. Background workers push the accepted ref updates to configured upstream remotes.
 
 ### 12.2 Acknowledgement policy
 
 The default policy should be **durable-local**:
 
-- success is returned after local acceptance and durable queueing of replication work.
+- success is returned after local acceptance and durable journaling of replication work.
 
 Optional future policies:
 
@@ -320,14 +404,14 @@ Optional future policies:
 - selected-upstreams-must-succeed,
 - branch-specific acknowledgement profiles.
 
-### 12.3 Why durable-local is preferred
+### 12.3 Durability requirements
 
-It best matches the product goals:
+The foundational contract is:
 
-- offline tolerance,
-- resilience to transient upstream failures,
-- simple client contract,
-- and cleaner operator recovery.
+- an **acknowledged** push must remain recoverable after relay restart or crash without requiring client retransmission,
+- an **unacknowledged** partial accept must be detectable and quarantined for reconciliation.
+
+The implementation may satisfy this with a journal-plus-recovery design, but the contract itself is mandatory.
 
 ## 13. Policy Enforcement
 
@@ -339,7 +423,9 @@ Use:
 
 - `pre-receive` for whole-push validation,
 - `update` for per-ref validation,
-- `post-receive` for enqueueing replication and notifications.
+- `post-receive` for non-critical notifications and worker wakeups.
+
+The durability contract must not depend solely on best-effort `post-receive` behavior.
 
 ### 13.2 Default repository protections
 
@@ -350,6 +436,12 @@ Recommended defaults:
 - enable object verification on receive,
 - restrict access to Git-only server-side commands,
 - and expose clear audit logs for ref updates.
+
+### 13.3 Authoritative divergence policy
+
+For authoritative repositories, direct upstream pushes should be treated as unsupported by default unless the repository is explicitly configured for shared-authority operation.
+
+If divergence is detected, the repository should enter a degraded state until repaired intentionally.
 
 ## 14. Authentication and Authorization
 
@@ -362,63 +454,68 @@ Use normal user-facing Git auth.
 
 ### 14.2 Relay to upstream
 
-Default to relay-owned machine credentials.
+Default to relay-owned machine credentials for read refreshes and background replication.
 
 Reasons:
 
 - background replication must work after the client disconnects,
 - retries and reconciliation need stable credentials,
-- and tarball fetch compatibility often requires host-scoped tokens.
+- and the relay must not depend on client credential presence after acceptance.
 
-### 14.3 Optional future mode
+### 14.3 Attribution and audit
 
-Per-user upstream delegation can be added later for environments that need upstream attribution, but it should not be the MVP default.
+Even when relay-owned machine credentials are used upstream, the relay must record:
 
-## 15. Tarball Compatibility Details
+- authenticated client identity,
+- repository identity,
+- accepted ref changes,
+- replication targets,
+- and replication outcomes.
+
+Per-user upstream delegation may be added later, but it is not the MVP default.
+
+## 15. Nix Migration Model
 
 ### 15.1 Why this exists
 
-Nix flake shorthand fetchers such as `github:` and `gitlab:` may refer to repositories conceptually, but those shorthand fetchers are archive-based rather than Git-transport based.
+Direct shorthand inputs that resolve to archive downloads cannot be intercepted through Git URL rewriting because they are not Git traffic.
 
-### 15.2 Required properties
+Given that project-owned source and lock files may be updated, the simplest solution is to migrate those direct inputs to Git transports explicitly.
 
-The compatibility module must preserve source-tree semantics expected by the consumer.
+### 15.2 Supported migration targets
 
-This means the module must key cache entries by properties such as:
+The migration tool should support:
 
-- provider,
-- host,
-- owner/group,
-- repo,
-- revision or ref,
-- subdirectory,
-- and integrity identity such as `narHash` when available.
+- `git+https://` targets,
+- `git+ssh://` targets,
+- policy selection by host or repository class,
+- and preservation of explicit branch or ref intent where representable.
 
-### 15.3 Two operating modes
+### 15.3 Migration contract
 
-#### A. Compatibility proxy mode
+Migration is an explicit command, not an implicit side effect.
 
-Use upstream-compatible archive requests and cache the results.
+The migration workflow should:
 
-Best for:
+1. inspect direct flake inputs,
+2. identify shorthand inputs covered by migration policy,
+3. rewrite them to Git URLs,
+4. re-lock the affected inputs,
+5. show a reviewable diff,
+6. and refuse unsafe mutation by default when the repository is dirty.
 
-- existing projects,
-- existing lock files,
-- minimal user-visible changes.
+The migration workflow must not assume that `narHash` or lock metadata remains stable across transport change.
 
-#### B. Relay-native tarball mode
+### 15.4 Direct versus transitive coverage
 
-Expose relay-owned tarball URLs and implement a stable, lockable tarball contract.
+The migration model guarantees coverage only for direct inputs owned by the repository being migrated.
 
-Best for:
+Transitive shorthand inputs may still bypass the relay unless:
 
-- controlled environments,
-- internal standardization,
-- future simplification.
+- the adopting repository overrides them directly,
+- or dependency relationships are tightened using mechanisms such as `follows`.
 
-### 15.4 Recommendation
-
-Ship **compatibility proxy mode** first, and keep relay-native tarball serving as a later optimization.
+That remaining gap is accepted in MVP.
 
 ## 16. Storage Model
 
@@ -433,32 +530,28 @@ Advantages:
 - clear isolation,
 - straightforward recovery.
 
-### 16.2 Metadata store
+### 16.2 Metadata and push journal
 
 SQLite tables should cover:
 
 - repository identity and ingress mappings,
 - repository mode,
 - upstream definitions,
-- replication queues,
-- cache pins and TTLs,
-- archive cache metadata,
+- refresh policy,
+- push journal entries,
+- replication jobs,
+- replication outcomes,
 - and audit events.
 
-### 16.3 Archive storage
-
-Store cached archives content-addressably and separately from Git object stores.
-
-### 16.4 Garbage collection
+### 16.3 Garbage collection and maintenance
 
 The relay needs explicit policies for:
 
-- retention,
-- pinning,
-- eviction,
-- repository maintenance,
-- archive expiry,
-- and failed replication clean-up.
+- Git maintenance scheduling,
+- retention and pinning,
+- cache eviction for cache-only repositories,
+- reflog and audit retention,
+- and failed replication cleanup.
 
 ## 17. Operations and Observability
 
@@ -467,10 +560,11 @@ The system should expose:
 - cache hits and misses,
 - upstream latency,
 - object growth,
-- archive cache growth,
 - replication lag,
-- failed ref replications,
-- per-repo health,
+- failed replications,
+- per-repo freshness state,
+- authoritative divergence state,
+- migration activity,
 - and authentication failures.
 
 A minimal operator interface should include:
@@ -482,17 +576,19 @@ A minimal operator interface should include:
 - `replication retry`,
 - `cache pin`,
 - `cache evict`,
-- `archive inspect`.
+- `migrate-flake-inputs`,
+- and `migration inspect`.
 
 ## 18. Security Considerations
 
 1. The relay becomes a high-value trust boundary.
 2. Client-facing SSH access must be restricted to Git-only commands.
 3. Upstream machine credentials must be isolated and auditable.
-4. Compatibility archive interception must be narrow in scope if enabled.
-5. Private source archives and public source archives should be segregated logically.
+4. Project migration commands must be explicit and reviewable.
+5. Private repositories and public repositories should be segregated logically in policy and credential scope.
 6. Object verification and ref protection should be on by default.
 7. Operator actions should be audited.
+8. The relay should assume that repository migration is a privileged operation over project source, not a transparent network convenience.
 
 ## 19. Failure Modes and Recovery
 
@@ -504,11 +600,21 @@ If a repository is already cached and the requested objects are present, serve f
 
 Do not roll back a locally accepted push. Queue retries, mark the repository degraded, and expose reconciliation tooling.
 
-### 19.3 Archive fetch failure
+### 19.3 Crash or partial accept before acknowledgement
 
-If a matching archive or validated source tree is cached, serve it. Otherwise fail clearly and preserve diagnostic state.
+If refs were updated locally but the push was not acknowledged durably, the relay must detect that condition on restart and quarantine the repository for reconciliation.
 
-### 19.4 Divergence
+The system must not silently treat an unacknowledged partial accept as a clean success.
+
+### 19.4 Repository migration failure
+
+If flake input migration fails partway through:
+
+- leave a clear diagnostic trail,
+- avoid silent lockfile corruption,
+- and provide a straightforward rollback path through normal version control.
+
+### 19.5 Divergence
 
 Authoritative repositories should include divergence detection and explicit repair commands.
 
@@ -518,7 +624,7 @@ The relay should have:
 
 - one global daemon configuration file,
 - one SQLite-backed metadata database,
-- and a CLI for repo and policy management.
+- and a CLI for repo, policy, and migration management.
 
 Example global configuration:
 
@@ -528,12 +634,6 @@ ssh_listen = "127.0.0.1:4222"
 http_listen = "127.0.0.1:4318"
 cache_root = "/var/lib/git-relay/git"
 
-[archive]
-mode = "compat-proxy"
-listen = "127.0.0.1:4320"
-cache_root = "/var/lib/git-relay/archive"
-providers = ["github", "gitlab", "sourcehut", "tarball"]
-
 [replication]
 default_push_ack = "durable-local"
 retry_backoff = "exponential"
@@ -541,6 +641,11 @@ retry_backoff = "exponential"
 [policy]
 default_repo_mode = "cache-only"
 default_refresh = "ttl:60s"
+
+[migration]
+default_public_transport = "git+https"
+default_private_transport = "git+ssh"
+refuse_dirty_worktree = true
 ```
 
 Example repository rules:
@@ -565,36 +670,38 @@ refresh = "ttl:60s"
 ### Included
 
 - Git over SSH
-- smart HTTP support
+- optional smart HTTP support
 - Git URL rewriting bootstrap helpers
 - cache-only repositories
 - authoritative repositories
-- local durable push acceptance
+- local durable push journaling
 - asynchronous replication
 - repository metadata in SQLite
-- archive compatibility module for GitHub/GitLab/SourceHut/tarball fetchers
+- Nix direct-input migration command
 - basic metrics, logs, and repair commands
 
 ### Excluded
 
+- tarball compatibility plane
 - Git LFS
 - distributed cluster mode
 - advanced multi-tenant auth
-- cross-repo object deduplication
 - generic full-traffic MITM as default behavior
+- guaranteed coverage for all transitive shorthand-based Nix fetches
 - full enterprise attribution of upstream writes
 
 ## 22. Alternatives Considered
 
-### 22.1 Pure Git-only relay
+### 22.1 Two-plane Git-plus-tarball architecture
 
-**Rejected as insufficient.**
+**Rejected for the foundational RFC and MVP.**
 
 Why:
 
-- correct for real Git traffic,
-- incorrect for archive-based forge fetchers,
-- fails the “works for tarball shorthand too” requirement.
+- no longer required for direct-input coverage once repository migration is allowed,
+- adds a second data plane and cache domain,
+- adds compatibility complexity before the Git boundary has been proven,
+- and weakens MVP discipline.
 
 ### 22.2 Generic interception as the primary mechanism
 
@@ -606,7 +713,7 @@ Why:
 - higher operational risk,
 - harder debugging,
 - unnecessary for real Git URLs,
-- and conceptually broader than the product needs.
+- and broader than the product needs.
 
 ### 22.3 Nix-first source cache with Git as a secondary feature
 
@@ -625,39 +732,43 @@ Why:
 - SSH ingress
 - cache-only Git repositories
 - explicit relay URLs
-- authoritative local accept for selected repositories
-- replication queue
+- repository identity and policy storage
 
 ### Phase 2
 
 - Git URL rewrite bootstrap
-- smart HTTP ingress
-- operator tooling and metrics
+- Nix direct-input migration tooling
+- lockfile relock workflow
 
 ### Phase 3
 
-- archive compatibility module for forge shorthand coverage
-- background Git hydration from archive activity
+- authoritative local accept for selected repositories
+- push journal
+- replication queue and repair tooling
 
 ### Phase 4
 
+- smart HTTP ingress
 - refined cache policies
-- optional relay-native tarball endpoints
-- advanced auth and policy features
+- stronger operator tooling and metrics
+
+### Phase 5
+
+- revisit tarball compatibility only if validation shows that transitive shorthand gaps materially block adoption
 
 ## 24. Open Questions
 
-1. Should authoritative repositories forbid direct upstream pushes operationally, or merely detect divergence?
-2. Which archive compatibility mode should be the default in workstation installs?
-3. How aggressive should automatic Git hydration be after archive-only fetches?
+1. What should be the default migration target for public repositories: `git+https://`, `git+ssh://`, or policy by host?
+2. How much automation should the migration tool provide for transitive overrides such as `follows`?
+3. Should authoritative repositories forbid direct upstream pushes operationally, or merely detect divergence?
 4. What retention defaults keep cache growth practical without undermining offline expectations?
 5. Should relay-owned upstream credentials be mandatory for authoritative repositories?
+6. Which deployment defaults should differ between workstation-first and nearby shared installs?
 
 ## 25. Recommendation
 
 Adopt the following product direction:
 
-> **Git Relay should be built as a Git-first cache and replication edge, with a narrowly scoped tarball compatibility sidecar for archive-based forge fetchers.**
+> **Git Relay should be built as a Git-first cache and replication edge, with explicit Nix direct-input migration and no tarball compatibility plane in the foundational architecture or MVP.**
 
-This preserves the cleanest protocol boundary, keeps Git as the authoritative model, gives users the transparency they want after one-time bootstrap, and still covers the Nix shorthand cases that a pure Git relay cannot see.
-
+This keeps the protocol boundary coherent, makes bootstrap and repository mutation explicit, allows direct Nix inputs to route through the relay using normal Git mechanisms, and keeps the MVP focused on the part of the system that must be correct first: the Git read/write boundary.
