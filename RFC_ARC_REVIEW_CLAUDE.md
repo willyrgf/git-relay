@@ -20,11 +20,12 @@ This review examines whether a single interception mechanism could replace the t
 
 Git Relay is strictly a workstation tool. CI environments (GitHub Actions, etc.) must work normally from the same repository without any relay-specific configuration. This means:
 
-- **No source-level changes.** `flake.nix`, `*.nix` files, and lock files must remain unchanged. The relay cannot require relay-specific URLs or inputs in committed code.
-- **Interception is environment-level only.** Git config (`insteadOf`), Nix registries, and environment variables are acceptable. Anything committed to the repo is not.
-- **The same `flake.lock` must work on both workstation (through relay) and CI (direct to forge).**
+- **No relay-specific URLs in source.** `flake.nix` must not reference `localhost`, relay ports, or relay-specific endpoints. Standard forge URLs (`git+ssh://git@github.com/...`) are acceptable because they work on both workstation and CI.
+- **Changing flake input types is acceptable.** Converting `github:` shorthand to `git+ssh://` or `git+https://` is a source-level change, but it uses standard Git URLs that work everywhere — on the workstation (routed through relay via `insteadOf`), on CI (direct to forge), and on any other machine. This is not a relay-specific change; it is a transport preference.
+- **Lock files will change when input types change.** Switching from `type: "github"` to `type: "git"` produces a different `narHash` (tarball extraction vs. Git checkout yield different source trees). This is a one-time re-lock cost per project, not an ongoing operational burden.
+- **Interception is environment-level.** Git config (`insteadOf`) is the sole interception mechanism. It is per-user, per-machine, and invisible to CI.
 
-This constraint shapes every architecture evaluated below and definitively rules out approaches that require modifying project files.
+This constraint shapes every architecture evaluated below. It rules out relay-specific URLs in committed code but accepts standard Git URL forms that happen to be interceptable by `insteadOf`.
 
 ### 1.2 Candidate architectures
 
@@ -59,41 +60,11 @@ Three candidate architectures are evaluated:
 
 ### 2.3 Addressing the weaknesses: unified storage model
 
-The weaknesses in Section 2.2 are not inherent to having two interception planes. They arise from having two **data models**. The fix is to keep two protocol frontends but unify the storage layer behind them.
+One approach to fixing these weaknesses is to keep two protocol frontends but unify the storage layer behind them — a shared identity index mapping `(forge, owner, repo, rev)` to both Git objects and cached archives.
 
-```
-┌──────────────┐     ┌──────────────┐
-│  Git plane   │     │ Tarball plane│
-│  (insteadOf) │     │ (Nix registry│
-│              │     │  redirect)   │
-└──────┬───────┘     └──────┬───────┘
-       │                    │
-       ▼                    ▼
-┌──────────────────────────────────┐
-│       Unified Relay Store        │
-│  ┌────────────┐ ┌─────────────┐  │
-│  │ bare Git   │ │ archive     │  │
-│  │ objects    │ │ cache       │  │
-│  └─────┬──────┘ └──────┬──────┘  │
-│        │               │         │
-│  ┌─────▼───────────────▼──────┐  │
-│  │   Identity + mapping index │  │
-│  │  (forge, owner, repo, rev) │  │
-│  └────────────────────────────┘  │
-└──────────────────────────────────┘
-```
+However, there is a simpler observation: **all four weaknesses disappear if the tarball plane is eliminated entirely.** If Nix inputs use `git+ssh://` instead of `github:`, there is only one plane, one cache, one identity resolution path, one bootstrap surface, and no hydration bridge. The weaknesses of Architecture A are not just fixable with a unified store — they are symptoms of a plane that may not need to exist.
 
-The design principles:
-
-1. **One identity index.** A single component maps `(forge, owner, repo, rev)` to both Git objects and cached archives. Both planes read from and write to the same index. No duplicated identity resolution logic.
-
-2. **Cross-plane warming is automatic, not optional.** When the tarball plane caches an archive for `(github.com, NixOS, nixpkgs, abc123)`, it records the mapping in the shared index. The Git plane can see that rev `abc123` is known. When the Git plane fetches a repo, it updates the shared index with all available refs, so the tarball plane knows which revs are locally resolvable.
-
-3. **The archive cache stores real upstream tarballs.** For `narHash` correctness (see Section 6.5), the relay must serve the actual upstream tarball, not a `git archive` derivative. The archive cache is a content-addressed blob store indexed by the shared identity layer. It is physically separate from the Git object store but logically part of the same unified model.
-
-4. **Hydration becomes index maintenance, not a separate mechanism.** There is no "hydration bridge" because both planes contribute to the same index. The cross-plane awareness that the original RFC treated as optional becomes an inherent property of the storage layer.
-
-This resolves weaknesses 1, 2, and 4 while keeping the two-plane architecture's strengths (independent failure domains, no TLS interception, native Git `insteadOf`).
+This observation motivates Architecture C (Section 4), which eliminates the tarball plane by changing the input convention rather than bridging two protocols.
 
 ## 3. Architecture B: Unified HTTP(S)/SSH Interception (Transparent Proxy)
 
@@ -178,116 +149,185 @@ One mechanism. One cache. One bootstrap. No tarballs.
 - Cache coherence is trivial because there is only one cache.
 - The relay is genuinely just a Git relay.
 
-### 4.3 Why This Does Not Fully Work
+### 4.3 Trade-offs
 
-1. **Existing lock files break.** A `flake.lock` that has `type: "github"` with a `narHash` computed from the GitHub tarball will fail verification when switched to `type: "git"`. The `narHash` will be different because Git checkout and tarball extraction produce different source trees. Every downstream project must re-lock.
+1. **Existing lock files must be re-locked.** A `flake.lock` with `type: "github"` and a `narHash` computed from the GitHub tarball will not match the Git checkout tree. Switching to `git+ssh://` requires a one-time `nix flake update` to re-lock all inputs. This is a migration cost, not an ongoing burden.
 
-2. **The `github:` shorthand is the dominant Nix convention.** Telling users not to use `github:` in favor of `git+ssh://` is a non-starter for adoption. It fights the ecosystem.
+2. **The `github:` shorthand is the dominant Nix convention.** Using `git+ssh://` is longer and less familiar. This is an ergonomic cost the user accepts in exchange for architectural simplicity — one transport, one interception mechanism, one cache.
 
-3. **Nix's Git fetcher is slower for large repos.** The `github:` tarball fetcher downloads a single archive. The Git fetcher must negotiate pack protocol, which for large repos like nixpkgs is significantly slower, even with shallow clones.
+3. **Nix's Git fetcher is slower for large repos.** The `github:` tarball fetcher downloads a single ~30MB archive for nixpkgs. The Git fetcher must negotiate pack protocol, which is significantly slower for the initial fetch. However, **with the relay caching Git objects locally**, subsequent fetches are fast incremental updates — the relay eliminates the performance disadvantage after the first fetch.
 
-4. **Some Nix features depend on tarball semantics.** `narHash` stability across evaluation environments is important for Nix's reproducibility guarantees. Changing the fetcher type changes the hash, which ripples through the entire dependency graph.
+4. **`narHash` changes are a one-time event.** The hash changes when the input type changes, but once re-locked, the `type: "git"` `narHash` is stable across all environments (workstation, CI, other machines) because Git checkout is deterministic. There is no ongoing hash instability.
 
-5. **Third-party flakes use `github:`.** Even if a user's own flakes use `git+ssh://`, their transitive dependencies use `github:`, and those lock files cannot be rewritten.
+5. **Transitive dependencies use `github:` in their own `flake.nix`.** This is the most significant remaining issue. When your flake depends on a third-party flake that uses `github:` inputs internally, those transitive inputs are locked with `type: "github"` and fetched as tarballs — bypassing the relay. Mitigations:
+   - Use `follows` to redirect transitive inputs through your own `git+ssh://` inputs where possible.
+   - Accept that some transitive fetches go direct to forges. The relay still covers all direct inputs and all plain Git operations.
+   - A future optional tarball compatibility plane could cover the remaining transitive cases if needed.
 
 ### 4.4 Verdict on Architecture C
 
-It is the purist's answer but it fails on two fronts:
+**This is the recommended architecture.** It trades ecosystem convention for architectural simplicity:
 
-1. **Incompatible with the workstation-only constraint (Section 1.1).** Rewriting `flake.nix` inputs from `github:` to `git+ssh://` is a source-level change. The same `flake.nix` must work unchanged on CI (no relay) and on a workstation (with relay). Architecture C requires modifying committed project files, which is ruled out.
+1. **Compatible with the workstation-only constraint (Section 1.1).** `git+ssh://git@github.com/...` is a standard Git URL that works everywhere — on the workstation (intercepted by `insteadOf`), on CI (direct to GitHub via SSH), and on any machine with Git and SSH keys. No relay-specific URLs are committed. The `flake.nix` is portable.
 
-2. **Incompatible with the existing Nix ecosystem.** It cannot be adopted incrementally and cannot be adopted for transitive dependencies whose `flake.nix` files are not under the user's control.
+2. **One mechanism, one cache, one bootstrap.** `insteadOf` in `~/.gitconfig` is the only interception needed. No tarball plane, no registry configuration, no separate archive cache. The relay is a pure Git relay.
 
-It would work for a greenfield, Nix-free, pure-Git environment, but then the tarball plane is unnecessary anyway.
+3. **The re-lock cost is acceptable.** Switching inputs from `github:` to `git+ssh://` requires one `nix flake update`. This is a migration step, not an ongoing tax.
+
+4. **The transitive dependency gap is real but bounded.** Third-party flakes that use `github:` internally still produce tarball-fetched transitive inputs. This can be mitigated with `follows` for key inputs, and the remaining gap is a candidate for a future optional tarball compatibility layer — not a blocker for the core architecture.
+
+5. **The performance concern is addressed by the relay itself.** The Git fetcher is slower than tarball for initial fetches of large repos, but with the relay caching Git objects locally, subsequent fetches are fast incremental updates. The relay turns the Git fetcher's weakness into a strength.
 
 ## 5. The Core Architectural Insight
 
-The two-mechanism approach is not a weakness. It is a reflection of a **genuine protocol boundary** in the ecosystem. Git traffic and tarball traffic are different protocols with different identity models, different integrity properties, and different client expectations. No amount of architectural cleverness makes `narHash` and Git SHA the same thing.
+The two-mechanism approach (Architecture A) reflects a genuine protocol boundary — Git and tarball are different wire protocols. But **the protocol boundary exists because of a Nix ecosystem convention (`github:` shorthand), not because of a fundamental technical constraint.** Nix fully supports `git+ssh://` and `git+https://` inputs. The tarball path is a convenience, not a necessity.
 
-The real question is not "can we unify the mechanism?" but rather "where should the complexity of bridging two identity models live?"
+The real question is: where should the complexity live?
 
-| Approach | Where the bridge complexity lives |
-|---|---|
-| A (RFC, as-is) | Explicit but optional: hydration step + per-plane identity resolution |
-| A (refined) | Implicit and structural: unified storage model with shared identity index |
-| B (MITM proxy) | Implicit in proxy routing, but still needs two cache stores for correctness |
-| C (Git-only) | Pushed onto users: re-lock everything, change conventions, modify source files |
+| Approach | Where the complexity lives | Ongoing cost |
+|---|---|---|
+| A (two planes) | Relay: two frontends, unified store, cross-plane coherence | Permanent architectural complexity |
+| B (MITM proxy) | Relay: TLS interception + two cache stores anyway | Permanent operational complexity |
+| C (Git-only) | User: one-time re-lock, `follows` for transitive deps | One-time migration cost |
 
-Architecture B does not eliminate the two-plane problem. It adds TLS interception complexity while still requiring two cache stores for `narHash` correctness. Architecture C is clean but violates the workstation-only constraint (Section 1.1) and is incompatible with the existing Nix ecosystem.
+Architecture A and B push complexity into the relay — permanently. Every release, every bug fix, every new forge must consider two code paths. Architecture C pushes a bounded, one-time cost onto the user (re-lock inputs, add `follows` where needed) and then the relay is simple forever.
 
-**Architecture A with a unified storage model is the right call.** Two protocol frontends, one data model. The interception planes stay separate (independent failure, no TLS MITM, native Git mechanisms), but the storage layer is shared so that cross-plane coherence is structural rather than bolted on.
+**Architecture C is the right call.** Accept the migration cost. Eliminate the tarball plane. Build a pure Git relay with one interception mechanism (`insteadOf`), one cache (bare Git repos), and one identity model (Git refs and SHAs). The transitive dependency gap (third-party flakes using `github:`) is real but bounded, and can be addressed with an optional tarball compatibility layer in a later phase if demand warrants it.
 
 ## 6. Recommendations for the RFC
 
-### 6.1 Adopt the unified storage model (Section 2.3)
+### 6.1 Adopt Architecture C: Git-only relay with `git+ssh://` inputs
 
-Replace the RFC's implicit two-store design with an explicit unified storage layer:
+The RFC should be rewritten around a single-plane architecture:
 
-- **One identity index** mapping `(forge, owner, repo, rev)` to both Git refs and cached archives.
-- **Both planes read from and write to the same index.** A tarball fetch updates the index; a Git fetch updates the index. Cross-plane awareness is structural, not optional.
-- **The archive cache is physically separate from Git objects but logically part of the same model.** Real upstream tarballs are stored for `narHash` correctness (see Section 6.5), but they are indexed by the same identity layer.
-- **Drop "optionally hydrate" language.** Cross-plane warming is a natural consequence of the shared index, not an optional background job.
+- **One data plane:** Git over SSH (primary) and smart HTTP (secondary).
+- **One interception mechanism:** `url.*.insteadOf` in `~/.gitconfig`.
+- **One cache:** Local bare Git repositories.
+- **One identity model:** `(forge, owner, repo)` mapped to Git refs and object SHAs.
 
-This is the single most impactful change. It resolves the weak coherence, duplicated identity resolution, and hydration bridge issues (Section 2.2) without adding any interception complexity.
+The tarball compatibility plane (RFC Sections 6.3, 10.2, 11.2, 15) should be removed from the MVP scope entirely. The archive cache, the compatibility proxy, the forge-specific tarball fetcher logic — all of it is eliminated.
 
-### 6.2 Use Nix flake registries as the primary tarball bootstrap mechanism
+### 6.2 Nix inputs use `git+ssh://` instead of `github:` shorthand
 
-Section 10.2 is the weakest part of the RFC. The workstation-only constraint (Section 1.1) narrows the options significantly: the bootstrap mechanism must be environment-level configuration, not source-level. Nix flake registries are the cleanest fit.
+Projects adopting Git Relay convert their `flake.nix` inputs:
 
-A relay-provided registry that maps `github:org/repo` to `tarball+http://relay:4320/github/org/repo/archive/<rev>.tar.gz` would:
+```nix
+# Before
+inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-- Require one configuration step: add the registry to `~/.config/nix/registry.json`.
-- Not require TLS interception.
-- Not require proxy configuration or DNS overrides.
-- Work with existing `github:` shorthand syntax in `flake.nix`.
-- Keep lock file compatibility (the resolved URL is still a tarball, `narHash` is preserved).
-- **Be invisible to CI.** On a workstation, Nix resolves `github:NixOS/nixpkgs` through the relay registry. On GitHub Actions, the default registry resolves it directly to GitHub. The same `flake.nix` and `flake.lock` work in both environments.
+# After
+inputs.nixpkgs.url = "git+ssh://git@github.com/NixOS/nixpkgs?ref=nixos-unstable";
+```
 
-This directly satisfies the workstation-only constraint and should be the recommended bootstrap path, not one option among several.
+This requires a one-time `nix flake update` to re-lock (the `narHash` changes because Git checkout and tarball extraction produce different source trees). After re-locking:
 
-### 6.3 Be concrete about bootstrap: one recommended path per plane
+- On the workstation, `insteadOf` routes the fetch through the relay.
+- On CI (GitHub Actions), the URL works directly — `git+ssh://git@github.com/...` is a standard Git remote. GHA provides SSH access to GitHub natively.
+- The `flake.lock` is portable and contains no relay-specific information.
 
-For the MVP, do not present a menu of options. Recommend one path per plane:
+### 6.3 One bootstrap mechanism, one command
 
-| Plane | Bootstrap mechanism | Configuration surface |
+The MVP bootstrap is a single concern:
+
+| What | Mechanism | Configuration surface |
 |---|---|---|
-| Git | `url.*.insteadOf` in `~/.gitconfig` | One `git config --global` per forge |
-| Tarball (Nix) | Nix flake registry | One entry in `~/.config/nix/registry.json` |
+| All Git traffic (including Nix `git+ssh://` inputs) | `url.*.insteadOf` in `~/.gitconfig` | One `git config --global` per forge |
 
-Both are environment-level, per-user, and invisible to CI. Both can be set up by a single `git-relay bootstrap` command.
+No registry configuration. No proxy env vars. No DNS overrides. A single `git-relay bootstrap` command writes the `insteadOf` rules and the relay is operational.
 
-Other options (proxy env vars, DNS overrides, explicit URLs) can be documented as alternatives for advanced use cases, but the default path should be this.
+### 6.4 Handle transitive `github:` dependencies with `follows`
 
-### 6.4 Drop generic network interception from the MVP
+When a direct dependency (e.g., nixpkgs) is also a transitive dependency of third-party flakes, use `follows` to ensure the transitive input resolves through your `git+ssh://` input:
 
-The RFC lists it as a possibility (Section 10.2.2). For the MVP, having two well-defined, environment-level mechanisms is better than having those plus an optional third mode that changes the trust model entirely. TLS MITM may be useful in controlled CI environments, but this contradicts the workstation-only scope. Add it in Phase 4 if there is demand.
+```nix
+inputs.nixpkgs.url = "git+ssh://git@github.com/NixOS/nixpkgs?ref=nixos-unstable";
+inputs.home-manager.url = "git+ssh://git@github.com/nix-community/home-manager";
+inputs.home-manager.inputs.nixpkgs.follows = "nixpkgs";
+```
 
-### 6.5 Clarify the narHash correctness contract
+This eliminates redundant fetches and ensures the relay caches the shared dependency. For transitive inputs that cannot be redirected with `follows` (deep dependency trees with `github:` inputs in third-party flakes), those fetches go directly to the forge. This is an accepted gap — the relay still covers all direct inputs and all plain Git operations.
 
-The RFC says the tarball module must "preserve source-tree semantics" (Section 15.2) but does not state the key constraint explicitly:
+### 6.5 Simplify the storage model
 
-> **The relay must serve the real upstream tarball (or a byte/content-identical reproduction), not a relay-derived archive, because `narHash` in existing lock files was computed from the upstream tarball.**
+With only one data plane, the storage model collapses to:
 
-This is the single hardest correctness requirement for the tarball plane. It should be stated upfront, not implied. It is also the reason the archive cache must be a separate content store from Git objects (you cannot substitute `git archive` output for GitHub's tarball endpoint), even though both stores are indexed by the same identity layer.
+- **Git storage:** One bare repository per logical repository identity.
+- **Metadata store:** SQLite for identity mappings, repository mode, upstream definitions, replication queues, cache TTLs, and audit events.
+- **No archive cache.** No content-addressed blob store for tarballs. No `narHash` correctness contract. No forge-specific tarball format handling.
+
+The identity index maps `(forge, owner, repo)` → local bare repo path + upstream URL(s) + repository mode (cache-only or authoritative). This is dramatically simpler than a unified index bridging Git objects and tarball archives.
+
+### 6.6 Defer the tarball compatibility plane to a future phase
+
+If the transitive dependency gap (Section 6.4) proves too painful in practice, a tarball compatibility plane can be added later as an **optional** module. But it should not be in the MVP. Build the Git relay first. Validate that `git+ssh://` inputs with `insteadOf` cover the primary use cases. Only add tarball support if real-world usage demonstrates the gap is significant enough to justify the architectural complexity.
+
+### 6.7 Use Rust instead of Go (revising RFC Section 7)
+
+The RFC recommends Go (Section 7.1–7.2). With the simplified Architecture C, Rust is the better choice. The relay is a long-running stateful daemon that orchestrates system Git processes, manages a SQLite database, and handles SSH/HTTP connections. The workload is I/O-bound, not compute-bound — the critical path is system Git, not the relay's own code.
+
+**Why Rust over Go for this project:**
+
+1. **SQLite without friction.** Go's best SQLite binding (`go-sqlite3`) requires CGO, which complicates Nix cross-compilation and makes builds less deterministic. The pure-Go alternative (`modernc.org/sqlite`) is a mechanical C-to-Go translation — it works but is unusual. Rust's `rusqlite` statically links `libsqlite3` and is the normal, well-trodden path in Nix. No CGO, no build-time surprises.
+
+2. **Compile-time error handling.** The relay manages replication queues, ref updates, and bare Git repositories. An unhandled error during push replication or a missed failure from a subprocess can leave state inconsistent — a half-replicated push, a corrupt queue entry, a lock file left behind. In Go, `if err != nil` is easy to forget and the compiler does not enforce it. In Rust, `Result<T, E>` makes unhandled errors a compile error. For a stateful daemon where partial failures corrupt state, this is not a style preference — it is a correctness guarantee.
+
+3. **No GC pauses.** The relay may handle bursts of concurrent Git fetches (e.g., Nix evaluating 10-30 inputs in parallel). Go's garbage collector is good but introduces latency variance. Rust has no GC. For a daemon that pipes data between network sockets and Git subprocesses, predictable latency matters.
+
+4. **Nix packaging is equally mature.** `buildRustPackage` (nixpkgs) and `crane` (flake-native) are both well-maintained. Cargo's lockfile integrates cleanly with Nix's reproducibility model. Deterministic builds are the default path, not a special configuration.
+
+5. **The ecosystem covers the requirements:**
+
+   | Concern | Rust crate | Notes |
+   |---|---|---|
+   | SSH server | `russh` | Actively maintained, async, used by Thrussh/Lapce |
+   | HTTP server | `hyper` / `axum` | Production-grade, async |
+   | SQLite | `rusqlite` | Static linking, well-maintained |
+   | Process orchestration | `tokio::process` | Async subprocess management |
+   | Singleflight / coalescing | `tokio::sync` | `OnceCell`, `broadcast`, `watch` channels |
+   | CLI | `clap` | Derive macros, shell completions |
+   | Serialization (TOML config) | `toml` / `serde` | Standard |
+
+6. **Static binary, single artifact.** Like Go, Rust produces a single static binary. The operational model is identical: one binary, one config file, one SQLite database, one directory of bare Git repos.
+
+**What Rust costs:**
+
+- **Slower iteration in early development.** Compile times are longer than Go. For a project this size (a focused daemon, not a large application), this is noticeable but not blocking — incremental builds are fast.
+- **Async complexity.** The relay needs async I/O (concurrent SSH/HTTP connections, subprocess pipes). Rust's async model (`tokio`) has a steeper learning curve than Go's goroutines. But the relay's concurrency patterns are straightforward (accept connection → resolve repo → spawn Git → pipe I/O), not complex state machines.
+- **Smaller hiring pool.** Irrelevant for a workstation tool maintained by its author.
+
+**Revised technology choices (replacing RFC Section 7.1):**
+
+- **Language:** Rust
+- **Async runtime:** `tokio`
+- **SSH ingress:** `russh` (relay-side) + OpenSSH (upstream)
+- **HTTP ingress:** `axum` (or `hyper` directly)
+- **Git server primitives:** system `git` (spawned as subprocesses)
+- **Metadata and job state:** SQLite via `rusqlite`
+- **Object storage:** filesystem bare repositories
+- **Configuration:** TOML via `serde` + `toml`
+- **CLI:** `clap`
+- **Packaging:** Nix flake with `crane` or `buildRustPackage`
 
 ## 7. Summary
 
-**Verdict: Architecture A (two interception planes) is correct, but the storage layer must be unified.**
+**Verdict: Architecture C (Git-only relay) is the right foundation.**
 
-The unified interception alternative (Architecture B) does not actually unify the underlying problem; it adds TLS interception complexity while still requiring two cache stores for `narHash` correctness. The pure Git approach (Architecture C) violates the workstation-only constraint and is incompatible with the existing Nix ecosystem.
+The two-plane approach (Architecture A) is not wrong — it correctly identifies the protocol boundary. But it permanently encodes the complexity of bridging Git and tarball semantics into the relay's architecture: two frontends, two cache stores (even with a unified index), forge-specific tarball format handling, and a `narHash` correctness contract that depends on upstream forges producing stable archives.
 
-The refined Architecture A provides:
+Architecture C eliminates all of that by pushing a one-time migration cost onto the user: convert `github:` inputs to `git+ssh://`, re-lock, and use `follows` for shared transitive dependencies. After that migration:
 
-- **Two protocol frontends** (Git via `insteadOf`, tarball via Nix flake registry redirect), each with independent failure domains and no TLS interception.
-- **One unified storage model** with a shared identity index mapping `(forge, owner, repo, rev)` to both Git objects and cached archives. Cross-plane coherence is structural.
-- **Environment-level bootstrap only** (`~/.gitconfig` + `~/.config/nix/registry.json`), invisible to CI. The same source files and lock files work on both workstation and GitHub Actions.
+- **One interception mechanism:** `insteadOf` in `~/.gitconfig`.
+- **One cache:** Local bare Git repositories.
+- **One identity model:** Git refs and SHAs.
+- **One bootstrap command:** `git-relay bootstrap`.
+- **Portable source files:** `git+ssh://git@github.com/...` works on workstation (through relay), CI (direct), and any other machine.
+- **Technology stack:** Rust + SQLite + Nix. Compile-time error handling for a stateful daemon, `rusqlite` with static linking for clean Nix builds, deterministic packaging via Nix flake.
 
-The RFC's main gaps to address:
+The RFC should be revised to:
 
-1. **Adopt a unified storage model** (Section 2.3). Replace optional hydration with a shared identity index.
-2. **Use Nix flake registries as the tarball bootstrap** (Section 6.2). This is the cleanest mechanism that satisfies the workstation-only constraint.
-3. **State the `narHash` correctness contract explicitly** (Section 6.5). The relay must serve real upstream tarballs, not `git archive` derivatives.
-4. **Recommend one bootstrap path per plane** (Section 6.3), not a menu of options. `insteadOf` for Git, flake registry for Nix.
-5. **Drop generic network interception from MVP scope** (Section 6.4).
-
-Tighten those five areas and the architecture is solid.
+1. **Drop the tarball compatibility plane from the MVP** (Sections 6.3, 10.2, 11.2, 15). Build a pure Git relay.
+2. **Recommend `git+ssh://` inputs for Nix flakes** (Section 6.2). Document the migration path from `github:` shorthand.
+3. **Simplify the storage model** (Section 6.5). One bare repo per logical identity, SQLite for metadata. No archive cache.
+4. **Use `follows` to cover transitive dependencies** (Section 6.4). Accept the remaining gap for deep third-party dependency trees.
+5. **Defer tarball compatibility to a future phase** (Section 6.6). Only build it if real-world usage proves the transitive dependency gap is a blocker.
+6. **Use Rust instead of Go** (Section 6.7). `rusqlite` avoids Go's CGO problem, `Result<T, E>` enforces error handling at compile time, and the Nix packaging story (`crane` / `buildRustPackage`) is clean and deterministic.
