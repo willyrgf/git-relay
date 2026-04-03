@@ -11,7 +11,7 @@ This RFC proposes **Git Relay**, a Git-first edge service that becomes the stand
 Git Relay has three core responsibilities:
 
 1. **Git relay and cache** for native Git transports (`ssh`, `http`, `https` via smart HTTP).
-2. **Single-endpoint push acceptance** for repositories that should accept writes through the relay and replicate them upstream asynchronously.
+2. **Single-endpoint push acceptance** for repositories that should accept writes through the relay and reconcile upstreams toward current local authoritative refs.
 3. **Explicit Nix input migration tooling** for direct flake inputs that currently use shorthand archive fetchers such as `github:`, `gitlab:`, and `sourcehut:`.
 
 The key architectural decision in this RFC is:
@@ -25,6 +25,12 @@ Instead of trying to transparently intercept existing shorthand tarball fetches,
 - and lock files are re-generated under the new transport semantics.
 
 This keeps the product Git-first, preserves a single protocol boundary, and avoids making archive compatibility a foundational requirement before it is proven necessary.
+
+For authoritative repositories, the foundational architecture in this RFC is also intentionally **SQLite-free**:
+
+- correctness-critical persistent state lives in local bare repositories, internal Git namespaces, and declarative repository policy,
+- the relay does not require a separate relational metadata store or durable per-push replay journal in MVP,
+- and upstream replication is modeled as deterministic convergence from current local authoritative refs to current upstream state rather than as exact replay of every accepted push.
 
 ## 2. Problem Statement
 
@@ -108,7 +114,7 @@ Transitive third-party shorthand inputs remain a separate problem. They can some
 
 ### 3.7 The foundational architecture should optimize for one protocol boundary
 
-The highest-risk part of this product is correctness at the Git boundary: clone, fetch, push, authorization, and crash-safe replication. The RFC should optimize for getting that boundary correct first.
+The highest-risk part of this product is correctness at the Git boundary: clone, fetch, push, authorization, and crash-safe upstream convergence. The RFC should optimize for getting that boundary correct first.
 
 ## 4. Goals
 
@@ -116,10 +122,11 @@ The highest-risk part of this product is correctness at the Git boundary: clone,
 2. Preserve normal Git semantics for clone, fetch, and push.
 3. Make repeated Git source access local after the first successful fetch.
 4. Improve offline and degraded-network behavior for already-seen Git content.
-5. Centralize push replication behind a single client-facing endpoint.
-6. Provide explicit migration tooling for direct Nix flake inputs that should route through the relay.
-7. Keep bootstrap and migration understandable, explicit, and reviewable.
-8. Make replication status, divergence, and migration outcomes observable and debuggable.
+5. Centralize upstream convergence behind a single client-facing endpoint.
+6. Make upstream convergence deterministic and recoverable from local repository state.
+7. Provide explicit migration tooling for direct Nix flake inputs that should route through the relay.
+8. Keep bootstrap and migration understandable, explicit, and reviewable.
+9. Make convergence state, divergence, and migration outcomes observable and debuggable.
 
 ## 5. Non-Goals
 
@@ -132,6 +139,7 @@ The highest-risk part of this product is correctness at the Git boundary: clone,
 7. Cover Git LFS in the MVP.
 8. Build a distributed cluster in the MVP.
 9. Support smart HTTP push in the MVP.
+10. Guarantee that every intermediate accepted push is replayed upstream in order.
 
 ## 6. Proposed Solution
 
@@ -151,10 +159,11 @@ A daemon responsible for:
 
 - routing and identity resolution,
 - repository policy,
-- metadata storage,
 - cache state,
-- push journaling,
-- replication jobs,
+- repository provisioning and descriptor resolution,
+- repo and upstream lock management,
+- upstream observation,
+- ad hoc refresh and reconcile execution,
 - observability,
 - and administration.
 
@@ -216,7 +225,7 @@ Required Git capabilities:
 - smart HTTP via `git-http-backend`
 - protocol v2 support for normal read-path operation
 - receive quarantine behavior for incoming objects
-- hooks: `pre-receive`, `update`, `reference-transaction`, `post-receive`
+- hooks: `pre-receive`, `reference-transaction`, `post-receive`
 - detection of upstream push capabilities such as `atomic` and `push-options`
 - repository maintenance commands and object verification
 
@@ -244,14 +253,25 @@ The RFC normatively requires the capabilities above. Version floors must be set 
 - **SSH ingress:** OpenSSH
 - **Git server primitives:** system Git
 - **HTTP Git support:** `git-http-backend`
-- **Metadata and push journal:** SQLite
+- **Repository metadata:** declarative rule files and repository descriptor files
+- **Convergence tracking:** internal Git refs plus filesystem locks
 - **Object storage:** filesystem bare repositories
 
 The foundational decision is to use:
 
 - system Git for Git correctness,
 - OpenSSH for SSH ingress,
-- and SQLite plus filesystem storage for local durability.
+- and filesystem-backed Git state for local durability and recovery.
+
+The foundational architecture does **not** require:
+
+- a relational metadata database,
+- a durable per-push replay journal,
+- or a continuously running replication queue.
+
+Read refresh and upstream reconciliation may be performed by short-lived ad hoc worker executions started by demand, push completion, or operator action.
+
+A relational metadata store may be added later for analytics, fleet management, or convenience features, but foundational correctness must remain reconstructable from local repositories, internal Git namespaces, and declarative configuration.
 
 Go and Rust are both viable implementation options for the control plane. Language selection should follow the stabilization of protocol, migration, and durability requirements rather than precede them.
 
@@ -295,7 +315,11 @@ Tarball compatibility may be revisited later if migrated direct inputs plus expl
 
 ## 8. Repository Model
 
-Git Relay supports two repository modes and a separate operational state machine.
+Git Relay supports two repository modes and three separate state axes:
+
+- repository lifecycle,
+- repository safety,
+- and per-upstream convergence.
 
 ### 8.1 Cache-only repository
 
@@ -317,42 +341,84 @@ Properties:
 
 - local bare repository is canonical for relay clients,
 - local refs are the client-visible source of truth,
-- upstreams are replication targets rather than read authority,
-- acknowledged pushes are durably journaled before success is returned,
-- and replication proceeds after local acceptance.
+- upstreams are convergence targets rather than read authority,
+- acknowledged pushes mean local refs committed successfully,
+- replication is computed from current local exported refs rather than replayed from a durable push journal,
+- and reconciliation proceeds after local acceptance.
 
-### 8.3 Repository operational states
+### 8.3 Repository lifecycle states
 
-Each repository has an operational state independent of its mode:
+Each repository has a lifecycle state independent of its mode:
 
 - `provisioning`
 - `ready`
-- `refreshing`
+- `disabled`
+
+`provisioning` means the repository is not ready for normal traffic yet.
+
+`ready` means the repository may serve normal traffic subject to its safety state.
+
+`disabled` means the repository is intentionally unavailable for normal traffic.
+
+### 8.4 Repository safety states
+
+Each repository also has a safety state:
+
+- `healthy`
 - `degraded`
 - `divergent`
 - `quarantined`
-- `disabled`
 
-`degraded` means the repository is still usable, but some background obligation such as replication has failed.
+`healthy` means the relay sees no known correctness risk for the configured authority model.
 
-`divergent` means authoritative local refs and tracked upstream refs no longer agree under a configuration that expects relay authority.
+`degraded` means local authority still holds, but at least one background obligation such as refresh or upstream convergence is failing.
 
-`quarantined` means the relay detected a correctness risk and blocks normal write operation until an explicit repair action completes.
+`divergent` means observed upstream refs no longer match the expected convergence model for that repository.
 
-### 8.4 Authoritative repository invariants
+`quarantined` means the relay detected a local correctness risk and blocks normal write operation until explicit repair completes.
+
+### 8.5 Per-upstream convergence states
+
+For each configured upstream, the relay tracks a convergence state:
+
+- `unknown`
+- `observing`
+- `in_sync`
+- `out_of_sync`
+- `reconciling`
+- `stalled`
+- `unsupported`
+
+`unknown` means the relay has not yet observed enough upstream state to compare safely.
+
+`observing` means the relay is actively fetching or verifying upstream refs.
+
+`in_sync` means the observed exported upstream refs match the current local exported ref set.
+
+`out_of_sync` means the observed exported upstream refs differ from local exported refs and need reconciliation.
+
+`reconciling` means a convergence attempt is in progress.
+
+`stalled` means convergence should occur but is currently failing and requires retry or repair.
+
+`unsupported` means the upstream cannot satisfy a configured requirement such as atomic multi-ref apply.
+
+### 8.6 Authoritative repository invariants
 
 For authoritative repositories, the following invariants are mandatory:
 
 - client-visible refs live in the normal bare-repository namespace,
 - upstream state is tracked under a separate internal namespace such as `refs/git-relay/upstreams/<upstream>/...`,
-- local acceptance does not imply upstream success,
+- the exported ref set is defined by deterministic policy,
+- local acceptance does not imply upstream convergence,
 - direct upstream pushes are unsupported by default,
-- and new writes are blocked while the repository is `divergent` or `quarantined`.
+- and new writes are blocked while the repository is `quarantined` and may also be blocked while `divergent` according to policy.
 
-“Local canonical, upstream replicated later” therefore means:
+“Local canonical, upstream converged later” therefore means:
 
 - relay clients read accepted refs locally,
-- upstreams are asynchronous replicas,
+- upstreams are asynchronous convergence targets,
+- the relay may coalesce several accepted local writes into one later upstream reconcile attempt,
 - and divergence with upstreams is a repair condition, not an alternate authority model.
 
 ## 9. Identity Model
@@ -427,9 +493,9 @@ Per repository, policy may define:
 - ordered read upstream URLs,
 - ordered write upstream URLs,
 - distinct auth profiles per upstream URL,
-- and whether an upstream requires atomic multi-ref replay.
+- and whether an upstream requires atomic multi-ref apply.
 
-The relay may try several configured upstream URLs across retries. Each individual refresh or replication attempt still uses one concrete URL and one concrete credential set.
+The relay may try several configured upstream URLs across retries. Each individual refresh or reconcile attempt still uses one concrete URL and one concrete credential set.
 
 ### 10.3 Repository migration: direct flake input rewriting
 
@@ -482,7 +548,7 @@ Git Relay distinguishes immutable object availability from ref freshness.
 
 - If a client requests an object already present locally by object ID, the relay may serve it directly.
 - If a client needs current ref advertisement such as branch heads or tags, the relay must apply repository freshness policy before advertising state.
-- For authoritative repositories, locally accepted refs are immediately readable from the relay even if replication is still pending.
+- For authoritative repositories, locally accepted refs are immediately readable from the relay even if upstream convergence is still pending.
 
 ### 11.2 Freshness policy
 
@@ -502,7 +568,7 @@ The relay must not advertise ref state blindly without a defined freshness rule.
 
 1. Client connects to the relay over SSH or optional smart HTTP.
 2. The relay parses the requested service and repository identity.
-3. The relay resolves repository mode, operational state, freshness policy, and upstream policy.
+3. The relay resolves repository mode, lifecycle state, safety state, freshness policy, and upstream policy.
 4. The relay checks local repository state.
 5. If required objects are present and freshness policy allows, serve locally.
 6. If required objects are missing or freshness policy requires refresh, perform a singleflight upstream refresh when policy allows.
@@ -526,48 +592,40 @@ Short negative caching may be used for repeated misses such as nonexistent repos
 The recommended default is:
 
 - accept locally first,
-- acknowledge only after replication work is durable,
-- then replicate asynchronously.
+- acknowledge after the local ref transaction commits successfully,
+- then reconcile upstreams toward current local exported refs.
 
-### 12.2 Client contract versus upstream replication contract
+### 12.2 Client contract versus upstream convergence contract
 
 When a client push succeeds against an authoritative repository, Git Relay promises:
 
 - local refs were accepted under Git’s normal receive rules,
-- the accepted ref updates are durable and recoverable after crash or restart,
-- replication work for each configured upstream was durably recorded,
+- the accepted local ref values are durable and recoverable after crash or restart,
 - and relay clients can read the accepted refs locally.
 
 Git Relay does **not** promise on client acknowledgement that:
 
 - every upstream already contains the accepted refs,
+- every intermediate accepted push will be replayed upstream individually,
 - the original client’s transport or credentials were preserved upstream,
 - upstream hooks observed the original client identity,
 - or upstream push-certificate semantics were preserved under relay-owned replication credentials.
 
-### 12.3 Push journal state machine
+### 12.3 Local write state machine
 
-Every accepted push attempt is tracked as a durable state machine:
+Each client push against an authoritative repository passes through a local write state machine:
 
-- `prepared`
-- `aborted`
-- `locally_committed`
-- `ack_ready`
-- `replicating`
-- `replicated`
-- `degraded`
-- `quarantined`
+- `receiving`
+- `validating`
+- `rejected`
+- `accepted`
 
 State meaning:
 
-- `prepared`: validation succeeded and the proposed ref updates are durably recorded before ref commit.
-- `aborted`: the prepared transaction did not commit local refs.
-- `locally_committed`: local refs were committed.
-- `ack_ready`: replication jobs are durable and the push may be acknowledged.
-- `replicating`: one or more upstream jobs are in flight.
-- `replicated`: all required upstream jobs succeeded.
-- `degraded`: local acceptance succeeded, but one or more background obligations failed.
-- `quarantined`: local state may require reconciliation before further writes are safe.
+- `receiving`: Git is receiving objects and the candidate ref updates from the client.
+- `validating`: the relay is evaluating whole-push policy against the proposed ref update set.
+- `rejected`: the push failed validation or Git did not commit the ref transaction.
+- `accepted`: Git committed the local authoritative ref transaction and the relay may return success.
 
 ### 12.4 Push acceptance flow
 
@@ -576,51 +634,52 @@ The write path for authoritative repositories is:
 1. Client pushes to the relay.
 2. The relay invokes native `git-receive-pack` against the local authoritative bare repository under a wrapper process that remains responsible for final success or failure.
 3. Incoming objects land in Git receive quarantine.
-4. `pre-receive` validates ACLs, protected refs, fast-forward rules, and write policy.
-5. During the same pre-commit phase, the relay durably records a push-journal row and the full set of proposed ref updates with state `prepared`.
+4. `pre-receive` validates ACLs, protected refs, fast-forward rules, exported-ref policy, and any other whole-push acceptance rule.
+5. Authoritative repositories default to **whole-push acceptance**: if any proposed ref update is disallowed, the relay rejects the entire push. Partial local success across refs is unsupported in MVP.
 6. If validation fails, the push aborts and no local refs update.
 7. If validation succeeds, Git commits the local ref transaction.
-8. `reference-transaction` marks the push `locally_committed` when the ref transaction commits, or `aborted` if the transaction aborts.
-9. After `git-receive-pack` completes successfully, the wrapper durably creates per-upstream replication jobs and marks the push `ack_ready`.
-10. Only after `ack_ready` is durable may the wrapper return overall success to the client.
-11. Background workers replay the accepted ref updates to configured upstreams.
+8. `reference-transaction` may observe `prepared`, `committed`, and `aborted` phases for diagnostics, metrics, and repair tooling, but it is not a second source of truth for accepted state.
+9. After the local ref transaction commits successfully, the wrapper returns overall success to the client.
+10. `post-receive` or the wrapper may trigger reconciliation for each configured upstream, immediately or through short-lived worker execution.
 
-The protocol-level implementation detail of how the wrapper gates final client success must be conformance-tested. The RFC requirement is normative: a push is not acknowledged until `ack_ready` is durable.
+### 12.5 Upstream convergence semantics
 
-### 12.5 Upstream replication semantics
+Upstream convergence is defined per repository and per upstream:
 
-Replication is defined per repository and per upstream:
+- desired state is the deterministic current local exported ref set,
+- observed state is the last known exported upstream ref set under the relay’s internal namespace,
+- one reconcile attempt may converge several accepted local writes at once,
+- intermediate accepted pushes may be coalesced and are not guaranteed to be replayed individually,
+- and explicit handling of multi-ref atomicity requirements remains mandatory.
 
-- one replication job per accepted push and upstream,
-- in-order replay per repository and upstream,
-- exact replay of the accepted ref update set,
-- and explicit handling of multi-ref atomicity requirements.
+Each upstream configuration must declare whether multi-ref atomic apply is required.
 
-Each upstream configuration must declare whether multi-ref atomic replay is required.
+- If `require_atomic = true`, the relay must use upstream atomic push when supported and must treat lack of atomic support as an `unsupported` or `stalled` convergence state.
+- If `require_atomic = false`, the relay may converge refs non-atomically, but any partial upstream application leaves the upstream `out_of_sync` and the repository `degraded` until a later reconcile attempt or explicit repair completes.
 
-- If `require_atomic = true`, the relay must use upstream atomic push when supported and must treat lack of atomic support as a failed replication obligation.
-- If `require_atomic = false`, the relay may attempt best-effort replay, but any partial upstream application is a degraded state that requires repair tooling.
-
-This is necessary because “one client push to N upstream servers” is not one semantic contract. It is N independent remote contracts behind one local acknowledgement boundary.
+There is no cross-upstream atomicity. “One client push to N upstream servers” is still N independent remote contracts behind one local acknowledgement boundary.
 
 ### 12.6 Acknowledgement policy
 
-The MVP acknowledgement policy is **durable-local**:
+The MVP acknowledgement policy is **local-commit**:
 
-- success is returned after local acceptance and durable journaling of replication work.
+- success is returned after the local authoritative ref transaction commits successfully.
 
 Future policies may include:
 
-- all-upstreams-must-succeed,
-- selected-upstreams-must-succeed,
+- selected-upstreams-converged,
+- all-upstreams-converged,
 - or branch-specific acknowledgement profiles.
 
 ### 12.7 Durability requirements
 
 The foundational contract is:
 
-- an **acknowledged** push must remain recoverable after relay restart or crash without requiring client retransmission,
-- an **unacknowledged** partial accept must be detectable and quarantined for reconciliation,
+- an **acknowledged** push must remain readable and recoverable from the local authoritative repository after relay restart or crash without requiring client retransmission,
+- after restart, the relay must be able to recompute required upstream reconciliation from local exported refs and observed upstream refs without requiring a durable push journal,
+- the system does **not** guarantee replay of every unreplicated intermediate push after crash or restart,
+- if the relay process dies after local ref commit but before the client observes success, the outcome follows normal Git ambiguity and the client must verify remote state,
+- any evidence that local ref state violated whole-push acceptance invariants must force `quarantined` state and explicit repair,
 - and local acceptance must never be silently rewritten to match a failed upstream outcome.
 
 ## 13. Policy Enforcement
@@ -631,12 +690,11 @@ The relay relies on Git-native enforcement points.
 
 Use:
 
-- `pre-receive` for whole-push validation and pre-commit journal preparation,
-- `update` for per-ref validation,
-- `reference-transaction` for commit or abort transition recording,
+- `pre-receive` for whole-push validation and whole-push rejection,
+- `reference-transaction` for observation of commit or abort phases and repair diagnostics,
 - `post-receive` for non-critical notifications and worker wakeups.
 
-The durability contract must not depend on best-effort `post-receive` behavior.
+The correctness contract must not depend on best-effort `post-receive` behavior or on a side journal separate from Git refs.
 
 ### 13.2 Default repository protections
 
@@ -675,11 +733,11 @@ If HTTP ingress is enabled, the web server or reverse proxy is responsible for a
 
 ### 14.2 Relay to upstream
 
-Default to relay-owned machine credentials for read refreshes and background replication.
+Default to relay-owned machine credentials for read refreshes and background reconciliation.
 
 Reasons:
 
-- background replication must work after the client disconnects,
+- background reconciliation must work after the client disconnects,
 - retries and reconciliation need stable credentials,
 - and the relay must not depend on client credential presence after acceptance.
 
@@ -696,9 +754,9 @@ Even when relay-owned machine credentials are used upstream, the relay must reco
 - authenticated client identity,
 - repository identity,
 - accepted ref changes,
-- replication targets,
+- convergence targets,
 - upstream credential profile used,
-- and replication outcomes.
+- and convergence outcomes.
 
 Per-user upstream delegation may be added later, but it is not the MVP default.
 
@@ -765,7 +823,7 @@ The migration workflow should:
 
 The migration workflow must not assume that `narHash` or lock metadata remains stable across transport change.
 
-The preferred relock behavior is targeted relocking of rewritten direct inputs. If the tool cannot isolate the lock update safely for the current Nix version or dependency graph, it must fail and require an explicit broader relock command rather than silently widening the update scope.
+The preferred relock behavior is targeted relocking of rewritten direct inputs. If the tool cannot isolate the lock update safely for the current Nix version or dependency graph, it must fail and require an explicit broader relock command rather than silently widening the update scope. Exact targeted relock behavior across supported Nix versions remains `needs verification`.
 
 ### 15.5 Direct versus transitive coverage
 
@@ -802,28 +860,29 @@ Advantages:
 
 For authoritative repositories, upstream-tracking refs must live in a separate internal namespace such as `refs/git-relay/upstreams/<upstream>/...`.
 
-### 16.2 Metadata and push journal
+### 16.2 Metadata and convergence tracking
 
-SQLite stores metadata and durable work state, not Git objects.
+Correctness-critical persistent state lives in filesystem structures and Git namespaces, not in a mandatory relational database.
 
-Tables should cover:
+The foundational persistent state should cover:
 
-- repository identity and alias mappings,
-- repository mode and operational state,
-- upstream definitions and auth-profile bindings,
-- refresh policy,
-- push journal entries,
-- push ref-update rows,
-- replication jobs,
-- replication attempts and outcomes,
-- and audit events.
+- repository identity and alias mappings through declarative repository descriptors or rule files,
+- repository mode, lifecycle controls, and upstream definitions,
+- auth-profile bindings and exported-ref policy,
+- authoritative local refs in the normal bare-repository namespace,
+- observed upstream refs under `refs/git-relay/upstreams/<upstream>/...`,
+- and filesystem lock paths used to serialize refresh and reconcile work.
 
-SQLite must be configured for local durability:
+Additional operator-focused state may be recorded in logs or diagnostic files, but it must be reconstructable and must not be required to determine the authoritative client-visible ref state.
 
-- `journal_mode = WAL`
-- `synchronous = FULL`
-- foreign keys enabled
-- and bounded transaction scope in the write path
+There is no durable per-push replay journal in MVP. After crash or restart, the relay must recover by inspecting:
+
+- declarative repository policy,
+- current local authoritative refs,
+- tracked upstream refs in the internal namespace,
+- and fresh upstream observation when needed.
+
+Any auxiliary state file beyond that set is a cache or convenience artifact, not a correctness anchor.
 
 ### 16.3 Garbage collection and maintenance
 
@@ -833,7 +892,7 @@ The relay needs explicit policies for:
 - retention and pinning,
 - cache eviction for cache-only repositories,
 - reflog retention for authoritative repositories,
-- and failed replication cleanup.
+- and cleanup of failed or stale reconcile attempts.
 
 Cache eviction must never apply to authoritative repositories while they are configured as write-accepting.
 
@@ -844,9 +903,10 @@ The system should expose:
 - cache hits and misses,
 - upstream latency,
 - object growth,
-- replication lag,
-- failed replications,
+- convergence lag,
+- failed reconcile attempts,
 - per-repo freshness state,
+- per-upstream convergence state,
 - authoritative divergence state,
 - migration activity,
 - and authentication failures.
@@ -867,7 +927,7 @@ A minimal operator interface should include:
 - `repo inspect`
 - `repo repair`
 - `replication status`
-- `replication retry`
+- `replication reconcile`
 - `cache pin`
 - `cache evict`
 - `migrate-flake-inputs`
@@ -894,29 +954,33 @@ If a repository is already cached and the requested objects are present, the rel
 
 If required objects are absent, return a normal fetch failure.
 
-### 19.2 Upstream replication failure
+### 19.2 Upstream convergence failure
 
 Do not roll back a locally accepted push.
 
 Instead:
 
-- queue retries,
 - preserve the accepted local refs,
 - mark the repository `degraded`,
+- mark the affected upstream `stalled` or `out_of_sync`,
+- allow later reconcile attempts to coalesce newer local writes,
 - and expose reconciliation tooling.
 
-### 19.3 Crash or partial accept before acknowledgement
+### 19.3 Crash during local acceptance or reconciliation
 
-If refs were updated locally but the push was not acknowledged durably, the relay must detect that condition on restart and quarantine the repository for reconciliation.
+If the relay crashes during or after local acceptance, local authoritative refs remain the source of truth.
 
-The system must not silently treat an unacknowledged partial accept as a clean success.
+Startup reconciliation must:
 
-Startup reconciliation must inspect push-journal rows and handle at least:
+- inspect current local authoritative refs,
+- inspect tracked upstream refs under the internal namespace,
+- refresh upstream observation when needed,
+- recompute which upstreams are `in_sync`, `out_of_sync`, `stalled`, or `unsupported`,
+- and trigger new reconcile attempts according to policy.
 
-- `prepared` without local commit,
-- `locally_committed` without `ack_ready`,
-- `ack_ready` without completed replication,
-- and in-flight replication attempts interrupted by crash.
+If the relay died after local ref commit but before the client observed success, the client sees normal Git ambiguity and must verify the remote state before retrying.
+
+Any impossible local state such as repository corruption or evidence that whole-push acceptance invariants were violated must force `quarantined` state and explicit repair.
 
 ### 19.4 Repository migration failure
 
@@ -930,33 +994,34 @@ If flake input migration fails partway through:
 
 Authoritative repositories must include divergence detection and explicit repair commands.
 
-### 19.6 Metadata-store corruption or unavailability
+### 19.6 Repository state corruption or unavailability
 
-If the metadata database cannot provide the durability guarantees required for the write path, authoritative write acceptance must fail closed.
+If repository descriptors, internal tracking refs, lock paths, or the authoritative bare repository cannot provide the guarantees required for the write path, authoritative write acceptance must fail closed.
 
 ## 20. Configuration Model
 
 Git Relay has:
 
 - one static daemon configuration file,
-- one SQLite-backed metadata database for mutable repository state,
+- one repository descriptor directory or declarative rule set for repository-specific state,
 - and a CLI for repo, policy, repair, and migration management.
 
 Static configuration covers:
 
 - listen addresses,
 - filesystem paths,
-- database durability settings,
+- lock and worker settings,
 - default policy classes,
 - and operator-safe feature toggles such as HTTP read enablement.
 
-Mutable repository configuration in SQLite covers:
+Repository-specific configuration in descriptor files or rule files covers:
 
 - repository mode,
 - upstream URLs,
+- exported ref policy,
 - auth profile bindings,
 - per-upstream atomicity requirements,
-- and current operational state.
+- and lifecycle flags.
 
 Example static configuration:
 
@@ -970,21 +1035,18 @@ enable_http_write = false
 [paths]
 state_root = "/var/lib/git-relay"
 repo_root = "/var/lib/git-relay/repos"
-db_path = "/var/lib/git-relay/metadata.sqlite3"
+repo_config_root = "/var/lib/git-relay/repos.d"
 
-[database]
-journal_mode = "wal"
-synchronous = "full"
-busy_timeout_ms = 5000
-
-[replication]
-default_push_ack = "durable-local"
-retry_backoff = "exponential"
+[reconcile]
+on_push = true
+worker_mode = "short-lived"
+lock_timeout_ms = 5000
 
 [policy]
 default_repo_mode = "cache-only"
 default_refresh = "ttl:60s"
 negative_cache_ttl = "5s"
+default_push_ack = "local-commit"
 
 [migration]
 supported_targets = ["git+https", "git+ssh"]
@@ -999,8 +1061,9 @@ Example repository rules:
 match = "github.com/my-org/**"
 mode = "authoritative"
 refresh = "authoritative-local"
-push_ack = "durable-local"
+push_ack = "local-commit"
 migration_transport = "git+ssh"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
 
 read_upstreams = [
   { name = "github-https", url = "https://github.com/%repo%", auth_profile = "github-read-https" },
@@ -1033,10 +1096,10 @@ read_upstreams = [
 - Git URL rewriting bootstrap helpers
 - cache-only repositories
 - authoritative repositories
-- local durable push journaling
-- asynchronous replication to multiple upstreams
-- per-upstream atomic replay policy
-- repository metadata in SQLite
+- local-commit acknowledgement for authoritative pushes
+- asynchronous convergence to multiple upstreams
+- per-upstream atomic apply policy
+- repository descriptors and internal Git tracking refs
 - Nix direct-input migration command
 - basic metrics, logs, and repair commands
 
@@ -1049,6 +1112,8 @@ read_upstreams = [
 - advanced multi-tenant auth
 - generic full-traffic MITM as default behavior
 - guaranteed coverage for all transitive shorthand-based Nix fetches
+- durable per-push replay logging
+- guarantee that every intermediate accepted push reaches every upstream
 - full enterprise attribution of upstream writes
 - preservation of original client upstream identity or push-certificate semantics
 
@@ -1117,9 +1182,9 @@ Why:
 ### Phase 3
 
 - authoritative local accept for selected repositories
-- push journal state machine
-- crash recovery and reconciliation tooling
-- replication queue and multi-upstream replay
+- local write and upstream convergence state machines
+- crash recovery by recomputation from Git state
+- multi-upstream reconcile execution
 
 ### Phase 4
 
@@ -1135,10 +1200,12 @@ Why:
 
 1. Which exact Git version floor satisfies the required hook, protocol, and atomicity-detection behavior across the supported platforms? `needs verification`
 2. Which exact Nix version floor provides the required flake Git URL and targeted relock behavior across the supported platforms? `needs verification`
-3. Should smart HTTP push ever enter scope, or should authoritative writes remain SSH-only by design?
-4. How much automation should the migration tool provide for transitive remediation suggestions such as `follows`?
-5. What retention defaults keep cache growth practical without undermining offline expectations?
-6. Should shared-authority operation ever be supported, or should authoritative repositories remain relay-authority-only?
+3. Should authoritative repositories remain whole-push-only for local acceptance, or should partial per-ref local success ever be exposed?
+4. How aggressive should automatic reconciliation be: on push only, on demand only, periodic, or some combination?
+5. Should smart HTTP push ever enter scope, or should authoritative writes remain SSH-only by design?
+6. How much automation should the migration tool provide for transitive remediation suggestions such as `follows`?
+7. What retention defaults keep cache growth practical without undermining offline expectations?
+8. Should shared-authority operation ever be supported, or should authoritative repositories remain relay-authority-only?
 
 ## 25. Recommendation
 
@@ -1149,8 +1216,8 @@ Adopt the following product direction:
 The relay’s core contract is:
 
 - normal Git read and write semantics at the relay boundary,
-- durable-local acknowledgement for authoritative pushes,
-- asynchronous replication to one or more upstream Git servers,
+- local-commit acknowledgement for authoritative pushes,
+- asynchronous convergence to one or more upstream Git servers,
 - and explicit, reviewable migration of direct Nix flake inputs to concrete Git transports.
 
-This keeps the protocol boundary coherent, makes bootstrap and repository mutation explicit, allows direct Nix inputs to route through the relay using normal Git mechanisms, and keeps the MVP focused on the part of the system that must be correct first: the Git read/write boundary.
+The foundational architecture keeps correctness-critical persistent state in Git repositories and declarative policy rather than in a mandatory relational side store. This keeps the protocol boundary coherent, makes bootstrap and repository mutation explicit, allows direct Nix inputs to route through the relay using normal Git mechanisms, and keeps the MVP focused on the part of the system that must be correct first: the Git read/write boundary.
