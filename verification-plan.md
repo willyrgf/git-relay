@@ -23,6 +23,22 @@ The RFC should not move into implementation-driving status until each blocker be
 - a proposed final contract,
 - and an RFC rewrite based on measured behavior.
 
+## Terminology
+
+This plan distinguishes three different properties that should not be collapsed into one word.
+
+- `atomicity`: one state transition either commits or does not commit.
+- `execution-unit completeness`: one reconcile run handles the full configured upstream set from one desired-state snapshot and reaches a terminal recorded outcome.
+- `terminal cleanup`: transient in-progress markers and locks are removed or superseded cleanly after normal completion or recovery, while terminal evidence remains visible for operators.
+
+In this system:
+
+- local Git ref acceptance may be atomic,
+- per-upstream multi-ref apply may be atomic when the remote supports it,
+- and multi-upstream fan-out is not atomic.
+
+The relay can still provide high-level "one run handles everything" behavior through execution-unit completeness without claiming false cross-upstream atomicity.
+
 ## Workstreams
 
 ### 1. Local Accept And Crash Safety
@@ -48,12 +64,15 @@ Scope:
 - observed upstream state tracking
 - atomic and non-atomic upstream apply
 - multi-upstream state derivation
+- reconcile execution-unit completeness
+- terminal cleanup of transient worker state
 
 Deliverable:
 
 - one local authoritative bare repository
 - two or more upstream bare repositories
 - a reconcile driver that can inject partial remote failure
+- a run coordinator that records terminal per-run outcomes
 
 ### 3. Nix Migration And Relock
 
@@ -432,6 +451,50 @@ RFC rewrite required:
 
 - Add a lock model section with supported filesystems, stale-lock handling, and lock granularity.
 
+### J. Reconcile execution-unit completeness and terminal cleanup
+
+Why it is blocking:
+
+- Higher-level "one push fans out to all configured upstreams in one run" behavior is a valid product contract.
+- The RFC currently talks about atomicity where it really needs an execution contract.
+
+What to build:
+
+- A reconcile coordinator that creates one `reconcile_run_id` per run.
+- A fixture with several configured upstreams where one succeeds, one fails, and one is temporarily unreachable.
+- Crash injection before run start, mid-run, and after the last upstream attempt but before terminal outcome is recorded.
+
+How to verify:
+
+- Start a reconcile run from one captured desired-state snapshot.
+- Confirm the run enumerates the full configured upstream set at run start.
+- Confirm every eligible upstream is attempted within that run unless the run is explicitly superseded by newer desired state.
+- Confirm completion leaves no stale in-progress markers or orphan locks.
+- Confirm terminal evidence remains visible after cleanup.
+
+Pass criteria:
+
+- One reconcile run always has one deterministic desired-state snapshot and one explicit upstream set.
+- Mixed per-upstream outcomes are recorded under the same `reconcile_run_id`.
+- Cleanup removes transient worker state but preserves terminal operator-visible outcome.
+- Crash recovery either resumes safely or starts a new run that supersedes the old one without leaving correctness dependent on stale run metadata.
+
+Proposed solution:
+
+- Define reconcile as a bounded execution unit distinct from atomicity.
+- Give each run:
+  - one `reconcile_run_id`
+  - one desired-state snapshot identifier
+  - one configured-upstream set captured at run start
+- Record per-upstream results under that run.
+- On completion, clear transient locks and in-progress markers.
+- Retain terminal run evidence in logs or diagnostic artifacts for debugging and repair.
+- If newer local state supersedes an active run, mark the old run superseded rather than pretending it fully converged current state.
+
+RFC rewrite required:
+
+- Add a reconcile execution-unit section that separates local atomicity, per-upstream atomic apply, and multi-upstream run completeness.
+
 ## Additional Verification Needed Beyond The Nine Blockers
 
 ### Git durability floor
@@ -480,9 +543,11 @@ The final RFC should make these rules explicit:
 - local acceptance is one committed Git ref transaction, not wrapper success plus side effects
 - upstream convergence is current-state reconciliation, not per-push replay
 - non-atomic upstream convergence is detectability plus repair, not atomic replication
+- each reconcile run is one bounded execution unit over one desired-state snapshot and one captured upstream set
+- execution-unit completeness is not cross-upstream atomicity
+- cleanup removes transient worker state but preserves terminal run evidence
 - observed upstream state is updated only by actual observation, not by optimistic push assumptions
 - startup without fresh observation yields `unknown`, not guessed `in_sync`
 - whole-push acceptance requires an allowed Git hook and config subset
 - targeted relock is only promised for validated Nix versions and validated graph shapes
 - lock paths are advisory coordination artifacts, not correctness anchors
-

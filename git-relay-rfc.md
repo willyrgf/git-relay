@@ -127,6 +127,7 @@ The highest-risk part of this product is correctness at the Git boundary: clone,
 7. Provide explicit migration tooling for direct Nix flake inputs that should route through the relay.
 8. Keep bootstrap and migration understandable, explicit, and reviewable.
 9. Make convergence state, divergence, and migration outcomes observable and debuggable.
+10. Make each reconcile run a bounded execution unit over the configured upstream set, with explicit terminal outcomes and no correctness-critical dangling in-progress state.
 
 ## 5. Non-Goals
 
@@ -659,7 +660,32 @@ Each upstream configuration must declare whether multi-ref atomic apply is requi
 
 There is no cross-upstream atomicity. “One client push to N upstream servers” is still N independent remote contracts behind one local acknowledgement boundary.
 
-### 12.6 Acknowledgement policy
+### 12.6 Reconcile execution-unit semantics
+
+Atomicity and execution-unit completeness are different guarantees.
+
+- local acceptance is atomic only at the local Git ref transaction boundary,
+- per-upstream multi-ref apply may be atomic only when the upstream supports atomic push and policy requires it,
+- and multi-upstream fan-out is not atomic.
+
+The relay should still make each reconcile run a single bounded execution unit:
+
+- each run has one `reconcile_run_id`,
+- each run uses one deterministic desired-state snapshot captured at run start,
+- each run captures one configured upstream set at run start,
+- each run attempts every eligible upstream in that captured set before reaching a terminal outcome unless the run is explicitly superseded by newer local desired state,
+- each per-upstream result is recorded under that run,
+- and normal completion or crash recovery must not leave dangling in-progress worker state as a correctness dependency.
+
+A given accepted push may trigger a reconcile run immediately or may be coalesced into a later run if another reconcile run is already active or pending. Coalescing changes which run carries the work. It does not change the local acknowledgement contract.
+
+Cleanup in this section means:
+
+- clear transient locks and in-progress markers when the run finishes or is superseded,
+- preserve terminal evidence of the run for debugging and repair,
+- and never require stale run metadata to determine the authoritative local ref state.
+
+### 12.7 Acknowledgement policy
 
 The MVP acknowledgement policy is **local-commit**:
 
@@ -671,7 +697,7 @@ Future policies may include:
 - all-upstreams-converged,
 - or branch-specific acknowledgement profiles.
 
-### 12.7 Durability requirements
+### 12.8 Durability requirements
 
 The foundational contract is:
 
@@ -916,6 +942,7 @@ Structured logs must carry stable identifiers such as:
 - `request_id`
 - `repo_id`
 - `push_id`
+- `reconcile_run_id`
 - `upstream_id`
 - `attempt_id`
 - and authenticated client identity
@@ -964,7 +991,8 @@ Instead:
 - mark the repository `degraded`,
 - mark the affected upstream `stalled` or `out_of_sync`,
 - allow later reconcile attempts to coalesce newer local writes,
-- and expose reconciliation tooling.
+- expose reconciliation tooling,
+- and clear or supersede transient in-progress worker state while preserving terminal run evidence.
 
 ### 19.3 Crash during local acceptance or reconciliation
 
@@ -976,7 +1004,8 @@ Startup reconciliation must:
 - inspect tracked upstream refs under the internal namespace,
 - refresh upstream observation when needed,
 - recompute which upstreams are `in_sync`, `out_of_sync`, `stalled`, or `unsupported`,
-- and trigger new reconcile attempts according to policy.
+- trigger new reconcile attempts according to policy,
+- and clear or supersede stale in-progress reconcile markers that survived the prior process.
 
 If the relay died after local ref commit but before the client observed success, the client sees normal Git ambiguity and must verify the remote state before retrying.
 
