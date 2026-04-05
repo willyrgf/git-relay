@@ -582,6 +582,92 @@ fn replication_reconcile_records_mixed_results_and_updates_internal_observed_ref
 }
 
 #[test]
+fn git_relayd_serve_once_drains_pending_reconcile_requests() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_ok = temp.path().join("upstream-ok.git");
+    init_bare_repo(&upstream_ok);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_ok.to_str().expect("path"), false)],
+    );
+
+    let dispatcher = cargo_bin_path("git-relay");
+    Command::cargo_bin("git-relay-install-hooks")
+        .expect("cargo bin")
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
+        ])
+        .assert()
+        .success();
+
+    let work_repo = temp.path().join("work-daemon");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-daemon")
+        .env("GIT_RELAY_PUSH_ID", "push-daemon")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("push success");
+
+    let pending_path = pending_request_file_path(temp.path(), "github.com/example/repo.git");
+    assert!(pending_path.exists(), "pending reconcile request should exist");
+
+    let output = Command::cargo_bin("git-relayd")
+        .expect("cargo bin")
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("serve report");
+    assert_eq!(report["runtime_validation"]["status"], "passed");
+    assert!(
+        report["processed_reconciles"]
+            .as_array()
+            .expect("processed reconciles")
+            .iter()
+            .any(|item| item["repo_safety"] == "healthy")
+    );
+
+    assert!(!pending_path.exists(), "pending reconcile request should be cleared");
+    let upstream_main = read_git_ref(&upstream_ok, "refs/heads/main");
+    let local_main = read_git_ref(&repo_path, "refs/heads/main");
+    let observed_main = read_git_ref(
+        &repo_path,
+        "refs/git-relay/upstreams/alpha/heads/main",
+    );
+    assert_eq!(upstream_main, local_main);
+    assert_eq!(observed_main, local_main);
+}
+
+#[test]
 fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_force_push() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);

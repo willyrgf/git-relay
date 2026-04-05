@@ -170,6 +170,66 @@ pub fn pending_request_file_path(state_root: &Path, repo_id: &str) -> PathBuf {
     pending_request_path(state_root, repo_id)
 }
 
+pub fn load_pending_reconcile_requests(
+    state_root: &Path,
+) -> Result<Vec<PendingReconcileRequest>, ReconcileError> {
+    let directory = pending_request_directory(state_root);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut requests = Vec::new();
+    for entry in fs::read_dir(&directory).map_err(|error| ReconcileError::Read {
+        path: directory.clone(),
+        error,
+    })? {
+        let entry = entry.map_err(|error| ReconcileError::Read {
+            path: directory.clone(),
+            error,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(request) = read_json_optional::<PendingReconcileRequest>(&path)? {
+            requests.push(request);
+        }
+    }
+    requests.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+    Ok(requests)
+}
+
+pub fn process_pending_reconcile_requests(
+    config: &AppConfig,
+    descriptors: &[RepositoryDescriptor],
+) -> Result<Vec<ReconcileRunRecord>, ReconcileError> {
+    let mut runs = Vec::new();
+    let pending = load_pending_reconcile_requests(&config.paths.state_root)?;
+    for request in pending {
+        let Some(descriptor) = descriptors
+            .iter()
+            .find(|descriptor| descriptor.repo_id == request.repo_id)
+        else {
+            clear_pending_request(config, &request.repo_id);
+            continue;
+        };
+
+        if descriptor.mode != RepositoryMode::Authoritative
+            || descriptor.lifecycle != RepositoryLifecycle::Ready
+        {
+            clear_pending_request(config, &request.repo_id);
+            continue;
+        }
+
+        match reconcile_repository(config, descriptor) {
+            Ok(run) => runs.push(run),
+            Err(ReconcileError::RunInProgress { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(runs)
+}
+
 pub fn reconcile_repository(
     config: &AppConfig,
     descriptor: &RepositoryDescriptor,
@@ -803,10 +863,11 @@ fn in_progress_marker_path(state_root: &Path, repo_id: &str) -> PathBuf {
 }
 
 fn pending_request_path(state_root: &Path, repo_id: &str) -> PathBuf {
-    state_root
-        .join("reconcile")
-        .join("pending")
-        .join(format!("{}.json", sanitize_path_component(repo_id)))
+    pending_request_directory(state_root).join(format!("{}.json", sanitize_path_component(repo_id)))
+}
+
+fn pending_request_directory(state_root: &Path) -> PathBuf {
+    state_root.join("reconcile").join("pending")
 }
 
 fn run_record_path(state_root: &Path, repo_id: &str, run_id: &str) -> PathBuf {

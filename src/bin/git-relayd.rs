@@ -4,11 +4,13 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use git_relay::config::AppConfig;
 use git_relay::deploy::validate_runtime_profile;
 use git_relay::git::SystemGitExecutor;
 use git_relay::platform::RealPlatformProbe;
+use git_relay::reconcile::{process_pending_reconcile_requests, ReconcileRunRecord};
 use git_relay::validator::Validator;
 
 #[derive(Debug, Parser)]
@@ -30,6 +32,12 @@ struct ServeArgs {
     config: PathBuf,
     #[arg(long)]
     once: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeCycleReport {
+    runtime_validation: git_relay::deploy::RuntimeValidationReport,
+    processed_reconciles: Vec<ReconcileRunRecord>,
 }
 
 fn main() -> ExitCode {
@@ -63,11 +71,25 @@ fn serve(args: ServeArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     if args.once {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let cycle = run_cycle(&config, &descriptors, report)?;
+        println!("{}", serde_json::to_string_pretty(&cycle)?);
         return Ok(ExitCode::SUCCESS);
     }
 
     loop {
+        let _ = run_cycle(&config, &descriptors, report.clone())?;
         thread::sleep(Duration::from_secs(60));
     }
+}
+
+fn run_cycle(
+    config: &AppConfig,
+    descriptors: &[git_relay::config::RepositoryDescriptor],
+    runtime_validation: git_relay::deploy::RuntimeValidationReport,
+) -> Result<ServeCycleReport, Box<dyn std::error::Error>> {
+    let processed_reconciles = process_pending_reconcile_requests(config, descriptors)?;
+    Ok(ServeCycleReport {
+        runtime_validation,
+        processed_reconciles,
+    })
 }
