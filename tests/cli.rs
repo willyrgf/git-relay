@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use git_relay::hooks::push_trace_file_path;
 use git_relay::platform::{PlatformProbe, RealPlatformProbe};
 use predicates::prelude::*;
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn init_bare_repo(path: &Path) {
@@ -262,6 +264,15 @@ fn package_example_config_path() -> PathBuf {
         .join("git-relay.example.toml")
 }
 
+fn read_push_trace(state_root: &Path, repo_id: &str, push_id: &str) -> Vec<Value> {
+    let path = push_trace_file_path(state_root, repo_id, push_id);
+    let source = fs::read_to_string(path).expect("push trace");
+    source
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trace json"))
+        .collect()
+}
+
 #[test]
 fn repo_validate_returns_json_for_valid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
@@ -444,6 +455,7 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
     let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
     init_bare_repo(&repo_path);
     configure_authoritative_repo(&repo_path);
     write_authoritative_descriptor(&temp, &repo_path, false);
@@ -466,7 +478,10 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
     init_work_repo(&work_repo);
     commit_file(&work_repo, "README.md", "hello\n", "initial");
 
+    let accept_push_id = "push-accept-main";
     StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-accept-main")
+        .env("GIT_RELAY_PUSH_ID", accept_push_id)
         .args([
             "-C",
             work_repo.to_str().expect("work repo"),
@@ -480,7 +495,40 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
         .then_some(())
         .expect("branch create push success");
 
+    let accepted_trace = read_push_trace(temp.path(), repo_id, accept_push_id);
+    assert!(
+        accepted_trace.iter().any(|event| {
+            event["hook"] == "pre-receive"
+                && event["status"] == "accepted"
+                && event["quarantine_path"].is_string()
+        }),
+        "accepted push should record pre-receive with a receive quarantine path"
+    );
+    assert!(
+        accepted_trace
+            .iter()
+            .any(|event| event["hook"] == "reference-transaction" && event["phase"] == "prepared"),
+        "accepted push should record reference-transaction prepared"
+    );
+    assert!(
+        accepted_trace
+            .iter()
+            .any(|event| event["hook"] == "reference-transaction" && event["phase"] == "committed"),
+        "accepted push should record reference-transaction committed"
+    );
+    assert!(
+        accepted_trace.iter().any(|event| {
+            event["hook"] == "post-receive"
+                && event["status"] == "accepted"
+                && event["reconcile_requested"] == true
+        }),
+        "accepted push should record post-receive reconcile wakeup intent"
+    );
+
+    let delete_push_id = "push-reject-delete";
     let delete_status = StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-reject-delete")
+        .env("GIT_RELAY_PUSH_ID", delete_push_id)
         .args([
             "-C",
             work_repo.to_str().expect("work repo"),
@@ -492,7 +540,27 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
         .expect("git push delete");
     assert!(!delete_status.success(), "delete push should fail closed");
 
+    let delete_trace = read_push_trace(temp.path(), repo_id, delete_push_id);
+    assert!(
+        delete_trace
+            .iter()
+            .any(|event| event["hook"] == "pre-receive" && event["status"] == "rejected"),
+        "rejected push should record the pre-receive rejection"
+    );
+    assert!(
+        !delete_trace
+            .iter()
+            .any(|event| event["hook"] == "reference-transaction" && event["phase"] == "committed"),
+        "rejected push must not record a committed local ref transaction"
+    );
+    assert!(
+        !delete_trace.iter().any(|event| event["hook"] == "post-receive"),
+        "rejected push must not run post-receive"
+    );
+
     let hidden_ref_status = StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-hidden-ref")
+        .env("GIT_RELAY_PUSH_ID", "push-hidden-ref")
         .args([
             "-C",
             work_repo.to_str().expect("work repo"),
@@ -509,6 +577,8 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
 
     commit_file(&work_repo, "README.md", "hello v2\n", "fast forward");
     StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-fast-forward")
+        .env("GIT_RELAY_PUSH_ID", "push-fast-forward")
         .args([
             "-C",
             work_repo.to_str().expect("work repo"),
@@ -526,6 +596,8 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
     init_work_repo(&rewrite_repo);
     commit_file(&rewrite_repo, "README.md", "rewrite\n", "rewrite history");
     let force_status = StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-force-reject")
+        .env("GIT_RELAY_PUSH_ID", "push-force-reject")
         .args([
             "-C",
             rewrite_repo.to_str().expect("rewrite repo"),

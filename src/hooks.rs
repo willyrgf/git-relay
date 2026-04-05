@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -15,6 +16,9 @@ use crate::validator::{ValidationInfrastructureError, Validator};
 
 const HOOK_NAMES: [&str; 3] = ["pre-receive", "reference-transaction", "post-receive"];
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const HOOK_TRACE_ROOT: &str = "push-traces";
+const REQUEST_ID_ENV: &str = "GIT_RELAY_REQUEST_ID";
+const PUSH_ID_ENV: &str = "GIT_RELAY_PUSH_ID";
 
 pub fn install_hooks(
     repo_path: &Path,
@@ -105,11 +109,17 @@ pub struct RefUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HookDispatchEvent {
     pub hook: String,
+    pub phase: Option<String>,
     pub repo: PathBuf,
+    pub repo_id: String,
+    pub request_id: Option<String>,
+    pub push_id: String,
     pub args: Vec<String>,
     pub updates: Vec<RefUpdate>,
     pub status: HookStatus,
     pub message: Option<String>,
+    pub quarantine_path: Option<PathBuf>,
+    pub reconcile_requested: bool,
 }
 
 impl HookDispatchEvent {
@@ -136,10 +146,32 @@ where
     let repo = repo
         .canonicalize()
         .map_err(|error| HookDispatchError::CanonicalizeRepo { path: repo, error })?;
+    let push_id = current_push_id();
+    let request_id = read_env_value(REQUEST_ID_ENV);
+    let quarantine_path = current_quarantine_path();
 
-    let (status, message) = match hook.as_str() {
-        "pre-receive" => evaluate_pre_receive(config_path, &repo, &updates, git, platform)?,
-        "reference-transaction" | "post-receive" => (HookStatus::Accepted, None),
+    let context = match hook.as_str() {
+        "pre-receive" => load_hook_context_strict(config_path, &repo)?,
+        "reference-transaction" | "post-receive" => load_hook_context_best_effort(config_path, &repo),
+        other => {
+            return Err(HookDispatchError::UnsupportedHook(other.to_owned()));
+        }
+    };
+
+    let evaluation = match hook.as_str() {
+        "pre-receive" => evaluate_pre_receive(
+            context.config.as_ref().expect("strict pre-receive config"),
+            context
+                .descriptor
+                .as_ref()
+                .expect("strict pre-receive descriptor"),
+            &repo,
+            &updates,
+            git,
+            platform,
+        )?,
+        "reference-transaction" => evaluate_reference_transaction(&args),
+        "post-receive" => evaluate_post_receive(&context),
         other => {
             return Err(HookDispatchError::UnsupportedHook(other.to_owned()));
         }
@@ -147,33 +179,49 @@ where
 
     let event = HookDispatchEvent {
         hook,
+        phase: evaluation.phase,
         repo,
+        repo_id: context.repo_id,
+        request_id,
+        push_id,
         args,
         updates,
-        status,
-        message,
+        status: evaluation.status,
+        message: evaluation.message,
+        quarantine_path,
+        reconcile_requested: evaluation.reconcile_requested,
     };
-    record_hook_event(&event);
+    record_hook_event(&event, context.config.as_ref());
     Ok(event)
 }
 
+#[derive(Debug)]
+struct HookContext {
+    config: Option<AppConfig>,
+    descriptor: Option<RepositoryDescriptor>,
+    repo_id: String,
+}
+
+#[derive(Debug)]
+struct HookEvaluation {
+    status: HookStatus,
+    message: Option<String>,
+    phase: Option<String>,
+    reconcile_requested: bool,
+}
+
 fn evaluate_pre_receive<G, P>(
-    config_path: &Path,
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
     repo: &Path,
     updates: &[RefUpdate],
     git: &G,
     platform: &P,
-) -> Result<(HookStatus, Option<String>), HookDispatchError>
+) -> Result<HookEvaluation, HookDispatchError>
 where
     G: GitExecutor,
     P: PlatformProbe,
 {
-    let config = AppConfig::load(config_path).map_err(HookDispatchError::Config)?;
-    let descriptors = config
-        .load_repository_descriptors()
-        .map_err(HookDispatchError::Config)?;
-    let descriptor = find_descriptor_for_repo(&descriptors, repo)?.clone();
-
     if descriptor.mode != RepositoryMode::Authoritative {
         return Ok(rejected(
             "writes are allowed only for authoritative repositories",
@@ -187,7 +235,7 @@ where
 
     let validator = Validator::new(git, platform);
     let validation = validator
-        .validate(&config, &descriptor)
+        .validate(config, descriptor)
         .map_err(HookDispatchError::ValidationInfra)?;
     if !validation.passed() {
         let details = validation
@@ -237,7 +285,81 @@ where
         }
     }
 
-    Ok((HookStatus::Accepted, None))
+    Ok(HookEvaluation {
+        status: HookStatus::Accepted,
+        message: None,
+        phase: None,
+        reconcile_requested: false,
+    })
+}
+
+fn evaluate_reference_transaction(args: &[String]) -> HookEvaluation {
+    HookEvaluation {
+        status: HookStatus::Accepted,
+        message: None,
+        phase: args.first().cloned(),
+        reconcile_requested: false,
+    }
+}
+
+fn evaluate_post_receive(context: &HookContext) -> HookEvaluation {
+    let reconcile_requested = match (&context.config, &context.descriptor) {
+        (Some(config), Some(descriptor))
+            if config.reconcile.on_push
+                && descriptor.mode == RepositoryMode::Authoritative
+                && descriptor.lifecycle == RepositoryLifecycle::Ready
+                && !descriptor.write_upstreams.is_empty() =>
+        {
+            true
+        }
+        _ => false,
+    };
+
+    HookEvaluation {
+        status: HookStatus::Accepted,
+        message: None,
+        phase: None,
+        reconcile_requested,
+    }
+}
+
+fn load_hook_context_strict(config_path: &Path, repo: &Path) -> Result<HookContext, HookDispatchError> {
+    let config = AppConfig::load(config_path).map_err(HookDispatchError::Config)?;
+    let descriptors = config
+        .load_repository_descriptors()
+        .map_err(HookDispatchError::Config)?;
+    let descriptor = find_descriptor_for_repo(&descriptors, repo)?.clone();
+
+    Ok(HookContext {
+        repo_id: descriptor.repo_id.clone(),
+        config: Some(config),
+        descriptor: Some(descriptor),
+    })
+}
+
+fn load_hook_context_best_effort(config_path: &Path, repo: &Path) -> HookContext {
+    let fallback_repo_id = repo.display().to_string();
+    let Ok(config) = AppConfig::load(config_path) else {
+        return HookContext {
+            config: None,
+            descriptor: None,
+            repo_id: fallback_repo_id,
+        };
+    };
+    let descriptor = config
+        .load_repository_descriptors()
+        .ok()
+        .and_then(|descriptors| find_descriptor_for_repo(&descriptors, repo).ok().cloned());
+    let repo_id = descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.repo_id.clone())
+        .unwrap_or(fallback_repo_id);
+
+    HookContext {
+        config: Some(config),
+        descriptor,
+        repo_id,
+    }
 }
 
 fn find_descriptor_for_repo<'a>(
@@ -303,16 +425,34 @@ fn is_fast_forward<G: GitExecutor>(
     }
 }
 
-fn rejected(message: impl Into<String>) -> (HookStatus, Option<String>) {
-    (HookStatus::Rejected, Some(message.into()))
+fn rejected(message: impl Into<String>) -> HookEvaluation {
+    HookEvaluation {
+        status: HookStatus::Rejected,
+        message: Some(message.into()),
+        phase: None,
+        reconcile_requested: false,
+    }
 }
 
-fn record_hook_event(event: &HookDispatchEvent) {
+pub fn push_trace_file_path(state_root: &Path, repo_id: &str, push_id: &str) -> PathBuf {
+    state_root
+        .join(HOOK_TRACE_ROOT)
+        .join(sanitize_path_component(repo_id))
+        .join(format!("{}.jsonl", sanitize_path_component(push_id)))
+}
+
+fn record_hook_event(event: &HookDispatchEvent, config: Option<&AppConfig>) {
     let Some(path) = std::env::var_os("GIT_RELAY_HOOK_EVENT_LOG") else {
+        if let Some(config) = config {
+            record_push_trace(config, event);
+        }
         return;
     };
     let path = PathBuf::from(path);
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        if let Some(config) = config {
+            record_push_trace(config, event);
+        }
         return;
     };
     let _ = writeln!(
@@ -320,6 +460,74 @@ fn record_hook_event(event: &HookDispatchEvent) {
         "{}",
         serde_json::to_string(event).expect("serialize hook event")
     );
+    if let Some(config) = config {
+        record_push_trace(config, event);
+    }
+}
+
+fn record_push_trace(config: &AppConfig, event: &HookDispatchEvent) {
+    let path = push_trace_file_path(&config.paths.state_root, &event.repo_id, &event.push_id);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "{}",
+        serde_json::to_string(event).expect("serialize hook event")
+    );
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn read_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn current_quarantine_path() -> Option<PathBuf> {
+    std::env::var_os("GIT_QUARANTINE_PATH").map(PathBuf::from)
+}
+
+fn current_push_id() -> String {
+    if let Some(push_id) = read_env_value(PUSH_ID_ENV) {
+        return push_id;
+    }
+    if let Some(request_id) = read_env_value(REQUEST_ID_ENV) {
+        return request_id;
+    }
+
+    format!(
+        "local-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
 }
 
 #[derive(Debug, Error)]
@@ -622,5 +830,32 @@ require_atomic = true
             .message
             .expect("message")
             .contains("must never be pushed"));
+    }
+
+    #[test]
+    fn reference_transaction_stays_observational_when_config_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo.git");
+        init_bare_repo(&repo);
+
+        let git = SystemGitExecutor;
+        let platform = FakePlatformProbe {
+            filesystem: "apfs".to_owned(),
+        };
+        let outcome = dispatch_hook_action(
+            &temp.path().join("missing-config.toml"),
+            "reference-transaction".to_owned(),
+            repo,
+            vec!["committed".to_owned()],
+            Cursor::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/main\n",
+            ),
+            &git,
+            &platform,
+        )
+        .expect("dispatch hook");
+
+        assert_eq!(outcome.status, HookStatus::Accepted);
+        assert_eq!(outcome.phase.as_deref(), Some("committed"));
     }
 }

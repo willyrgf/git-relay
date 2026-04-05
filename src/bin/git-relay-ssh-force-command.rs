@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use git_relay::git::SystemGitExecutor;
@@ -8,6 +9,9 @@ use git_relay::ssh_wrapper::resolve_and_authorize_ssh_command;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+const REQUEST_ID_ENV: &str = "GIT_RELAY_REQUEST_ID";
+const PUSH_ID_ENV: &str = "GIT_RELAY_PUSH_ID";
 
 #[derive(Debug, Parser)]
 #[command(name = "git-relay-ssh-force-command")]
@@ -45,9 +49,14 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     {
-        let error = std::process::Command::new(&resolved.service)
+        let mut command = std::process::Command::new(&resolved.service);
+        command
             .arg(&resolved.repo_path)
-            .exec();
+            .env(REQUEST_ID_ENV, generate_session_id("request"));
+        if resolved.service == "git-receive-pack" {
+            command.env(PUSH_ID_ENV, generate_session_id("push"));
+        }
+        let error = command.exec();
         Err(Box::new(error))
     }
 
@@ -56,4 +65,15 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         let _ = resolved;
         Err("git-relay-ssh-force-command is supported only on Unix platforms".into())
     }
+}
+
+fn generate_session_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
 }
