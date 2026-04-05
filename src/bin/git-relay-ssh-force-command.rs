@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use git_relay::ssh_wrapper::resolve_ssh_command;
+use git_relay::git::SystemGitExecutor;
+use git_relay::platform::RealPlatformProbe;
+use git_relay::ssh_wrapper::resolve_and_authorize_ssh_command;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -12,7 +14,7 @@ use std::os::unix::process::CommandExt;
 #[command(about = "Resolve and execute the Git Relay OpenSSH forced command")]
 struct Cli {
     #[arg(long)]
-    repo_root: PathBuf,
+    config: PathBuf,
     #[arg(long)]
     check_only: bool,
 }
@@ -31,7 +33,10 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let original_command =
         std::env::var("SSH_ORIGINAL_COMMAND").map_err(|_| "SSH_ORIGINAL_COMMAND is not set")?;
-    let resolved = resolve_ssh_command(&cli.repo_root, &original_command)?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let resolved =
+        resolve_and_authorize_ssh_command(&cli.config, &original_command, &git, &platform)?;
 
     if cli.check_only {
         println!("{}", serde_json::to_string_pretty(&resolved)?);
