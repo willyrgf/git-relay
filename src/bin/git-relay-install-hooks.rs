@@ -13,6 +13,8 @@ struct Cli {
     repo: PathBuf,
     #[arg(long)]
     dispatcher: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -27,7 +29,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let hooks = install_hooks(&cli.repo, &cli.dispatcher)?;
+    let hooks = install_hooks(&cli.repo, &cli.dispatcher, &cli.config)?;
     println!("{}", serde_json::to_string_pretty(&hooks)?);
     Ok(ExitCode::SUCCESS)
 }

@@ -10,7 +10,7 @@ use crate::deploy::{
     render_service, validate_runtime_profile, ServiceFormat, ServiceRenderRequest,
 };
 use crate::git::SystemGitExecutor;
-use crate::hooks::dispatch_hook_event;
+use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
@@ -88,9 +88,13 @@ struct RenderServiceOptions {
 #[derive(Debug, Args)]
 struct HookDispatchCommand {
     #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long)]
     hook: String,
     #[arg(long)]
     repo: std::path::PathBuf,
+    #[arg(long)]
+    json: bool,
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
@@ -129,17 +133,36 @@ where
 }
 
 fn run_hook_dispatch(options: HookDispatchCommand) -> Result<ExitCode, CliError> {
-    let event = dispatch_hook_event(options.hook, options.repo, options.args)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    writeln!(
-        stdout,
-        "{}",
-        serde_json::to_string_pretty(&event)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
-    )?;
-    stdout.flush()?;
-    Ok(ExitCode::SUCCESS)
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let event = dispatch_hook_action(
+        &options.config,
+        options.hook,
+        options.repo,
+        options.args,
+        io::stdin().lock(),
+        &git,
+        &platform,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    if options.json {
+        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&event)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+        )?;
+        stdout.flush()?;
+    }
+    if event.accepted() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        if let Some(message) = event.message {
+            eprintln!("{message}");
+        }
+        Ok(ExitCode::from(1))
+    }
 }
 
 fn run_deploy_validate_runtime(options: TargetOptions) -> Result<ExitCode, CliError> {

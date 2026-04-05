@@ -143,16 +143,14 @@ secret_ref = "env:GITHUB_WRITE_KEY"
     config_path
 }
 
-#[test]
-fn repo_validate_returns_json_for_valid_authoritative_repo() {
-    let temp = TempDir::new().expect("tempdir");
-    let config_path = write_config_fixture(&temp);
-    let repo_path = temp.path().join("repos").join("repo.git");
-    init_bare_repo(&repo_path);
-    configure_authoritative_repo(&repo_path);
-
-    let descriptor = format!(
-        r#"
+fn write_authoritative_descriptor(
+    temp: &TempDir,
+    repo_path: &Path,
+    include_read_upstream: bool,
+) -> PathBuf {
+    let descriptor = if include_read_upstream {
+        format!(
+            r#"
 repo_id = "github.com/example/repo.git"
 canonical_identity = "github.com/example/repo.git"
 repo_path = "{}"
@@ -176,9 +174,106 @@ url = "ssh://git@github.com/example/repo.git"
 auth_profile = "github-write"
 require_atomic = true
 "#,
-        repo_path.display()
-    );
-    fs::write(temp.path().join("repos.d").join("repo.toml"), descriptor).expect("descriptor");
+            repo_path.display()
+        )
+    } else {
+        format!(
+            r#"
+repo_id = "github.com/example/repo.git"
+canonical_identity = "github.com/example/repo.git"
+repo_path = "{}"
+mode = "authoritative"
+lifecycle = "ready"
+authority_model = "relay-authoritative"
+tracking_refs = "same-repo-hidden"
+refresh = "authoritative-local"
+push_ack = "local-commit"
+reconcile_policy = "on-push+manual"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
+
+[[write_upstreams]]
+name = "github-write"
+url = "ssh://git@github.com/example/repo.git"
+auth_profile = "github-write"
+require_atomic = true
+"#,
+            repo_path.display()
+        )
+    };
+    let path = temp.path().join("repos.d").join("repo.toml");
+    fs::write(&path, descriptor).expect("descriptor");
+    path
+}
+
+fn init_work_repo(path: &Path) {
+    fs::create_dir_all(path).expect("work repo");
+    StdCommand::new("git")
+        .args(["-c", "init.defaultBranch=main", "init"])
+        .arg(path)
+        .status()
+        .expect("git init")
+        .success()
+        .then_some(())
+        .expect("git init success");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            path.to_str().expect("path"),
+            "config",
+            "user.name",
+            "Git Relay Test",
+        ])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            path.to_str().expect("path"),
+            "config",
+            "user.email",
+            "git-relay@example.com",
+        ])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+}
+
+fn commit_file(path: &Path, file_name: &str, contents: &str, message: &str) {
+    fs::write(path.join(file_name), contents).expect("write file");
+    StdCommand::new("git")
+        .args(["-C", path.to_str().expect("path"), "add", file_name])
+        .status()
+        .expect("git add")
+        .success()
+        .then_some(())
+        .expect("git add success");
+    StdCommand::new("git")
+        .args(["-C", path.to_str().expect("path"), "commit", "-m", message])
+        .status()
+        .expect("git commit")
+        .success()
+        .then_some(())
+        .expect("git commit success");
+}
+
+fn cargo_bin_path(name: &str) -> PathBuf {
+    let command = Command::cargo_bin(name).expect("cargo bin");
+    PathBuf::from(command.get_program())
+}
+
+#[test]
+fn repo_validate_returns_json_for_valid_authoritative_repo() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, true);
 
     let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
     command
@@ -203,30 +298,7 @@ fn startup_classify_fails_closed_for_invalid_authoritative_repo() {
     let config_path = write_config_fixture(&temp);
     let repo_path = temp.path().join("repos").join("repo.git");
     init_bare_repo(&repo_path);
-
-    let descriptor = format!(
-        r#"
-repo_id = "github.com/example/repo.git"
-canonical_identity = "github.com/example/repo.git"
-repo_path = "{}"
-mode = "authoritative"
-lifecycle = "ready"
-authority_model = "relay-authoritative"
-tracking_refs = "same-repo-hidden"
-refresh = "authoritative-local"
-push_ack = "local-commit"
-reconcile_policy = "on-push+manual"
-exported_refs = ["refs/heads/*", "refs/tags/*"]
-
-[[write_upstreams]]
-name = "github-write"
-url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
-require_atomic = true
-"#,
-        repo_path.display()
-    );
-    fs::write(temp.path().join("repos.d").join("repo.toml"), descriptor).expect("descriptor");
+    write_authoritative_descriptor(&temp, &repo_path, false);
 
     let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
     command
@@ -252,30 +324,7 @@ fn deploy_validate_runtime_reports_secret_and_contract_health() {
     let repo_path = temp.path().join("repos").join("repo.git");
     init_bare_repo(&repo_path);
     configure_authoritative_repo(&repo_path);
-
-    let descriptor = format!(
-        r#"
-repo_id = "github.com/example/repo.git"
-canonical_identity = "github.com/example/repo.git"
-repo_path = "{}"
-mode = "authoritative"
-lifecycle = "ready"
-authority_model = "relay-authoritative"
-tracking_refs = "same-repo-hidden"
-refresh = "authoritative-local"
-push_ack = "local-commit"
-reconcile_policy = "on-push+manual"
-exported_refs = ["refs/heads/*", "refs/tags/*"]
-
-[[write_upstreams]]
-name = "github-write"
-url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
-require_atomic = true
-"#,
-        repo_path.display()
-    );
-    fs::write(temp.path().join("repos.d").join("repo.toml"), descriptor).expect("descriptor");
+    write_authoritative_descriptor(&temp, &repo_path, false);
 
     let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
     command
@@ -343,6 +392,8 @@ fn install_hooks_writes_git_hook_wrappers() {
     fs::create_dir_all(&repo_path).expect("repo");
     let dispatcher = temp.path().join("dispatcher");
     fs::write(&dispatcher, "#!/bin/sh\nexit 0\n").expect("dispatcher");
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "").expect("config");
 
     let mut command = Command::cargo_bin("git-relay-install-hooks").expect("cargo bin");
     command
@@ -351,10 +402,115 @@ fn install_hooks_writes_git_hook_wrappers() {
             repo_path.to_str().expect("repo"),
             "--dispatcher",
             dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains("pre-receive"))
         .stdout(predicate::str::contains("reference-transaction"))
         .stdout(predicate::str::contains("post-receive"));
+}
+
+#[test]
+fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_force_push() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let dispatcher = cargo_bin_path("git-relay");
+    let mut install = Command::cargo_bin("git-relay-install-hooks").expect("cargo bin");
+    install
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
+        ])
+        .assert()
+        .success();
+
+    let work_repo = temp.path().join("work");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("branch create push success");
+
+    let delete_status = StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            ":refs/heads/main",
+        ])
+        .status()
+        .expect("git push delete");
+    assert!(!delete_status.success(), "delete push should fail closed");
+
+    let hidden_ref_status = StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/git-relay/internal",
+        ])
+        .status()
+        .expect("git push hidden ref");
+    assert!(
+        !hidden_ref_status.success(),
+        "hidden ref push should fail closed"
+    );
+
+    commit_file(&work_repo, "README.md", "hello v2\n", "fast forward");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push fast forward")
+        .success()
+        .then_some(())
+        .expect("fast-forward push success");
+
+    let rewrite_repo = temp.path().join("rewrite");
+    init_work_repo(&rewrite_repo);
+    commit_file(&rewrite_repo, "README.md", "rewrite\n", "rewrite history");
+    let force_status = StdCommand::new("git")
+        .args([
+            "-C",
+            rewrite_repo.to_str().expect("rewrite repo"),
+            "push",
+            "--force",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git force push");
+    assert!(
+        !force_status.success(),
+        "non-fast-forward force push should fail closed"
+    );
 }
