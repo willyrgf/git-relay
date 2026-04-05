@@ -12,7 +12,7 @@ use crate::deploy::{
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
-use crate::reconcile::{reconcile_repository, ReconcileError};
+use crate::reconcile::{reconcile_repository, replication_status_for_repo, ReconcileError};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
 #[derive(Debug, Parser)]
@@ -60,6 +60,7 @@ struct ReplicationCommand {
 #[derive(Debug, Subcommand)]
 enum ReplicationSubcommand {
     Reconcile(TargetOptions),
+    Status(TargetOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +141,7 @@ where
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
         TopLevelCommand::Replication(command) => match command.command {
             ReplicationSubcommand::Reconcile(options) => run_replication_reconcile(options),
+            ReplicationSubcommand::Status(options) => run_replication_status(options),
         },
         TopLevelCommand::Repo(command) => match command.command {
             RepoSubcommand::Validate(options) => run_repo_validate(options),
@@ -204,6 +206,17 @@ fn run_replication_reconcile(options: TargetOptions) -> Result<ExitCode, CliErro
     let reports = targets
         .iter()
         .map(|descriptor| reconcile_repository(&config, descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_replication_status(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let reports = targets
+        .iter()
+        .map(|descriptor| replication_status_for_repo(&config, descriptor))
         .collect::<Result<Vec<_>, _>>()?;
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)

@@ -170,6 +170,13 @@ pub fn pending_request_file_path(state_root: &Path, repo_id: &str) -> PathBuf {
     pending_request_path(state_root, repo_id)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationStatus {
+    pub repo_id: String,
+    pub pending_request: Option<PendingReconcileRequest>,
+    pub latest_run: Option<ReconcileRunRecord>,
+}
+
 pub fn load_pending_reconcile_requests(
     state_root: &Path,
 ) -> Result<Vec<PendingReconcileRequest>, ReconcileError> {
@@ -197,6 +204,17 @@ pub fn load_pending_reconcile_requests(
     }
     requests.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
     Ok(requests)
+}
+
+pub fn replication_status_for_repo(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<ReplicationStatus, ReconcileError> {
+    Ok(ReplicationStatus {
+        repo_id: descriptor.repo_id.clone(),
+        pending_request: read_pending_request(&config.paths.state_root, &descriptor.repo_id)?,
+        latest_run: latest_run_record(&config.paths.state_root, &descriptor.repo_id)?,
+    })
 }
 
 pub fn process_pending_reconcile_requests(
@@ -520,6 +538,48 @@ fn clear_in_progress_marker(config: &AppConfig, repo_id: &str) {
 
 fn clear_pending_request(config: &AppConfig, repo_id: &str) {
     let _ = fs::remove_file(pending_request_path(&config.paths.state_root, repo_id));
+}
+
+fn read_pending_request(
+    state_root: &Path,
+    repo_id: &str,
+) -> Result<Option<PendingReconcileRequest>, ReconcileError> {
+    read_json_optional(&pending_request_path(state_root, repo_id))
+}
+
+fn latest_run_record(
+    state_root: &Path,
+    repo_id: &str,
+) -> Result<Option<ReconcileRunRecord>, ReconcileError> {
+    let directory = run_record_directory(state_root, repo_id);
+    if !directory.exists() {
+        return Ok(None);
+    }
+
+    let mut candidates = fs::read_dir(&directory)
+        .map_err(|error| ReconcileError::Read {
+            path: directory.clone(),
+            error,
+        })?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| ReconcileError::Read {
+                path: directory.clone(),
+                error,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    candidates.sort();
+    candidates.reverse();
+
+    for path in candidates {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(record) = read_json_optional::<ReconcileRunRecord>(&path)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 fn list_local_exported_refs(
@@ -871,11 +931,14 @@ fn pending_request_directory(state_root: &Path) -> PathBuf {
 }
 
 fn run_record_path(state_root: &Path, repo_id: &str, run_id: &str) -> PathBuf {
+    run_record_directory(state_root, repo_id).join(format!("{run_id}.json"))
+}
+
+fn run_record_directory(state_root: &Path, repo_id: &str) -> PathBuf {
     state_root
         .join("reconcile")
         .join("runs")
         .join(sanitize_path_component(repo_id))
-        .join(format!("{run_id}.json"))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ReconcileError> {

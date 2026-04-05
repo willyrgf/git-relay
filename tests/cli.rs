@@ -668,6 +668,109 @@ fn git_relayd_serve_once_drains_pending_reconcile_requests() {
 }
 
 #[test]
+fn replication_status_reports_pending_and_latest_run_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_ok = temp.path().join("upstream-ok.git");
+    init_bare_repo(&upstream_ok);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_ok.to_str().expect("path"), false)],
+    );
+
+    let dispatcher = cargo_bin_path("git-relay");
+    Command::cargo_bin("git-relay-install-hooks")
+        .expect("cargo bin")
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
+        ])
+        .assert()
+        .success();
+
+    let work_repo = temp.path().join("work-status");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-status")
+        .env("GIT_RELAY_PUSH_ID", "push-status")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("push success");
+
+    let before = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "status",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let before_status: Value = serde_json::from_slice(&before).expect("status json");
+    let before_item = &before_status.as_array().expect("status array")[0];
+    assert_eq!(before_item["pending_request"]["last_push_id"], "push-status");
+    assert!(before_item["latest_run"].is_null());
+
+    Command::cargo_bin("git-relayd")
+        .expect("cargo bin")
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--once",
+        ])
+        .assert()
+        .success();
+
+    let after = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "status",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after_status: Value = serde_json::from_slice(&after).expect("status json");
+    let after_item = &after_status.as_array().expect("status array")[0];
+    assert!(after_item["pending_request"].is_null());
+    assert_eq!(after_item["latest_run"]["repo_safety"], "healthy");
+}
+
+#[test]
 fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_force_push() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
