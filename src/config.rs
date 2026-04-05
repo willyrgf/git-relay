@@ -155,9 +155,12 @@ pub struct MigrationConfig {
 pub struct DeploymentProfile {
     pub platform: SupportedPlatform,
     pub service_manager: ServiceManager,
+    pub service_label: String,
     pub git_only_command_mode: GitOnlyCommandMode,
     pub forced_command_wrapper: PathBuf,
     pub disable_forwarding: bool,
+    pub runtime_secret_env_file: PathBuf,
+    pub required_secret_keys: Vec<String>,
     pub allowed_git_services: Vec<GitService>,
     pub supported_filesystems: Vec<String>,
 }
@@ -620,9 +623,12 @@ targeted_relock_mode = "validated-only"
 [deployment]
 platform = "macos"
 service_manager = "launchd"
+service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "{}"
 disable_forwarding = true
+runtime_secret_env_file = "{}"
+required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["apfs"]
 "#,
@@ -630,6 +636,7 @@ supported_filesystems = ["apfs"]
             repo_root.display(),
             descriptor_root.display(),
             temp.path().join("wrapper").display(),
+            temp.path().join("git-relay.env").display(),
         );
         std::fs::write(&config_path, config).expect("config");
 

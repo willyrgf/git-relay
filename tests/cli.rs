@@ -112,9 +112,12 @@ targeted_relock_mode = "validated-only"
 [deployment]
 platform = "{platform}"
 service_manager = "{service_manager}"
+service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "/usr/local/bin/git-relay-ssh-force-command"
 disable_forwarding = true
+runtime_secret_env_file = "{env_file}"
+required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["{filesystem}"]
 
@@ -129,8 +132,14 @@ secret_ref = "env:GITHUB_WRITE_KEY"
         temp.path().display(),
         repo_root.display(),
         repo_config_root.display(),
+        env_file = temp.path().join("git-relay.env").display(),
     );
     fs::write(&config_path, config).expect("config");
+    fs::write(
+        temp.path().join("git-relay.env"),
+        "GITHUB_READ_TOKEN=alpha\nGITHUB_WRITE_KEY=beta\n",
+    )
+    .expect("env file");
     config_path
 }
 
@@ -234,4 +243,70 @@ require_atomic = true
         .stdout(predicate::str::contains(
             "\"write_acceptance_allowed\": false",
         ));
+}
+
+#[test]
+fn deploy_validate_runtime_reports_secret_and_contract_health() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let descriptor = format!(
+        r#"
+repo_id = "github.com/example/repo.git"
+canonical_identity = "github.com/example/repo.git"
+repo_path = "{}"
+mode = "authoritative"
+lifecycle = "ready"
+authority_model = "relay-authoritative"
+tracking_refs = "same-repo-hidden"
+refresh = "authoritative-local"
+push_ack = "local-commit"
+reconcile_policy = "on-push+manual"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
+
+[[write_upstreams]]
+name = "github-write"
+url = "ssh://git@github.com/example/repo.git"
+auth_profile = "github-write"
+require_atomic = true
+"#,
+        repo_path.display()
+    );
+    fs::write(temp.path().join("repos.d").join("repo.toml"), descriptor).expect("descriptor");
+
+    let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
+    command
+        .args([
+            "deploy",
+            "validate-runtime",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"passed\""))
+        .stdout(predicate::str::contains("\"secret_count\": 2"));
+}
+
+#[test]
+fn git_relayd_serve_once_fails_closed_when_runtime_secrets_are_missing() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    fs::remove_file(temp.path().join("git-relay.env")).expect("remove env file");
+
+    let mut command = Command::cargo_bin("git-relayd").expect("cargo bin");
+    command
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--once",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("runtime_secret_env_file"));
 }

@@ -6,6 +6,9 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::classification::classify_startup;
 use crate::config::{AppConfig, ConfigError, RepositoryDescriptor};
+use crate::deploy::{
+    render_service, validate_runtime_profile, ServiceFormat, ServiceRenderRequest,
+};
 use crate::git::SystemGitExecutor;
 use crate::platform::RealPlatformProbe;
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
@@ -20,8 +23,21 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    Deploy(DeployCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
+}
+
+#[derive(Debug, Args)]
+struct DeployCommand {
+    #[command(subcommand)]
+    command: DeploySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DeploySubcommand {
+    ValidateRuntime(TargetOptions),
+    RenderService(RenderServiceOptions),
 }
 
 #[derive(Debug, Args)]
@@ -56,6 +72,16 @@ struct TargetOptions {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct RenderServiceOptions {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long, value_enum)]
+    format: ServiceFormat,
+    #[arg(long)]
+    binary_path: std::path::PathBuf,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -75,6 +101,10 @@ where
 {
     let cli = Cli::parse_from(args);
     match cli.command {
+        TopLevelCommand::Deploy(command) => match command.command {
+            DeploySubcommand::ValidateRuntime(options) => run_deploy_validate_runtime(options),
+            DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
+        },
         TopLevelCommand::Repo(command) => match command.command {
             RepoSubcommand::Validate(options) => run_repo_validate(options),
         },
@@ -82,6 +112,37 @@ where
             StartupSubcommand::Classify(options) => run_startup_classify(options),
         },
     }
+}
+
+fn run_deploy_validate_runtime(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+    let report = validate_runtime_profile(&config, &targets, &validator)?;
+    emit_output(&report, options.json)?;
+    if report.passed() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn run_deploy_render_service(options: RenderServiceOptions) -> Result<ExitCode, CliError> {
+    let config = AppConfig::load(&options.config)?;
+    let rendered = render_service(
+        &config,
+        &ServiceRenderRequest {
+            binary_path: options.binary_path,
+            config_path: options.config,
+            format: options.format,
+        },
+    );
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    stdout.write_all(rendered.as_bytes())?;
+    stdout.flush()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_repo_validate(options: TargetOptions) -> Result<ExitCode, CliError> {
