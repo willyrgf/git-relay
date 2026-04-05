@@ -10,6 +10,7 @@ use crate::deploy::{
     render_service, validate_runtime_profile, ServiceFormat, ServiceRenderRequest,
 };
 use crate::git::SystemGitExecutor;
+use crate::hooks::dispatch_hook_event;
 use crate::platform::RealPlatformProbe;
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
@@ -24,6 +25,8 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
     Deploy(DeployCommand),
+    #[command(hide = true)]
+    HookDispatch(HookDispatchCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
 }
@@ -82,6 +85,16 @@ struct RenderServiceOptions {
     binary_path: std::path::PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct HookDispatchCommand {
+    #[arg(long)]
+    hook: String,
+    #[arg(long)]
+    repo: std::path::PathBuf,
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -105,6 +118,7 @@ where
             DeploySubcommand::ValidateRuntime(options) => run_deploy_validate_runtime(options),
             DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
         },
+        TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
         TopLevelCommand::Repo(command) => match command.command {
             RepoSubcommand::Validate(options) => run_repo_validate(options),
         },
@@ -112,6 +126,20 @@ where
             StartupSubcommand::Classify(options) => run_startup_classify(options),
         },
     }
+}
+
+fn run_hook_dispatch(options: HookDispatchCommand) -> Result<ExitCode, CliError> {
+    let event = dispatch_hook_event(options.hook, options.repo, options.args)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    writeln!(
+        stdout,
+        "{}",
+        serde_json::to_string_pretty(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+    )?;
+    stdout.flush()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_deploy_validate_runtime(options: TargetOptions) -> Result<ExitCode, CliError> {

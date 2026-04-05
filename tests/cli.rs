@@ -310,3 +310,51 @@ fn git_relayd_serve_once_fails_closed_when_runtime_secrets_are_missing() {
         .failure()
         .stderr(predicate::str::contains("runtime_secret_env_file"));
 }
+
+#[test]
+fn ssh_force_command_accepts_only_git_pack_services_under_repo_root() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_root = temp.path().join("repos");
+    let repo_path = repo_root.join("example.git");
+    fs::create_dir_all(&repo_path).expect("repo");
+
+    let mut command = Command::cargo_bin("git-relay-ssh-force-command").expect("cargo bin");
+    command
+        .env("SSH_ORIGINAL_COMMAND", "git-receive-pack example.git")
+        .args([
+            "--repo-root",
+            repo_root.to_str().expect("repo root"),
+            "--check-only",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"service\": \"git-receive-pack\"",
+        ))
+        .stdout(predicate::str::contains(
+            repo_path.to_str().expect("repo path"),
+        ));
+}
+
+#[test]
+fn install_hooks_writes_git_hook_wrappers() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo.git");
+    fs::create_dir_all(&repo_path).expect("repo");
+    let dispatcher = temp.path().join("dispatcher");
+    fs::write(&dispatcher, "#!/bin/sh\nexit 0\n").expect("dispatcher");
+
+    let mut command = Command::cargo_bin("git-relay-install-hooks").expect("cargo bin");
+    command
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pre-receive"))
+        .stdout(predicate::str::contains("reference-transaction"))
+        .stdout(predicate::str::contains("post-receive"));
+}

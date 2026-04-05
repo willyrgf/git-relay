@@ -3,5 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod deploy;
 pub mod git;
+pub mod hooks;
 pub mod platform;
+pub mod ssh_wrapper;
 pub mod validator;
