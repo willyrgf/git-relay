@@ -12,6 +12,7 @@ use crate::deploy::{
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
+use crate::reconcile::{reconcile_repository, ReconcileError};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
 #[derive(Debug, Parser)]
@@ -27,6 +28,7 @@ enum TopLevelCommand {
     Deploy(DeployCommand),
     #[command(hide = true)]
     HookDispatch(HookDispatchCommand),
+    Replication(ReplicationCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
 }
@@ -47,6 +49,17 @@ enum DeploySubcommand {
 struct RepoCommand {
     #[command(subcommand)]
     command: RepoSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct ReplicationCommand {
+    #[command(subcommand)]
+    command: ReplicationSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ReplicationSubcommand {
+    Reconcile(TargetOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -104,6 +117,8 @@ pub enum CliError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
+    Reconcile(#[from] ReconcileError),
+    #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
     #[error("repository {0} was not found in the descriptor set")]
     RepositoryNotFound(String),
@@ -123,6 +138,9 @@ where
             DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
         },
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
+        TopLevelCommand::Replication(command) => match command.command {
+            ReplicationSubcommand::Reconcile(options) => run_replication_reconcile(options),
+        },
         TopLevelCommand::Repo(command) => match command.command {
             RepoSubcommand::Validate(options) => run_repo_validate(options),
         },
@@ -178,6 +196,17 @@ fn run_deploy_validate_runtime(options: TargetOptions) -> Result<ExitCode, CliEr
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+fn run_replication_reconcile(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let reports = targets
+        .iter()
+        .map(|descriptor| reconcile_repository(&config, descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_deploy_render_service(options: RenderServiceOptions) -> Result<ExitCode, CliError> {

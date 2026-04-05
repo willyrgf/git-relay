@@ -5,6 +5,7 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use git_relay::hooks::push_trace_file_path;
 use git_relay::platform::{PlatformProbe, RealPlatformProbe};
+use git_relay::reconcile::pending_request_file_path;
 use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -196,6 +197,45 @@ require_atomic = true
     path
 }
 
+fn write_authoritative_descriptor_with_write_upstreams(
+    temp: &TempDir,
+    repo_path: &Path,
+    write_upstreams: &[(&str, &str, bool)],
+) -> PathBuf {
+    let mut descriptor = format!(
+        r#"
+repo_id = "github.com/example/repo.git"
+canonical_identity = "github.com/example/repo.git"
+repo_path = "{}"
+mode = "authoritative"
+lifecycle = "ready"
+authority_model = "relay-authoritative"
+tracking_refs = "same-repo-hidden"
+refresh = "authoritative-local"
+push_ack = "local-commit"
+reconcile_policy = "on-push+manual"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
+"#,
+        repo_path.display()
+    );
+    for (name, url, require_atomic) in write_upstreams {
+        descriptor.push_str(&format!(
+            r#"
+
+[[write_upstreams]]
+name = "{name}"
+url = "{url}"
+auth_profile = "github-write"
+require_atomic = {require_atomic}
+"#
+        ));
+    }
+
+    let path = temp.path().join("repos.d").join("repo.toml");
+    fs::write(&path, descriptor).expect("descriptor");
+    path
+}
+
 fn init_work_repo(path: &Path) {
     fs::create_dir_all(path).expect("work repo");
     StdCommand::new("git")
@@ -271,6 +311,16 @@ fn read_push_trace(state_root: &Path, repo_id: &str, push_id: &str) -> Vec<Value
         .lines()
         .map(|line| serde_json::from_str(line).expect("trace json"))
         .collect()
+}
+
+fn read_git_ref(repo_path: &Path, ref_name: &str) -> String {
+    let output = StdCommand::new("git")
+        .arg(format!("--git-dir={}", repo_path.display()))
+        .args(["rev-parse", ref_name])
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[test]
@@ -451,6 +501,87 @@ fn deploy_render_service_uses_packaged_example_config() {
 }
 
 #[test]
+fn replication_reconcile_records_mixed_results_and_updates_internal_observed_refs() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_ok = temp.path().join("upstream-ok.git");
+    init_bare_repo(&upstream_ok);
+    let upstream_missing = temp.path().join("missing-upstream.git");
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[
+            ("alpha", upstream_ok.to_str().expect("path"), false),
+            ("beta", upstream_missing.to_str().expect("path"), false),
+        ],
+    );
+
+    let work_repo = temp.path().join("work-reconcile");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("reconcile json");
+    let runs = report.as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run["repo_safety"], "degraded");
+    assert!(
+        run["upstream_results"]
+            .as_array()
+            .expect("upstream results")
+            .iter()
+            .any(|item| item["upstream_id"] == "alpha" && item["state"] == "in_sync")
+    );
+    assert!(
+        run["upstream_results"]
+            .as_array()
+            .expect("upstream results")
+            .iter()
+            .any(|item| item["upstream_id"] == "beta" && item["state"] == "stalled")
+    );
+
+    let local_main = read_git_ref(&repo_path, "refs/heads/main");
+    let observed_main = read_git_ref(
+        &repo_path,
+        "refs/git-relay/upstreams/alpha/heads/main",
+    );
+    assert_eq!(observed_main, local_main);
+}
+
+#[test]
 fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_force_push() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
@@ -524,6 +655,9 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
         }),
         "accepted push should record post-receive reconcile wakeup intent"
     );
+    let pending_request = fs::read_to_string(pending_request_file_path(temp.path(), repo_id))
+        .expect("pending reconcile request");
+    assert!(pending_request.contains("\"last_push_id\": \"push-accept-main\""));
 
     let delete_push_id = "push-reject-delete";
     let delete_status = StdCommand::new("git")

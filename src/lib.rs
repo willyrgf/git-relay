@@ -5,5 +5,6 @@ pub mod deploy;
 pub mod git;
 pub mod hooks;
 pub mod platform;
+pub mod reconcile;
 pub mod ssh_wrapper;
 pub mod validator;

@@ -12,6 +12,7 @@ use crate::config::{
 };
 use crate::git::{GitCommandError, GitExecutor};
 use crate::platform::PlatformProbe;
+use crate::reconcile::enqueue_reconcile_request;
 use crate::validator::{ValidationInfrastructureError, Validator};
 
 const HOOK_NAMES: [&str; 3] = ["pre-receive", "reference-transaction", "post-receive"];
@@ -192,6 +193,16 @@ where
         reconcile_requested: evaluation.reconcile_requested,
     };
     record_hook_event(&event, context.config.as_ref());
+    if event.reconcile_requested {
+        if let (Some(config), Some(descriptor)) = (context.config.as_ref(), context.descriptor.as_ref()) {
+            let _ = enqueue_reconcile_request(
+                config,
+                descriptor,
+                Some(&event.push_id),
+                event.request_id.as_deref(),
+            );
+        }
+    }
     Ok(event)
 }
 

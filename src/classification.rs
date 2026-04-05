@@ -1,9 +1,9 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{RepositoryDescriptor, RepositoryLifecycle, RepositoryMode};
 use crate::validator::ValidationReport;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySafetyState {
     Healthy,
@@ -12,19 +12,25 @@ pub enum RepositorySafetyState {
     Quarantined,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamConvergenceState {
     Unknown,
+    Observing,
+    InSync,
+    OutOfSync,
+    Reconciling,
+    Stalled,
+    Unsupported,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamStartupState {
     pub upstream_id: String,
     pub state: UpstreamConvergenceState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupClassification {
     pub repo_id: String,
     pub lifecycle: RepositoryLifecycle,
