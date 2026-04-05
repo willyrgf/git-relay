@@ -1318,10 +1318,7 @@ Why:
 1. Which exact Git version floor satisfies the required hook, protocol, atomicity-detection, and durability-floor behavior across the supported macOS and Linux platforms? `needs verification`
 2. Which exact Nix version floor provides the required flake Git URL, targeted relock, and packaged deployment behavior across the supported macOS and Linux platforms? `needs verification`
 3. Which additional filesystem profiles beyond the validated local POSIX deployments should enter the supported durability matrix? `needs verification`
-4. Which additional self-managed or managed upstream products should enter the supported capability matrix for atomic probing and hidden-ref behavior? `needs verification`
-5. How aggressive should automatic reconciliation be: on push only, on demand only, periodic, or some combination?
-6. How much automation should the migration tool provide for transitive remediation suggestions such as `follows`?
-7. What retention defaults keep cache growth practical without undermining offline expectations?
+4. What retention defaults keep cache growth practical without undermining offline expectations?
 
 The following are deferred future-scope questions, not implementation blockers for the current RFC:
 
@@ -1333,7 +1330,7 @@ The following are deferred future-scope questions, not implementation blockers f
 
 Adopt the following product direction:
 
-> **Git Relay should be built as a Git-first cache and replication edge, with explicit Nix direct-input migration and no tarball compatibility plane in the foundational architecture or MVP.**
+> **Git Relay should be built as a Git-first cache and replication edge, with explicit Nix direct-input migration and no tarball compatibility plane in the foundational architecture or first supported release.**
 
 The relay’s core contract is:
 
@@ -1342,12 +1339,210 @@ The relay’s core contract is:
 - asynchronous convergence to one or more upstream Git servers,
 - and explicit, reviewable migration of direct Nix flake inputs to concrete Git transports.
 
-The foundational architecture keeps correctness-critical persistent state in Git repositories and declarative policy rather than in a mandatory relational side store. This keeps the protocol boundary coherent, makes bootstrap and repository mutation explicit, allows direct Nix inputs to route through the relay using normal Git mechanisms, and keeps the MVP focused on the part of the system that must be correct first: the Git read/write boundary.
+The foundational architecture keeps correctness-critical persistent state in Git repositories and declarative policy rather than in a mandatory relational side store. This keeps the protocol boundary coherent, makes bootstrap and repository mutation explicit, allows direct Nix inputs to route through the relay using normal Git mechanisms, and keeps the first supported implementation focused on the part of the system that must be correct first: the Git read/write boundary.
 
-The supported deployment contract for that MVP is intentionally narrow:
+The supported deployment contract for that first supported release is intentionally narrow:
 
 - authoritative repositories run on macOS or Linux only,
 - authoritative repositories must set `core.fsync=all` and `core.fsyncMethod=fsync`,
 - packaged deployment is Nix-built,
 - runtime secrets stay outside `/nix/store`,
 - and service-manager integration is `launchd` on macOS and `systemd` on Linux.
+
+## 26. Concrete Implementation Plan
+
+This section turns the verified architecture into the implementation plan to execute now. It resolves the planning choices that are no longer open.
+
+### 26.1 Planning decisions fixed by this RFC
+
+- Internal tracking refs stay in the same authoritative repository in the initial implementation. Startup and provisioning must enforce the Section 13.2 validator strictly. Internal refs must never be pushed upstream.
+- Automatic reconciliation is `on_push + manual` only in the initial implementation. Periodic reconciliation is deferred.
+- The migration CLI reports unresolved transitive shorthand usage only. It does not generate or apply automatic `follows` or override rewrites in the initial implementation.
+- Implementation planning must cover the full supported upstream matrix for this product, not a reduced prototype subset. Managed and self-managed upstream classes in scope for the supported matrix must all pass the same capability-probing and conformance harness before release.
+- Planning baseline uses current major Git, Nix, and OpenSSH versions on the supported macOS and Linux platforms. Exact minimum supported floors remain release gates and must be closed by conformance evidence rather than by assumption.
+
+### 26.2 Workstream order
+
+Implementation proceeds in this order:
+
+1. repository contract and validator
+2. deployment profile and service supervision
+3. Git ingress and authoritative local acceptance
+4. reconcile engine and recoverability
+5. upstream matrix conformance
+6. read path and cache-only operation
+7. Nix migration CLI
+8. observability, repair, and release-floor closure
+
+No downstream workstream may weaken an earlier contract. If later implementation pressure conflicts with the validator, local acceptance contract, or recovery model, the implementation must change instead of the invariant.
+
+### 26.3 Workstream 1: Repository Contract And Validator
+
+Deliver:
+
+- repository descriptor schema with explicit authority model, upstream definitions, exported-ref policy, and auth-profile bindings
+- authoritative repository validator enforcing Section 13.2 before a repository can enter `ready`
+- validator checks for same-repository hidden refs, SHA-by-id upload-pack restrictions, Git-only command restriction, fsync settings, and supported filesystem/profile constraints
+- deterministic startup classification entrypoint that marks all upstreams `unknown` before fresh observation
+
+Gate:
+
+- no authoritative repository can accept writes unless the validator passes
+- validator failure forces fail-closed behavior, not warning-only behavior
+
+Parallel ownership boundary:
+
+- Team A owns repository descriptors, validator, and startup classification inputs
+
+### 26.4 Workstream 2: Deployment Profile And Service Supervision
+
+Deliver:
+
+- Nix-built package outputs for the relay daemon, hook installer, and SSH forced-command wrapper
+- launchd and systemd integration for the supported macOS and Linux profiles
+- runtime secret injection outside `/nix/store`
+- service startup profile that runs validator checks before enabling authoritative write acceptance
+
+Gate:
+
+- service-manager bring-up must succeed on supported macOS and Linux profiles
+- startup must fail closed when required runtime secrets or repository contracts are missing
+
+Parallel ownership boundary:
+
+- Team B owns packaging, launchd/systemd templates, runtime profile validation, and secret injection wiring
+
+### 26.5 Workstream 3: Git Ingress And Authoritative Local Acceptance
+
+Deliver:
+
+- SSH ingress through OpenSSH forced-command routing into system Git
+- optional smart HTTP read path kept isolated from write-path work
+- authoritative local write path with `git-receive-pack`, receive quarantine, `pre-receive`, `reference-transaction`, and `post-receive`
+- strict `local-commit` acknowledgement contract for committed local refs only
+- explicit rejection of any implementation shortcut that tries to infer the user-intended push set beyond what native ingress transmitted
+
+Gate:
+
+- acknowledged pushes remain readable and recoverable locally after crash
+- hooks and wrappers do not become alternate truth sources for success
+- no implementation step assumes ordinary native inbound whole-push atomicity
+
+Parallel ownership boundary:
+
+- Team C owns SSH ingress, hook contract, and authoritative local acceptance path
+
+### 26.6 Workstream 4: Reconcile Engine And Recoverability
+
+Deliver:
+
+- one reconcile coordinator with one `reconcile_run_id`, one desired snapshot, and one captured upstream set per run
+- per-upstream observe, compute, apply, observe execution
+- explicit `unsupported`, `stalled`, `out_of_sync`, and `divergent` classification rules
+- stale-lock breaking and stale-run supersession with advisory lock contents only
+- `on_push + manual` scheduling only
+
+Gate:
+
+- no reconcile path may mutate observed upstream refs optimistically
+- crash recovery must recompute from local refs, internal observed refs, and fresh observation
+- mixed per-upstream terminal results must remain visible under one run without claiming cross-upstream atomicity
+
+Parallel ownership boundary:
+
+- Team D owns reconcile coordinator, lock handling, run recording, and recovery classification
+
+### 26.7 Workstream 5: Upstream Matrix Conformance
+
+Deliver:
+
+- a conformance harness for every upstream product and transport in the supported matrix
+- behavior probes for atomic capability, auth behavior, error classification, and disposable namespace handling
+- self-managed upstream conformance for same-repository hidden-ref assumptions where relevant
+- release manifest recording the supported matrix and the evidence used to admit each entry
+
+Gate:
+
+- every supported upstream entry must pass the same conformance suite before release
+- no supported upstream may be admitted by brand-name assumption alone
+- `require_atomic = true` must be proven by session behavior on each supported entry
+
+Parallel ownership boundary:
+
+- Team E owns the upstream matrix harness and provider-specific fixtures
+
+### 26.8 Workstream 6: Read Path And Cache-Only Operation
+
+Deliver:
+
+- repository identity resolution
+- freshness policy enforcement
+- singleflight refresh
+- cache-only repository mode
+- local object serving and negative-cache behavior consistent with policy
+
+Gate:
+
+- authoritative-local freshness must never consult upstream before serving accepted local refs
+- stale serving must follow explicit policy only
+
+Parallel ownership boundary:
+
+- Team F owns read-path serving, refresh, and cache-only mode
+
+### 26.9 Workstream 7: Nix Migration CLI
+
+Deliver:
+
+- parser-backed deterministic rewrite for supported literal shorthand forms
+- validated-only targeted relock behavior
+- diff-first explicit mutation workflow
+- unresolved transitive shorthand reporting only
+
+Gate:
+
+- unsupported or ambiguous expressions fail closed
+- second rewrite run is a no-op
+- targeted relock is allowed only inside the validated Nix version-and-graph matrix
+
+Parallel ownership boundary:
+
+- Team G owns the migration CLI, grammar fixtures, and relock matrix enforcement
+
+### 26.10 Workstream 8: Observability, Repair, And Release-Floor Closure
+
+Deliver:
+
+- structured logs carrying `request_id`, `repo_id`, `push_id`, `reconcile_run_id`, `upstream_id`, `attempt_id`, and client identity
+- operator commands for inspect, doctor, repair, reconcile, and migration inspection
+- release conformance report closing exact Git and Nix floors for supported platforms
+- retention defaults for cache growth, terminal run evidence, and authoritative maintenance
+
+Gate:
+
+- the release is not complete until exact version floors are backed by conformance evidence
+- no operator repair path may rely on stale lock contents or speculative replay history
+
+Parallel ownership boundary:
+
+- Team H owns observability, operator tooling, and release-floor evidence
+
+### 26.11 Integration rules across teams
+
+- Team A defines the repository descriptor and validator contract first. Other teams consume it; they do not fork it.
+- Team C and Team D must share one authoritative ref and state-transition vocabulary from Sections 8, 12, 13, 16, and 19.
+- Team E does not redefine upstream semantics. It proves conformance against the existing reconcile contract.
+- Team G does not widen rewrite grammar or relock scope without new validation and an RFC update.
+- Team B cannot bypass validator or secret-handling requirements for convenience in local deployment tooling.
+
+### 26.12 Release criteria for the first supported implementation
+
+The first supported implementation is ready only when all of the following are true:
+
+- authoritative repositories fail closed unless Section 13.2 validation passes
+- local acceptance obeys the committed-local-ref contract under crash testing
+- reconcile runs obey the bounded execution-unit contract with deterministic recovery
+- every entry in the supported upstream matrix passes conformance
+- migration rewrite and targeted relock obey the validated matrix contract
+- supported macOS and Linux deployment profiles pass packaging, supervision, and secret-injection checks
+- exact supported Git and Nix floors are recorded from evidence, not inferred from “current major versions”
