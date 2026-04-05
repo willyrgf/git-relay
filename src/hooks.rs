@@ -10,9 +10,10 @@ use thiserror::Error;
 use crate::config::{
     AppConfig, ConfigError, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
 };
+use crate::crash::{self, CrashCheckpoint};
 use crate::git::{GitCommandError, GitExecutor};
 use crate::platform::PlatformProbe;
-use crate::reconcile::enqueue_reconcile_request;
+use crate::reconcile::{enqueue_reconcile_request, load_divergence_markers, ReconcileError};
 use crate::validator::{ValidationInfrastructureError, Validator};
 
 const HOOK_NAMES: [&str; 3] = ["pre-receive", "reference-transaction", "post-receive"];
@@ -147,13 +148,18 @@ where
     let repo = repo
         .canonicalize()
         .map_err(|error| HookDispatchError::CanonicalizeRepo { path: repo, error })?;
+    if hook == "pre-receive" {
+        crash::hit_checkpoint(CrashCheckpoint::BeforePreReceive);
+    }
     let push_id = current_push_id();
     let request_id = read_env_value(REQUEST_ID_ENV);
     let quarantine_path = current_quarantine_path();
 
     let context = match hook.as_str() {
         "pre-receive" => load_hook_context_strict(config_path, &repo)?,
-        "reference-transaction" | "post-receive" => load_hook_context_best_effort(config_path, &repo),
+        "reference-transaction" | "post-receive" => {
+            load_hook_context_best_effort(config_path, &repo)
+        }
         other => {
             return Err(HookDispatchError::UnsupportedHook(other.to_owned()));
         }
@@ -193,8 +199,11 @@ where
         reconcile_requested: evaluation.reconcile_requested,
     };
     record_hook_event(&event, context.config.as_ref());
+    maybe_hit_hook_checkpoint(&event);
     if event.reconcile_requested {
-        if let (Some(config), Some(descriptor)) = (context.config.as_ref(), context.descriptor.as_ref()) {
+        if let (Some(config), Some(descriptor)) =
+            (context.config.as_ref(), context.descriptor.as_ref())
+        {
             let _ = enqueue_reconcile_request(
                 config,
                 descriptor,
@@ -257,6 +266,18 @@ where
             .join("; ");
         return Ok(rejected(format!(
             "repository contract validation failed before write acceptance: {details}"
+        )));
+    }
+
+    let divergence_markers = load_divergence_markers(repo).map_err(HookDispatchError::Reconcile)?;
+    if !divergence_markers.is_empty() {
+        let upstreams = divergence_markers
+            .iter()
+            .map(|marker| marker.upstream_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(rejected(format!(
+            "repository is divergent for upstreams [{upstreams}] and blocks new writes until repaired"
         )));
     }
 
@@ -334,7 +355,10 @@ fn evaluate_post_receive(context: &HookContext) -> HookEvaluation {
     }
 }
 
-fn load_hook_context_strict(config_path: &Path, repo: &Path) -> Result<HookContext, HookDispatchError> {
+fn load_hook_context_strict(
+    config_path: &Path,
+    repo: &Path,
+) -> Result<HookContext, HookDispatchError> {
     let config = AppConfig::load(config_path).map_err(HookDispatchError::Config)?;
     let descriptors = config
         .load_repository_descriptors()
@@ -442,6 +466,21 @@ fn rejected(message: impl Into<String>) -> HookEvaluation {
         message: Some(message.into()),
         phase: None,
         reconcile_requested: false,
+    }
+}
+
+fn maybe_hit_hook_checkpoint(event: &HookDispatchEvent) {
+    match (event.hook.as_str(), event.status, event.phase.as_deref()) {
+        ("pre-receive", HookStatus::Accepted, _) => {
+            crash::hit_checkpoint(CrashCheckpoint::AfterPreReceiveSuccess);
+        }
+        ("reference-transaction", HookStatus::Accepted, Some("prepared")) => {
+            crash::hit_checkpoint(CrashCheckpoint::AfterReferenceTransactionPrepared);
+        }
+        ("reference-transaction", HookStatus::Accepted, Some("committed")) => {
+            crash::hit_checkpoint(CrashCheckpoint::AfterReferenceTransactionCommitted);
+        }
+        _ => {}
     }
 }
 
@@ -595,6 +634,8 @@ pub enum HookDispatchError {
     MalformedUpdateLine(String),
     #[error("git command failed during hook validation: {0}")]
     Git(#[from] GitCommandError),
+    #[error("failed to inspect reconcile safety state: {0}")]
+    Reconcile(#[from] ReconcileError),
     #[error("repository contract validation failed: {0}")]
     ValidationInfra(#[from] ValidationInfrastructureError),
 }

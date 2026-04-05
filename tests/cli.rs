@@ -297,6 +297,32 @@ fn cargo_bin_path(name: &str) -> PathBuf {
     PathBuf::from(command.get_program())
 }
 
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
+}
+
+fn write_fake_ssh_command(temp: &TempDir, config_path: &Path) -> PathBuf {
+    let script = temp.path().join("fake-ssh");
+    let wrapper = cargo_bin_path("git-relay-ssh-force-command");
+    let source = format!(
+        "#!/bin/sh\nset -eu\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o|-i|-p|-l|-S|-F|-J|-E|-c|-m)\n      shift 2\n      ;;\n    -T|-n|-N|-4|-6|-a|-A|-q|-v|-vv|-vvv|-x|-X|-Y|-y|-C|-f|-G)\n      shift\n      ;;\n    --)\n      shift\n      break\n      ;;\n    -*)\n      shift\n      ;;\n    *)\n      break\n      ;;\n  esac\ndone\nif [ \"$#\" -lt 2 ]; then\n  echo \"fake ssh expected host and remote command\" >&2\n  exit 1\nfi\nhost=\"$1\"\nshift\nSSH_ORIGINAL_COMMAND=\"$*\" exec {wrapper} --config {config}\n",
+        wrapper = shell_quote(&wrapper),
+        config = shell_quote(config_path),
+    );
+    fs::write(&script, source).expect("fake ssh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&script)
+            .expect("fake ssh metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("fake ssh chmod");
+    }
+    script
+}
+
 fn package_example_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("packaging")
@@ -321,6 +347,40 @@ fn read_git_ref(repo_path: &Path, ref_name: &str) -> String {
         .expect("git rev-parse");
     assert!(output.status.success(), "git rev-parse failed");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn read_worktree_ref(repo_path: &Path, ref_name: &str) -> String {
+    let output = StdCommand::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().expect("path"),
+            "rev-parse",
+            ref_name,
+        ])
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn git_ref_exists(repo_path: &Path, ref_name: &str) -> bool {
+    StdCommand::new("git")
+        .arg(format!("--git-dir={}", repo_path.display()))
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .status()
+        .expect("git rev-parse")
+        .success()
+}
+
+fn assert_git_fsck_clean(repo_path: &Path) {
+    StdCommand::new("git")
+        .arg(format!("--git-dir={}", repo_path.display()))
+        .args(["fsck", "--strict"])
+        .status()
+        .expect("git fsck")
+        .success()
+        .then_some(())
+        .expect("git fsck success");
 }
 
 #[test]
@@ -448,6 +508,106 @@ fn ssh_force_command_accepts_only_git_pack_services_under_repo_root() {
 }
 
 #[test]
+fn ssh_crash_checkpoints_match_the_local_commit_boundary() {
+    let checkpoints = [
+        ("before_pre_receive", false),
+        ("after_pre_receive_success", false),
+        ("after_reference_transaction_prepared", false),
+        ("after_reference_transaction_committed", true),
+        ("after_receive_pack_success_before_wrapper_exit", true),
+        ("after_wrapper_flushes_response", true),
+    ];
+
+    for (checkpoint, expect_committed) in checkpoints {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = write_config_fixture(&temp);
+        let repo_path = temp.path().join("repos").join("repo.git");
+        let repo_id = "github.com/example/repo.git";
+        init_bare_repo(&repo_path);
+        configure_authoritative_repo(&repo_path);
+        write_authoritative_descriptor(&temp, &repo_path, false);
+
+        let dispatcher = cargo_bin_path("git-relay");
+        Command::cargo_bin("git-relay-install-hooks")
+            .expect("cargo bin")
+            .args([
+                "--repo",
+                repo_path.to_str().expect("repo"),
+                "--dispatcher",
+                dispatcher.to_str().expect("dispatcher"),
+                "--config",
+                config_path.to_str().expect("config"),
+            ])
+            .assert()
+            .success();
+
+        let fake_ssh = write_fake_ssh_command(&temp, &config_path);
+        let checkpoint_log = temp.path().join(format!("{checkpoint}.log"));
+        let work_repo = temp.path().join(format!("work-{checkpoint}"));
+        init_work_repo(&work_repo);
+        commit_file(&work_repo, "README.md", "hello\n", "initial");
+
+        let request_id = format!("request-{checkpoint}");
+        let push_id = format!("push-{checkpoint}");
+        let status = StdCommand::new("git")
+            .env("GIT_SSH", &fake_ssh)
+            .env("GIT_RELAY_CRASH_AT", checkpoint)
+            .env("GIT_RELAY_CHECKPOINT_LOG", &checkpoint_log)
+            .env("GIT_RELAY_REQUEST_ID", &request_id)
+            .env("GIT_RELAY_PUSH_ID", &push_id)
+            .args([
+                "-C",
+                work_repo.to_str().expect("work repo"),
+                "push",
+                "relay:repo.git",
+                "HEAD:refs/heads/main",
+            ])
+            .status()
+            .expect("git push over fake ssh");
+        assert_eq!(
+            git_ref_exists(&repo_path, "refs/heads/main"),
+            expect_committed,
+            "checkpoint {checkpoint} committed state mismatch"
+        );
+        if !expect_committed {
+            assert!(
+                !status.success(),
+                "checkpoint {checkpoint} should fail before local ref commit"
+            );
+        }
+        if expect_committed {
+            assert_eq!(
+                read_git_ref(&repo_path, "refs/heads/main"),
+                read_worktree_ref(&work_repo, "HEAD"),
+                "checkpoint {checkpoint} should preserve the committed ref"
+            );
+        }
+
+        let checkpoint_hits = fs::read_to_string(&checkpoint_log).expect("checkpoint log");
+        assert!(
+            checkpoint_hits
+                .lines()
+                .any(|line| line.trim() == checkpoint),
+            "checkpoint {checkpoint} should be recorded"
+        );
+
+        if checkpoint == "after_reference_transaction_committed" {
+            let trace = read_push_trace(temp.path(), repo_id, &push_id);
+            assert!(
+                trace.iter().any(|event| {
+                    event["hook"] == "reference-transaction"
+                        && event["phase"] == "committed"
+                        && event["status"] == "accepted"
+                }),
+                "committed checkpoint should record the committed reference transaction"
+            );
+        }
+
+        assert_git_fsck_clean(&repo_path);
+    }
+}
+
+#[test]
 fn install_hooks_writes_git_hook_wrappers() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo.git");
@@ -558,27 +718,218 @@ fn replication_reconcile_records_mixed_results_and_updates_internal_observed_ref
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     assert_eq!(run["repo_safety"], "degraded");
-    assert!(
-        run["upstream_results"]
-            .as_array()
-            .expect("upstream results")
-            .iter()
-            .any(|item| item["upstream_id"] == "alpha" && item["state"] == "in_sync")
-    );
-    assert!(
-        run["upstream_results"]
-            .as_array()
-            .expect("upstream results")
-            .iter()
-            .any(|item| item["upstream_id"] == "beta" && item["state"] == "stalled")
-    );
+    assert!(run["upstream_results"]
+        .as_array()
+        .expect("upstream results")
+        .iter()
+        .any(|item| item["upstream_id"] == "alpha" && item["state"] == "in_sync"));
+    assert!(run["upstream_results"]
+        .as_array()
+        .expect("upstream results")
+        .iter()
+        .any(|item| item["upstream_id"] == "beta" && item["state"] == "stalled"));
 
     let local_main = read_git_ref(&repo_path, "refs/heads/main");
-    let observed_main = read_git_ref(
-        &repo_path,
-        "refs/git-relay/upstreams/alpha/heads/main",
-    );
+    let observed_main = read_git_ref(&repo_path, "refs/git-relay/upstreams/alpha/heads/main");
     assert_eq!(observed_main, local_main);
+}
+
+#[test]
+fn divergent_repositories_block_new_writes_at_startup_ssh_and_pre_receive() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream = temp.path().join("upstream.git");
+    init_bare_repo(&upstream);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream.to_str().expect("path"), false)],
+    );
+
+    let dispatcher = cargo_bin_path("git-relay");
+    Command::cargo_bin("git-relay-install-hooks")
+        .expect("cargo bin")
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
+        ])
+        .assert()
+        .success();
+
+    let work_repo = temp.path().join("work-divergence");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("initial push success");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let external = temp.path().join("external");
+    StdCommand::new("git")
+        .args([
+            "clone",
+            upstream.to_str().expect("path"),
+            external.to_str().expect("path"),
+        ])
+        .status()
+        .expect("git clone")
+        .success()
+        .then_some(())
+        .expect("git clone success");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            external.to_str().expect("path"),
+            "config",
+            "user.name",
+            "Git Relay Test",
+        ])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            external.to_str().expect("path"),
+            "config",
+            "user.email",
+            "git-relay@example.com",
+        ])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+    commit_file(&external, "README.md", "external\n", "external mutation");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            external.to_str().expect("path"),
+            "push",
+            upstream.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("external push success");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"repo_safety\": \"divergent\""));
+
+    assert!(
+        git_ref_exists(&repo_path, "refs/git-relay/safety/divergent/alpha"),
+        "divergence marker should be persisted under hidden internal refs"
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "startup",
+            "classify",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"safety\": \"divergent\""))
+        .stdout(predicate::str::contains(
+            "\"write_acceptance_allowed\": false",
+        ));
+
+    Command::cargo_bin("git-relay-ssh-force-command")
+        .expect("cargo bin")
+        .env("SSH_ORIGINAL_COMMAND", "git-receive-pack repo.git")
+        .args([
+            "--config",
+            config_path.to_str().expect("config"),
+            "--check-only",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("divergent"));
+
+    commit_file(&work_repo, "README.md", "hello again\n", "blocked write");
+    let blocked_push_id = "push-blocked-divergent";
+    let blocked_status = StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-blocked-divergent")
+        .env("GIT_RELAY_PUSH_ID", blocked_push_id)
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push");
+    assert!(
+        !blocked_status.success(),
+        "pre-receive should fail closed while the repository is divergent"
+    );
+
+    let trace = read_push_trace(temp.path(), repo_id, blocked_push_id);
+    assert!(
+        trace.iter().any(|event| {
+            event["hook"] == "pre-receive"
+                && event["status"] == "rejected"
+                && event["message"]
+                    .as_str()
+                    .map(|message| message.contains("divergent"))
+                    .unwrap_or(false)
+        }),
+        "blocked push should record the divergence rejection in pre-receive"
+    );
 }
 
 #[test]
@@ -631,7 +982,10 @@ fn git_relayd_serve_once_drains_pending_reconcile_requests() {
         .expect("push success");
 
     let pending_path = pending_request_file_path(temp.path(), "github.com/example/repo.git");
-    assert!(pending_path.exists(), "pending reconcile request should exist");
+    assert!(
+        pending_path.exists(),
+        "pending reconcile request should exist"
+    );
 
     let output = Command::cargo_bin("git-relayd")
         .expect("cargo bin")
@@ -648,21 +1002,19 @@ fn git_relayd_serve_once_drains_pending_reconcile_requests() {
         .clone();
     let report: Value = serde_json::from_slice(&output).expect("serve report");
     assert_eq!(report["runtime_validation"]["status"], "passed");
-    assert!(
-        report["processed_reconciles"]
-            .as_array()
-            .expect("processed reconciles")
-            .iter()
-            .any(|item| item["repo_safety"] == "healthy")
-    );
+    assert!(report["processed_reconciles"]
+        .as_array()
+        .expect("processed reconciles")
+        .iter()
+        .any(|item| item["repo_safety"] == "healthy"));
 
-    assert!(!pending_path.exists(), "pending reconcile request should be cleared");
+    assert!(
+        !pending_path.exists(),
+        "pending reconcile request should be cleared"
+    );
     let upstream_main = read_git_ref(&upstream_ok, "refs/heads/main");
     let local_main = read_git_ref(&repo_path, "refs/heads/main");
-    let observed_main = read_git_ref(
-        &repo_path,
-        "refs/git-relay/upstreams/alpha/heads/main",
-    );
+    let observed_main = read_git_ref(&repo_path, "refs/git-relay/upstreams/alpha/heads/main");
     assert_eq!(upstream_main, local_main);
     assert_eq!(observed_main, local_main);
 }
@@ -734,7 +1086,10 @@ fn replication_status_reports_pending_and_latest_run_state() {
         .clone();
     let before_status: Value = serde_json::from_slice(&before).expect("status json");
     let before_item = &before_status.as_array().expect("status array")[0];
-    assert_eq!(before_item["pending_request"]["last_push_id"], "push-status");
+    assert_eq!(
+        before_item["pending_request"]["last_push_id"],
+        "push-status"
+    );
     assert!(before_item["latest_run"].is_null());
 
     Command::cargo_bin("git-relayd")
@@ -877,7 +1232,9 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
         "rejected push must not record a committed local ref transaction"
     );
     assert!(
-        !delete_trace.iter().any(|event| event["hook"] == "post-receive"),
+        !delete_trace
+            .iter()
+            .any(|event| event["hook"] == "post-receive"),
         "rejected push must not run post-receive"
     );
 

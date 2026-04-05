@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::classification::{RepositorySafetyState, UpstreamConvergenceState};
-use crate::config::{AppConfig, AuthorityModel, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode};
+use crate::config::{
+    AppConfig, AuthorityModel, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
+};
 
 const INTERNAL_UPSTREAM_REF_PREFIX: &str = "refs/git-relay/upstreams";
+const INTERNAL_DIVERGENCE_REF_PREFIX: &str = "refs/git-relay/safety/divergent";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefSnapshotEntry {
@@ -74,6 +77,15 @@ pub struct PendingReconcileRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DivergenceMarker {
+    pub repo_id: String,
+    pub upstream_id: String,
+    pub run_id: String,
+    pub recorded_at_ms: u128,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LockMetadata {
     repo_id: String,
     run_id: String,
@@ -102,7 +114,10 @@ impl Drop for ReconcileLockGuard {
 #[derive(Debug, Error)]
 pub enum ReconcileError {
     #[error("repository {repo_id} is {mode:?}; manual reconcile is supported only for authoritative repositories")]
-    UnsupportedRepositoryMode { repo_id: String, mode: RepositoryMode },
+    UnsupportedRepositoryMode {
+        repo_id: String,
+        mode: RepositoryMode,
+    },
     #[error("repository {repo_id} is {lifecycle:?}; manual reconcile requires lifecycle ready")]
     RepositoryNotReady {
         repo_id: String,
@@ -125,6 +140,12 @@ pub enum ReconcileError {
     #[error("failed to write {path}: {error}", path = path.display())]
     Write {
         path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("failed to write git input for args {args:?}: {error}")]
+    WriteGitInput {
+        args: Vec<String>,
         #[source]
         error: std::io::Error,
     },
@@ -217,6 +238,16 @@ pub fn replication_status_for_repo(
     })
 }
 
+pub fn load_divergence_markers(repo_path: &Path) -> Result<Vec<DivergenceMarker>, ReconcileError> {
+    let refs = list_divergence_marker_refs(repo_path)?;
+    let mut markers = refs
+        .into_iter()
+        .map(|(_, oid)| read_divergence_marker(repo_path, &oid))
+        .collect::<Result<Vec<_>, _>>()?;
+    markers.sort_by(|left, right| left.upstream_id.cmp(&right.upstream_id));
+    Ok(markers)
+}
+
 pub fn process_pending_reconcile_requests(
     config: &AppConfig,
     descriptors: &[RepositoryDescriptor],
@@ -268,7 +299,8 @@ pub fn reconcile_repository(
     let run_id = generate_run_id();
     let _lock = acquire_reconcile_lock(config, descriptor, &run_id)?;
     let started_at_ms = current_time_ms();
-    let desired_snapshot = list_local_exported_refs(&descriptor.repo_path, &descriptor.exported_refs)?;
+    let desired_snapshot =
+        list_local_exported_refs(&descriptor.repo_path, &descriptor.exported_refs)?;
     let mut upstreams = descriptor.write_upstreams.clone();
     upstreams.sort_by(|left, right| left.name.cmp(&right.name));
 
@@ -290,7 +322,10 @@ pub fn reconcile_repository(
         started_at_ms,
         completed_at_ms: None,
         desired_snapshot: desired_snapshot.clone(),
-        captured_upstreams: upstreams.iter().map(|upstream| upstream.name.clone()).collect(),
+        captured_upstreams: upstreams
+            .iter()
+            .map(|upstream| upstream.name.clone())
+            .collect(),
         repo_safety: if upstreams.is_empty() {
             RepositorySafetyState::Healthy
         } else {
@@ -309,6 +344,12 @@ pub fn reconcile_repository(
     }
 
     run.repo_safety = classify_repository_safety(&run.upstream_results);
+    persist_divergence_markers(
+        &descriptor.repo_path,
+        &descriptor.repo_id,
+        &run.run_id,
+        &run.upstream_results,
+    )?;
     run.status = ReconcileRunStatus::Completed;
     run.completed_at_ms = Some(current_time_ms());
     persist_run_record(config, &run)?;
@@ -325,22 +366,23 @@ fn reconcile_one_upstream(
 ) -> Result<ReconcileUpstreamResult, ReconcileError> {
     let previous_observed = read_observed_refs(&descriptor.repo_path, &upstream.name)?;
 
-    let observed_before = match observe_upstream(&descriptor.repo_path, &upstream.name, &upstream.url)? {
-        Ok(snapshot) => snapshot,
-        Err(detail) => {
-            return Ok(ReconcileUpstreamResult {
-                upstream_id: upstream.name.clone(),
-                require_atomic: upstream.require_atomic,
-                state: UpstreamConvergenceState::Stalled,
-                divergent: false,
-                apply_attempted: false,
-                detail: Some(detail),
-                atomic_capability: None,
-                observed_before: Vec::new(),
-                observed_after: Vec::new(),
-            });
-        }
-    };
+    let observed_before =
+        match observe_upstream(&descriptor.repo_path, &upstream.name, &upstream.url)? {
+            Ok(snapshot) => snapshot,
+            Err(detail) => {
+                return Ok(ReconcileUpstreamResult {
+                    upstream_id: upstream.name.clone(),
+                    require_atomic: upstream.require_atomic,
+                    state: UpstreamConvergenceState::Stalled,
+                    divergent: false,
+                    apply_attempted: false,
+                    detail: Some(detail),
+                    atomic_capability: None,
+                    observed_before: Vec::new(),
+                    observed_after: Vec::new(),
+                });
+            }
+        };
     let divergent = detect_divergence(
         descriptor.authority_model,
         &previous_observed,
@@ -370,7 +412,8 @@ fn reconcile_one_upstream(
 
     if !same_snapshot(&observed_before, desired_snapshot) {
         if upstream.require_atomic {
-            let probe = probe_atomic_capability(&descriptor.repo_path, &upstream.url, desired_snapshot)?;
+            let probe =
+                probe_atomic_capability(&descriptor.repo_path, &upstream.url, desired_snapshot)?;
             atomic_capability = Some(probe);
             if probe != AtomicCapabilityVerdict::Supported {
                 return Ok(ReconcileUpstreamResult {
@@ -413,22 +456,23 @@ fn reconcile_one_upstream(
         }
     }
 
-    let observed_after = match observe_upstream(&descriptor.repo_path, &upstream.name, &upstream.url)? {
-        Ok(snapshot) => snapshot,
-        Err(observe_error) => {
-            return Ok(ReconcileUpstreamResult {
-                upstream_id: upstream.name.clone(),
-                require_atomic: upstream.require_atomic,
-                state: UpstreamConvergenceState::Stalled,
-                divergent: false,
-                apply_attempted,
-                detail: Some(observe_error),
-                atomic_capability,
-                observed_before,
-                observed_after: Vec::new(),
-            });
-        }
-    };
+    let observed_after =
+        match observe_upstream(&descriptor.repo_path, &upstream.name, &upstream.url)? {
+            Ok(snapshot) => snapshot,
+            Err(observe_error) => {
+                return Ok(ReconcileUpstreamResult {
+                    upstream_id: upstream.name.clone(),
+                    require_atomic: upstream.require_atomic,
+                    state: UpstreamConvergenceState::Stalled,
+                    divergent: false,
+                    apply_attempted,
+                    detail: Some(observe_error),
+                    atomic_capability,
+                    observed_before,
+                    observed_after: Vec::new(),
+                });
+            }
+        };
     Ok(ReconcileUpstreamResult {
         upstream_id: upstream.name.clone(),
         require_atomic: upstream.require_atomic,
@@ -513,7 +557,11 @@ fn supersede_stale_run_if_present(
     let marker_path = in_progress_marker_path(&config.paths.state_root, &descriptor.repo_id);
     let marker = read_json_optional::<InProgressMarker>(&marker_path)?;
     if let Some(marker) = marker {
-        let run_path = run_record_path(&config.paths.state_root, &descriptor.repo_id, &marker.run_id);
+        let run_path = run_record_path(
+            &config.paths.state_root,
+            &descriptor.repo_id,
+            &marker.run_id,
+        );
         if let Some(mut run) = read_json_optional::<ReconcileRunRecord>(&run_path)? {
             if run.status == ReconcileRunStatus::InProgress {
                 run.status = ReconcileRunStatus::Superseded;
@@ -562,10 +610,12 @@ fn latest_run_record(
             error,
         })?
         .map(|entry| {
-            entry.map(|entry| entry.path()).map_err(|error| ReconcileError::Read {
-                path: directory.clone(),
-                error,
-            })
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| ReconcileError::Read {
+                    path: directory.clone(),
+                    error,
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     candidates.sort();
@@ -660,9 +710,7 @@ fn probe_atomic_capability(
     }
 
     let detail = format_git_failure(&output).to_ascii_lowercase();
-    if detail.contains("atomic")
-        && (detail.contains("support") || detail.contains("advertis"))
-    {
+    if detail.contains("atomic") && (detail.contains("support") || detail.contains("advertis")) {
         Ok(AtomicCapabilityVerdict::Unsupported)
     } else {
         Ok(AtomicCapabilityVerdict::Inconclusive)
@@ -700,6 +748,65 @@ fn run_git(repo_path: Option<&Path>, args: &[String]) -> Result<GitProcessOutput
         args: args.to_vec(),
         error,
     })?;
+
+    Ok(GitProcessOutput {
+        success: output.status.success(),
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        args: args.to_vec(),
+    })
+}
+
+fn run_git_expect_success_with_input(
+    repo_path: Option<&Path>,
+    args: &[String],
+    input: &[u8],
+) -> Result<GitProcessOutput, ReconcileError> {
+    let output = run_git_with_input(repo_path, args, input)?;
+    if output.success {
+        Ok(output)
+    } else {
+        let detail = format_git_failure(&output);
+        Err(ReconcileError::Git {
+            args: output.args.clone(),
+            status: output.status,
+            detail,
+        })
+    }
+}
+
+fn run_git_with_input(
+    repo_path: Option<&Path>,
+    args: &[String],
+    input: &[u8],
+) -> Result<GitProcessOutput, ReconcileError> {
+    let mut command = Command::new("git");
+    if let Some(repo_path) = repo_path {
+        command.arg(format!("--git-dir={}", repo_path.display()));
+    }
+    command.args(args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| ReconcileError::SpawnGit {
+        args: args.to_vec(),
+        error,
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input)
+            .map_err(|error| ReconcileError::WriteGitInput {
+                args: args.to_vec(),
+                error,
+            })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ReconcileError::SpawnGit {
+            args: args.to_vec(),
+            error,
+        })?;
 
     Ok(GitProcessOutput {
         success: output.status.success(),
@@ -788,7 +895,8 @@ fn parse_internal_observed_snapshot(
     let prefix = observed_ref_prefix(upstream_id);
     let mut refs = Vec::new();
     for entry in parse_ref_snapshot(source)? {
-        let ref_name = if let Some(rest) = entry.ref_name.strip_prefix(&format!("{prefix}/heads/")) {
+        let ref_name = if let Some(rest) = entry.ref_name.strip_prefix(&format!("{prefix}/heads/"))
+        {
             format!("refs/heads/{rest}")
         } else if let Some(rest) = entry.ref_name.strip_prefix(&format!("{prefix}/tags/")) {
             format!("refs/tags/{rest}")
@@ -833,6 +941,142 @@ fn classify_repository_safety(results: &[ReconcileUpstreamResult]) -> Repository
     }
 }
 
+fn persist_divergence_markers(
+    repo_path: &Path,
+    repo_id: &str,
+    run_id: &str,
+    results: &[ReconcileUpstreamResult],
+) -> Result<(), ReconcileError> {
+    let existing = list_divergence_marker_refs(repo_path)?;
+    let mut desired = BTreeMap::new();
+
+    for result in results.iter().filter(|result| result.divergent) {
+        let ref_name = divergence_ref_name(&result.upstream_id);
+        let marker = DivergenceMarker {
+            repo_id: repo_id.to_owned(),
+            upstream_id: result.upstream_id.clone(),
+            run_id: run_id.to_owned(),
+            recorded_at_ms: current_time_ms(),
+            detail: result.detail.clone(),
+        };
+        write_divergence_marker(repo_path, &ref_name, &marker)?;
+        desired.insert(ref_name, ());
+    }
+
+    for (ref_name, _) in existing {
+        if !desired.contains_key(&ref_name) {
+            delete_internal_ref(repo_path, &ref_name)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_divergence_marker(
+    repo_path: &Path,
+    ref_name: &str,
+    marker: &DivergenceMarker,
+) -> Result<(), ReconcileError> {
+    let encoded = serde_json::to_vec_pretty(marker).map_err(|error| ReconcileError::ParseJson {
+        path: repo_path.to_path_buf(),
+        error,
+    })?;
+    let oid = write_git_blob(repo_path, &encoded)?;
+    update_internal_ref(repo_path, ref_name, &oid)
+}
+
+fn read_divergence_marker(repo_path: &Path, oid: &str) -> Result<DivergenceMarker, ReconcileError> {
+    let output = run_git_expect_success(
+        Some(repo_path),
+        &["cat-file".to_owned(), "blob".to_owned(), oid.to_owned()],
+    )?;
+    serde_json::from_str(&output.stdout).map_err(|error| ReconcileError::ParseJson {
+        path: repo_path.to_path_buf(),
+        error,
+    })
+}
+
+fn list_divergence_marker_refs(repo_path: &Path) -> Result<Vec<(String, String)>, ReconcileError> {
+    list_internal_refs(repo_path, INTERNAL_DIVERGENCE_REF_PREFIX)
+}
+
+fn list_internal_refs(
+    repo_path: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, ReconcileError> {
+    let output = run_git_expect_success(
+        Some(repo_path),
+        &[
+            "for-each-ref".to_owned(),
+            "--format=%(refname) %(objectname)".to_owned(),
+            prefix.to_owned(),
+        ],
+    )?;
+    parse_ref_targets(&output.stdout)
+}
+
+fn parse_ref_targets(source: &str) -> Result<Vec<(String, String)>, ReconcileError> {
+    let mut refs = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((ref_name, oid)) = trimmed.split_once(char::is_whitespace) else {
+            return Err(ReconcileError::Git {
+                args: vec!["parse-ref-targets".to_owned()],
+                status: None,
+                detail: format!("malformed ref target line {trimmed}"),
+            });
+        };
+        refs.push((ref_name.to_owned(), oid.trim().to_owned()));
+    }
+    refs.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(refs)
+}
+
+fn write_git_blob(repo_path: &Path, input: &[u8]) -> Result<String, ReconcileError> {
+    let output = run_git_expect_success_with_input(
+        Some(repo_path),
+        &[
+            "hash-object".to_owned(),
+            "-w".to_owned(),
+            "--stdin".to_owned(),
+        ],
+        input,
+    )?;
+    Ok(output.stdout.trim().to_owned())
+}
+
+fn update_internal_ref(repo_path: &Path, ref_name: &str, oid: &str) -> Result<(), ReconcileError> {
+    run_git_expect_success(
+        Some(repo_path),
+        &["update-ref".to_owned(), ref_name.to_owned(), oid.to_owned()],
+    )?;
+    Ok(())
+}
+
+fn delete_internal_ref(repo_path: &Path, ref_name: &str) -> Result<(), ReconcileError> {
+    let output = run_git(
+        Some(repo_path),
+        &[
+            "update-ref".to_owned(),
+            "-d".to_owned(),
+            ref_name.to_owned(),
+        ],
+    )?;
+    let detail = format_git_failure(&output);
+    if output.success || detail.contains("not a valid ref") {
+        Ok(())
+    } else {
+        Err(ReconcileError::Git {
+            args: output.args,
+            status: output.status,
+            detail,
+        })
+    }
+}
+
 fn build_push_refspecs(snapshot: &[RefSnapshotEntry]) -> Vec<String> {
     snapshot
         .iter()
@@ -864,6 +1108,13 @@ fn matches_exported_ref(patterns: &[String], ref_name: &str) -> bool {
 fn observed_ref_prefix(upstream_id: &str) -> String {
     format!(
         "{INTERNAL_UPSTREAM_REF_PREFIX}/{}",
+        sanitize_ref_component(upstream_id)
+    )
+}
+
+fn divergence_ref_name(upstream_id: &str) -> String {
+    format!(
+        "{INTERNAL_DIVERGENCE_REF_PREFIX}/{}",
         sanitize_ref_component(upstream_id)
     )
 }
@@ -956,14 +1207,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ReconcileError
         path: path.to_path_buf(),
         error,
     })?;
-    file.write_all(&encoded).map_err(|error| ReconcileError::Write {
-        path: path.to_path_buf(),
-        error,
-    })?;
-    file.write_all(b"\n").map_err(|error| ReconcileError::Write {
-        path: path.to_path_buf(),
-        error,
-    })?;
+    file.write_all(&encoded)
+        .map_err(|error| ReconcileError::Write {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    file.write_all(b"\n")
+        .map_err(|error| ReconcileError::Write {
+            path: path.to_path_buf(),
+            error,
+        })?;
     Ok(())
 }
 
@@ -1034,7 +1287,7 @@ mod tests {
 
     use super::{
         enqueue_reconcile_request, observed_ref_prefix, read_observed_refs, reconcile_lock_path,
-        reconcile_repository, run_record_path, RefSnapshotEntry, ReconcileRunStatus,
+        reconcile_repository, run_record_path, ReconcileRunStatus, RefSnapshotEntry,
         UpstreamConvergenceState,
     };
 
@@ -1271,12 +1524,21 @@ mod tests {
 
         let run = reconcile_repository(&config, &descriptor).expect("reconcile");
 
-        assert_eq!(run.captured_upstreams, vec!["alpha".to_owned(), "beta".to_owned()]);
+        assert_eq!(
+            run.captured_upstreams,
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
         assert_eq!(run.status, ReconcileRunStatus::Completed);
         assert_eq!(run.repo_safety, RepositorySafetyState::Degraded);
         assert_eq!(run.upstream_results.len(), 2);
-        assert_eq!(run.upstream_results[0].state, UpstreamConvergenceState::InSync);
-        assert_eq!(run.upstream_results[1].state, UpstreamConvergenceState::Stalled);
+        assert_eq!(
+            run.upstream_results[0].state,
+            UpstreamConvergenceState::InSync
+        );
+        assert_eq!(
+            run.upstream_results[1].state,
+            UpstreamConvergenceState::Stalled
+        );
 
         let observed = read_observed_refs(&authoritative, "alpha").expect("observed refs");
         assert_eq!(
@@ -1460,8 +1722,9 @@ mod tests {
             }],
         );
 
-        let pending = enqueue_reconcile_request(&config, &descriptor, Some("push-1"), Some("req-1"))
-            .expect("enqueue");
+        let pending =
+            enqueue_reconcile_request(&config, &descriptor, Some("push-1"), Some("req-1"))
+                .expect("enqueue");
         assert_eq!(pending.last_push_id.as_deref(), Some("push-1"));
         let path = super::pending_request_path(&config.paths.state_root, &descriptor.repo_id);
         let source = fs::read_to_string(path).expect("pending request");

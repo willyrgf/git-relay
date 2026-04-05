@@ -8,6 +8,7 @@ use crate::config::{
 };
 use crate::git::GitExecutor;
 use crate::platform::PlatformProbe;
+use crate::reconcile::{load_divergence_markers, ReconcileError};
 use crate::validator::{ValidationInfrastructureError, Validator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,6 +123,19 @@ where
                     details,
                 });
             }
+            let divergence_markers = load_divergence_markers(&descriptor.repo_path)
+                .map_err(SshAuthorizationError::ReconcileState)?;
+            if !divergence_markers.is_empty() {
+                let upstreams = divergence_markers
+                    .iter()
+                    .map(|marker| marker.upstream_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(SshAuthorizationError::RepositoryDivergent {
+                    repo_id: descriptor.repo_id.clone(),
+                    upstreams,
+                });
+            }
 
             Ok(AuthorizedSshCommand {
                 service: resolved.service,
@@ -208,6 +222,10 @@ pub enum SshAuthorizationError {
     WritesRequireAuthoritative { repo_id: String },
     #[error("repository {repo_id} failed validator re-check before write acceptance: {details}")]
     ValidationFailed { repo_id: String, details: String },
+    #[error("repository {repo_id} is divergent for upstreams [{upstreams}] and blocks new writes until repaired")]
+    RepositoryDivergent { repo_id: String, upstreams: String },
+    #[error("failed to inspect repository reconcile state before SSH authorization: {0}")]
+    ReconcileState(#[from] ReconcileError),
     #[error("validator infrastructure failed during SSH authorization: {0}")]
     ValidationInfra(#[from] ValidationInfrastructureError),
 }

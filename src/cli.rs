@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::classification::classify_startup;
+use crate::classification::{classify_startup, RepositorySafetyState};
 use crate::config::{AppConfig, ConfigError, RepositoryDescriptor};
 use crate::deploy::{
     render_service, validate_runtime_profile, ServiceFormat, ServiceRenderRequest,
@@ -12,7 +12,9 @@ use crate::deploy::{
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
-use crate::reconcile::{reconcile_repository, replication_status_for_repo, ReconcileError};
+use crate::reconcile::{
+    load_divergence_markers, reconcile_repository, replication_status_for_repo, ReconcileError,
+};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
 #[derive(Debug, Parser)]
@@ -268,10 +270,18 @@ fn run_startup_classify(options: TargetOptions) -> Result<ExitCode, CliError> {
     let mut valid = true;
     for descriptor in targets {
         let report = validator.validate(&config, &descriptor)?;
-        if !report.passed() {
+        let mut classification = classify_startup(&descriptor, &report);
+        if report.passed() {
+            let divergence_markers = load_divergence_markers(&descriptor.repo_path)?;
+            if !divergence_markers.is_empty() {
+                classification.safety = RepositorySafetyState::Divergent;
+                classification.write_acceptance_allowed = false;
+            }
+        }
+        if !classification.write_acceptance_allowed {
             valid = false;
         }
-        classifications.push(classify_startup(&descriptor, &report));
+        classifications.push(classification);
     }
 
     emit_output(&classifications, options.json)?;
