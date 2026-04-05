@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use git_relay::platform::{PlatformProbe, RealPlatformProbe};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -42,21 +43,9 @@ fn configure_authoritative_repo(path: &Path) {
 }
 
 fn detect_filesystem(path: &Path) -> String {
-    let output = match std::env::consts::OS {
-        "macos" => StdCommand::new("stat")
-            .args(["-f", "%T"])
-            .arg(path)
-            .output()
-            .expect("stat"),
-        "linux" => StdCommand::new("stat")
-            .args(["-f", "-c", "%T"])
-            .arg(path)
-            .output()
-            .expect("stat"),
-        other => panic!("unsupported host {other}"),
-    };
-    assert!(output.status.success(), "stat failed");
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    RealPlatformProbe
+        .filesystem_type(path)
+        .expect("filesystem type")
 }
 
 fn write_config_fixture(temp: &TempDir) -> PathBuf {
@@ -266,6 +255,13 @@ fn cargo_bin_path(name: &str) -> PathBuf {
     PathBuf::from(command.get_program())
 }
 
+fn package_example_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("packaging")
+        .join("example")
+        .join("git-relay.example.toml")
+}
+
 #[test]
 fn repo_validate_returns_json_for_valid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
@@ -415,6 +411,32 @@ fn install_hooks_writes_git_hook_wrappers() {
         .stdout(predicate::str::contains("pre-receive"))
         .stdout(predicate::str::contains("reference-transaction"))
         .stdout(predicate::str::contains("post-receive"));
+}
+
+#[test]
+fn deploy_render_service_uses_packaged_example_config() {
+    let example_config = package_example_config_path();
+
+    let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
+    command
+        .args([
+            "deploy",
+            "render-service",
+            "--config",
+            example_config.to_str().expect("example config"),
+            "--format",
+            "systemd",
+            "--binary-path",
+            "/nix/store/example/bin/git-relayd",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "EnvironmentFile=/etc/git-relay/runtime.env",
+        ))
+        .stdout(predicate::str::contains(
+            "ExecStart=/nix/store/example/bin/git-relayd serve --config",
+        ));
 }
 
 #[test]

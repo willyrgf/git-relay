@@ -1,0 +1,48 @@
+[listen]
+ssh = "127.0.0.1:4222"
+https = "127.0.0.1:4318"
+enable_http_read = false
+enable_http_write = false
+
+[paths]
+state_root = "/var/lib/git-relay"
+repo_root = "/var/lib/git-relay/repos"
+repo_config_root = "/etc/git-relay/repos.d"
+
+[reconcile]
+on_push = true
+manual_enabled = true
+periodic_enabled = false
+worker_mode = "short-lived"
+lock_timeout_ms = 5000
+
+[policy]
+default_repo_mode = "cache-only"
+default_refresh = "ttl:60s"
+negative_cache_ttl = "5s"
+default_push_ack = "local-commit"
+
+[migration]
+supported_targets = ["git+https", "git+ssh"]
+refuse_dirty_worktree = true
+targeted_relock_mode = "validated-only"
+
+[deployment]
+platform = "linux"
+service_manager = "systemd"
+service_label = "dev.git-relay"
+git_only_command_mode = "openssh-force-command"
+forced_command_wrapper = "/usr/local/libexec/git-relay-ssh-force-command"
+disable_forwarding = true
+runtime_secret_env_file = "/etc/git-relay/runtime.env"
+required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
+allowed_git_services = ["git-upload-pack", "git-receive-pack"]
+supported_filesystems = ["apfs", "ext2/ext3", "ext4"]
+
+[auth_profiles.github-read]
+kind = "https-token"
+secret_ref = "env:GITHUB_READ_TOKEN"
+
+[auth_profiles.github-write]
+kind = "ssh-key"
+secret_ref = "env:GITHUB_WRITE_KEY"

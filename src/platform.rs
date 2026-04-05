@@ -31,7 +31,7 @@ impl PlatformProbe for RealPlatformProbe {
 
     fn filesystem_type(&self, path: &Path) -> Result<String, PlatformProbeError> {
         let (program, args) = match std::env::consts::OS {
-            "macos" => ("stat", vec!["-f", "%T"]),
+            "macos" => ("/usr/bin/stat", vec!["-f", "%T"]),
             "linux" => ("stat", vec!["-f", "-c", "%T"]),
             unsupported => {
                 return Err(PlatformProbeError::UnsupportedPlatform(
