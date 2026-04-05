@@ -39,6 +39,169 @@ In this system:
 
 The relay can still provide high-level "one run handles everything" behavior through execution-unit completeness without claiming false cross-upstream atomicity.
 
+## Execution Status
+
+<!-- EXECUTION_LEDGER:START -->
+| Check | Status | Latest run | Decision |
+|---|---|---|---|
+| A | pass | 20260405T012510Z-A-local-ack | Local SSH and local smart-HTTP acknowledgement are governed by receive-pack and committed local ref state for both single-ref and transmitted multi-ref pushes. Post-receive is non-critical, and the only observed client ambiguity is the normal Git case where commit happened but the client did not observe success. |
+| B | fail | 20260405T005620Z-B-whole-push | Whole-push local acceptance is not implementable for ordinary pushes using only server-side Git hooks, receive-pack, and filesystem locks. The relay can reject the whole push for bad refs that are actually transmitted, but send-pack may prune a locally rejected ref before the relay sees the user-requested push set. |
+| C | pass | 20260404T072857Z-C-startup-classify | A deterministic and conservative startup classifier is implementable if startup never trusts cached upstream observation as current truth. Cached observation can inform recovery only after an explicit fresh observation step. |
+| D | pass | 20260405T000831Z-D-atomic-capability | Atomic capability can be classified from concrete receive-pack behavior across the validated local transports and the configured hosted managed-forge target: advertisement plus --atomic push outcome, with ambiguity treated as unsupported. |
+| E | pass | 20260404T073220Z-E-partial-apply | A non-atomic upstream apply can be recovered safely without a replay log if the relay updates internal observed refs only from explicit observation and always recomputes desired state from current local refs. |
+| F | pass | 20260405T003947Z-F-hidden-refs | The same-repository hidden-ref model is viable only when the authoritative server enforces hideRefs and disables SHA-by-id wants. That contract now holds across the validated local transports and the configured self-managed hosted target. |
+| G | pass | 20260405T013304Z-G-targeted-relock | On the validated local Nix variants (nix (Determinate Nix 3.0.0) 2.26.3, nix (Nix) 2.28.5, nix (Nix) 2.30.3+2, nix (Nix) 2.31.3), targeted relock stayed scoped and idempotent across the validated local Git-input graph shapes: multi-direct inputs with follows, transitive subgraphs, and root overrides, using both `nix flake lock --update-input alpha` and `nix flake update alpha`. The supported contract can therefore be narrowed to this validated version-and-graph matrix. |
+| H | pass | 20260404T080317Z-H-rewrite-fixtures | A parser-backed deterministic rewrite is implementable for literal direct-input shorthand forms if the grammar stays intentionally narrow and unsupported expressions fail closed. |
+| I | pass | 20260404T073519Z-I-locks | Short-lived workers can use advisory lock directories safely if lock contents remain advisory, stale locks are broken via liveness checks, and recovery re-derives work from Git state. |
+| J | pass | 20260404T074302Z-J-execution-unit | A reconcile run can be specified as one bounded execution unit with one desired snapshot and one captured upstream set, while mixed per-upstream outcomes remain recorded under that same run and stale prior runs are superseded. |
+| K | pass | 20260405T031317Z-K-durability-floor | Across the validated macOS and Linux hosts, the exercised Git variants upheld the selected authoritative-write crash checkpoints when authoritative repos used `core.fsync=all` and `core.fsyncMethod=fsync`. The supported durability contract can therefore be limited to those validated platforms and filesystems rather than a broader unproven matrix. |
+| L | pass | 20260405T031318Z-L-deployment-repro | A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime secret injection outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux. |
+<!-- EXECUTION_LEDGER:END -->
+
+### Result A
+
+<!-- RESULT:A:START -->
+- Status: pass
+- Latest run: 20260405T012510Z-A-local-ack
+- Environment: Git=git version 2.53.0, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3
+- Evidence: evidence/A/20260405T012510Z-A-local-ack
+- Observed result: Baseline local push succeeded and created the authoritative ref. Baseline local smart-HTTP push also succeeded and created the authoritative ref. A non-zero post-receive hook did not remove the committed ref and did not change push success. A non-zero post-receive hook on the smart-HTTP path also did not remove the committed ref and did not change push success. A baseline multi-ref push over SSH committed the full transmitted ref set. A baseline multi-ref push over local smart HTTP also committed the full transmitted ref set. A non-zero post-receive hook after an SSH multi-ref push did not change the committed ref set or success outcome. A non-zero post-receive hook after a local smart-HTTP multi-ref push also did not change the committed ref set or success outcome. Committed-but-client-ambiguous outcomes were observed at: after_receive_pack_success_before_wrapper_exit, after_reference_transaction_committed, http_after_reference_transaction_committed, http_multi_ref_after_reference_transaction_committed, multi_ref_after_receive_pack_success_before_wrapper_exit, multi_ref_after_reference_transaction_committed.
+- Decision: Local SSH and local smart-HTTP acknowledgement are governed by receive-pack and committed local ref state for both single-ref and transmitted multi-ref pushes. Post-receive is non-critical, and the only observed client ambiguity is the normal Git case where commit happened but the client did not observe success.
+- RFC/doc follow-up: Treat this as the accepted local acknowledgement contract for native Git ingress. Broader durability and deployment matrix work remains tracked under K and L rather than under A.
+<!-- RESULT:A:END -->
+
+### Result B
+
+<!-- RESULT:B:START -->
+- Status: fail
+- Latest run: 20260405T005620Z-B-whole-push
+- Environment: Git=git version 2.53.0, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3
+- Evidence: evidence/B/20260405T005620Z-B-whole-push
+- Observed result: A valid multi-ref push updated both tracked refs from one receive-pack path. A valid multi-ref push over local smart HTTP also updated both tracked refs from one receive-pack path. A pre-receive rejection on one protected ref left the entire pushed ref set unchanged. With client-requested --atomic, denied delete, non-fast-forward rejection, and ref lock failure all left the tracked ref set unchanged. With client-requested --atomic over local smart HTTP, denied delete, non-fast-forward rejection, and ref lock failure all left the tracked ref set unchanged. Hooks did not receive an atomic-specific signal on either tested transport: GIT_PROTOCOL stayed unset and GIT_PUSH_OPTION_COUNT stayed neutral (0 or unset) for both plain and --atomic pushes, while receive-pack packet traces still distinguished the --atomic request at the protocol layer. When a non-fast-forward branch update was forced so both refs were actually transmitted, the relay-owned guard rejected the whole push before either branch or tag changed on both SSH and local smart HTTP. Rejected multi-ref pushes still changed a subset of refs at: forbidden_delete_rejection, guarded_non_fast_forward_plus_tag_rejection, http_forbidden_delete_rejection, http_guarded_non_fast_forward_plus_tag_rejection, http_non_fast_forward_plus_tag_rejection, http_ref_lock_contention, non_fast_forward_plus_tag_rejection, ref_lock_contention. The guarded non-fast-forward ordinary-push cases remained partial because send-pack omitted the rejected branch update client-side and transmitted only the tag, so the relay never saw the full user-requested ref set.
+- Decision: Whole-push local acceptance is not implementable for ordinary pushes using only server-side Git hooks, receive-pack, and filesystem locks. The relay can reject the whole push for bad refs that are actually transmitted, but send-pack may prune a locally rejected ref before the relay sees the user-requested push set.
+- RFC/doc follow-up: Rewrite the RFC to treat ordinary inbound pushes as per-ref at the relay boundary. If whole-push semantics are required, the design needs either a protocol-aware front proxy or a narrower relay API that controls the transmitted ref set before send-pack can prune it. Hooks, internal refs, and filesystem locks alone cannot enforce inbound --atomic.
+<!-- RESULT:B:END -->
+
+### Result C
+
+<!-- RESULT:C:START -->
+- Status: pass
+- Latest run: 20260404T072857Z-C-startup-classify
+- Environment: Git=git version 2.53.0, Python=3.14.3
+- Evidence: evidence/C/20260404T072857Z-C-startup-classify
+- Observed result: Startup without any observed upstream refs classified the upstream as unknown, then fresh observation produced in_sync deterministically. Cached matching observation was not trusted at startup; it became in_sync only after an explicit fresh observation step. Cached mismatch was not treated as divergent at startup; after fresh observation the same upstream classified out_of_sync deterministically. Fresh mixed upstream observations produced deterministic per-upstream states and a degraded repo safety state derived from them.
+- Decision: A deterministic and conservative startup classifier is implementable if startup never trusts cached upstream observation as current truth. Cached observation can inform recovery only after an explicit fresh observation step.
+- RFC/doc follow-up: Rewrite the RFC storage and recovery sections to define desired-state derivation, observed-ref storage, startup=unknown behavior, and the exact transition to in_sync or out_of_sync after fresh observation.
+<!-- RESULT:C:END -->
+
+### Result D
+
+<!-- RESULT:D:START -->
+- Status: pass
+- Latest run: 20260405T000831Z-D-atomic-capability
+- Environment: Git=git version 2.53.0, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3
+- Evidence: evidence/D/20260405T000831Z-D-atomic-capability
+- Observed result: The default local SSH receive-pack session advertised atomic capability and accepted a multi-ref --atomic push. With receive.advertiseAtomic=false, the same SSH path did not advertise atomic capability, rejected --atomic push, and still accepted a plain push. The default local smart-HTTP receive-pack session advertised atomic capability and accepted a multi-ref --atomic push. With receive.advertiseAtomic=false, the same smart-HTTP path did not advertise atomic capability, rejected --atomic push, and still accepted a plain push. Hosted target github-current-origin-ssh over ssh classified atomic capability as supported from concrete session behavior, accepted a plain disposable push, and cleaned up its temporary refs.
+- Decision: Atomic capability can be classified from concrete receive-pack behavior across the validated local transports and the configured hosted managed-forge target: advertisement plus --atomic push outcome, with ambiguity treated as unsupported.
+- RFC/doc follow-up: Rewrite the RFC to define atomic capability detection as a behavior-based probe, and require unsupported or ambiguous upstreams to remain unconverged when require_atomic=true.
+<!-- RESULT:D:END -->
+
+### Result E
+
+<!-- RESULT:E:START -->
+- Status: pass
+- Latest run: 20260404T073220Z-E-partial-apply
+- Environment: Git=git version 2.53.0, Python=3.14.3
+- Evidence: evidence/E/20260404T073220Z-E-partial-apply
+- Observed result: After a delete was rejected, the internal observed namespace remained at the pre-apply snapshot until re-observation. The first run ended out_of_sync plus degraded from actual upstream state. After local main advanced and the upstream policy changed, the second run converged the newer local main without a replay log.
+- Decision: A non-atomic upstream apply can be recovered safely without a replay log if the relay updates internal observed refs only from explicit observation and always recomputes desired state from current local refs.
+- RFC/doc follow-up: Rewrite the RFC convergence section so apply attempts never mutate observed truth, failed non-atomic reconcile ends out_of_sync plus degraded, and later reconcile derives from current local refs rather than prior push events.
+<!-- RESULT:E:END -->
+
+### Result F
+
+<!-- RESULT:F:START -->
+- Status: pass
+- Latest run: 20260405T003947Z-F-hidden-refs
+- Environment: Git=git version 2.53.0, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3
+- Evidence: evidence/F/20260405T003947Z-F-hidden-refs
+- Observed result: Without hideRefs, the internal ref was advertised and the hidden object was fetchable by object id over SSH. With hideRefs only, the internal ref disappeared from advertisement but the hidden object remained fetchable by object id when reachable SHA wants were enabled. With hideRefs and SHA-by-id wants disabled, the internal ref was hidden and the hidden object fetch failed over SSH. Without hideRefs, the internal ref was advertised and the hidden object was fetchable by object id over local smart HTTP. With hideRefs only, the internal ref disappeared from advertisement but the hidden object remained fetchable by object id over local smart HTTP when reachable SHA wants were enabled. With hideRefs and SHA-by-id wants disabled, the internal ref was hidden and the hidden object fetch failed over local smart HTTP. Hosted self-managed target pp-vnlabs-self-managed-ssh hid the internal ref from advertisement but still allowed object-id fetch when only hideRefs was configured. Hosted self-managed target pp-vnlabs-self-managed-ssh hid the internal ref and blocked object-id fetch when hideRefs and SHA-by-id wants were both disabled.
+- Decision: The same-repository hidden-ref model is viable only when the authoritative server enforces hideRefs and disables SHA-by-id wants. That contract now holds across the validated local transports and the configured self-managed hosted target.
+- RFC/doc follow-up: Rewrite the RFC security and storage sections to require transfer/upload/receive hideRefs and to forbid uploadpack.allowReachableSHA1InWant, uploadpack.allowAnySHA1InWant, and uploadpack.allowTipSHA1InWant for authoritative repos that keep internal refs in the same repository.
+<!-- RESULT:F:END -->
+
+### Result G
+
+<!-- RESULT:G:START -->
+- Status: pass
+- Latest run: 20260405T013304Z-G-targeted-relock
+- Environment: Nix=nix (Determinate Nix 3.0.0) 2.26.3, Variants=current,nix_2_28,nix_2_30,nix_2_31, Python=3.14.3
+- Evidence: evidence/G/20260405T013304Z-G-targeted-relock
+- Observed result: With nix (Determinate Nix 3.0.0) 2.26.3, the direct-input/follows graph kept `nix flake lock --update-input alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second relock. With nix (Determinate Nix 3.0.0) 2.26.3, the transitive-subgraph graph updated alpha and alpha's leaf subgraph together, left unrelated beta unchanged, and produced a no-op second relock. With nix (Determinate Nix 3.0.0) 2.26.3, the direct-input/follows graph kept `nix flake update alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second update. With nix (Determinate Nix 3.0.0) 2.26.3, the transitive-subgraph graph updated alpha and alpha's leaf subgraph under `nix flake update alpha`, left unrelated beta unchanged, and produced a no-op second update. With nix (Determinate Nix 3.0.0) 2.26.3, the override graph kept the root override leaf and unrelated beta unchanged under `nix flake update alpha`, updated alpha, and produced a no-op second update. With nix (Nix) 2.28.5, the direct-input/follows graph kept `nix flake lock --update-input alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second relock. With nix (Nix) 2.28.5, the transitive-subgraph graph updated alpha and alpha's leaf subgraph together, left unrelated beta unchanged, and produced a no-op second relock. With nix (Nix) 2.28.5, the direct-input/follows graph kept `nix flake update alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second update. With nix (Nix) 2.28.5, the transitive-subgraph graph updated alpha and alpha's leaf subgraph under `nix flake update alpha`, left unrelated beta unchanged, and produced a no-op second update. With nix (Nix) 2.28.5, the override graph kept the root override leaf and unrelated beta unchanged under `nix flake update alpha`, updated alpha, and produced a no-op second update. With nix (Nix) 2.30.3+2, the direct-input/follows graph kept `nix flake lock --update-input alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second relock. With nix (Nix) 2.30.3+2, the transitive-subgraph graph updated alpha and alpha's leaf subgraph together, left unrelated beta unchanged, and produced a no-op second relock. With nix (Nix) 2.30.3+2, the direct-input/follows graph kept `nix flake update alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second update. With nix (Nix) 2.30.3+2, the transitive-subgraph graph updated alpha and alpha's leaf subgraph under `nix flake update alpha`, left unrelated beta unchanged, and produced a no-op second update. With nix (Nix) 2.30.3+2, the override graph kept the root override leaf and unrelated beta unchanged under `nix flake update alpha`, updated alpha, and produced a no-op second update. With nix (Nix) 2.31.3, the direct-input/follows graph kept `nix flake lock --update-input alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second relock. With nix (Nix) 2.31.3, the transitive-subgraph graph updated alpha and alpha's leaf subgraph together, left unrelated beta unchanged, and produced a no-op second relock. With nix (Nix) 2.31.3, the direct-input/follows graph kept `nix flake update alpha` scoped to alpha, left beta and gamma unchanged, and produced a no-op second update. With nix (Nix) 2.31.3, the transitive-subgraph graph updated alpha and alpha's leaf subgraph under `nix flake update alpha`, left unrelated beta unchanged, and produced a no-op second update. With nix (Nix) 2.31.3, the override graph kept the root override leaf and unrelated beta unchanged under `nix flake update alpha`, updated alpha, and produced a no-op second update.
+- Decision: On the validated local Nix variants (nix (Determinate Nix 3.0.0) 2.26.3, nix (Nix) 2.28.5, nix (Nix) 2.30.3+2, nix (Nix) 2.31.3), targeted relock stayed scoped and idempotent across the validated local Git-input graph shapes: multi-direct inputs with follows, transitive subgraphs, and root overrides, using both `nix flake lock --update-input alpha` and `nix flake update alpha`. The supported contract can therefore be narrowed to this validated version-and-graph matrix.
+- RFC/doc follow-up: Rewrite the RFC to promise targeted relock only for the validated Nix versions and validated graph shapes exercised here, prefer `nix flake update <input>` in normative examples, and keep broader version or graph cases fail-closed until proven.
+<!-- RESULT:G:END -->
+
+### Result H
+
+<!-- RESULT:H:START -->
+- Status: pass
+- Latest run: 20260404T080317Z-H-rewrite-fixtures
+- Environment: Python=3.14.3
+- Evidence: evidence/H/20260404T080317Z-H-rewrite-fixtures
+- Observed result: Supported literal shorthands rewrote deterministically for fixtures: already_rewritten_noop, github_basic_https, github_basic_ssh, github_ref_and_dir_https, gitlab_nested_groups_https, gitlab_subgroup_with_host_https, sourcehut_rev_https. Unsupported or ambiguous forms failed closed for fixtures: dynamic_expression_rejected, github_ambiguous_ref_query_rejected, non_literal_rejected. A second rewrite run was a byte-identical no-op for every successfully rewritten fixture.
+- Decision: A parser-backed deterministic rewrite is implementable for literal direct-input shorthand forms if the grammar stays intentionally narrow and unsupported expressions fail closed.
+- RFC/doc follow-up: Rewrite the RFC migration section as a normative grammar over literal URL assignments, with explicit transport policy inputs and explicit fail-closed exclusions for dynamic or ambiguous forms.
+<!-- RESULT:H:END -->
+
+### Result I
+
+<!-- RESULT:I:START -->
+- Status: pass
+- Latest run: 20260404T073519Z-I-locks
+- Environment: Git=git version 2.53.0, Python=3.14.3, FS=/
+- Evidence: evidence/I/20260404T073519Z-I-locks
+- Observed result: A second worker stayed out of the critical section while the first lock holder was alive. After the lock holder was killed, a third worker broke the stale lock, re-derived current work from Git, and updated the runtime ref to the newer local main with no leftover lock directory.
+- Decision: Short-lived workers can use advisory lock directories safely if lock contents remain advisory, stale locks are broken via liveness checks, and recovery re-derives work from Git state.
+- RFC/doc follow-up: Rewrite the RFC to define one lock per (repo, upstream, operation-class), local-filesystem-only support, stale-lock liveness checks, and the rule that lock contents are never the correctness source.
+<!-- RESULT:I:END -->
+
+### Result J
+
+<!-- RESULT:J:START -->
+- Status: pass
+- Latest run: 20260404T074302Z-J-execution-unit
+- Environment: Git=git version 2.53.0, Python=3.14.3
+- Evidence: evidence/J/20260404T074302Z-J-execution-unit
+- Observed result: One run captured one desired snapshot and the sorted upstream set alpha,beta,gamma, then recorded mixed outcomes under the same run id: alpha in_sync, beta out_of_sync, gamma unreachable. Cleanup removed the lock and in-progress marker while leaving terminal run evidence, and a stale older run was recorded as superseded.
+- Decision: A reconcile run can be specified as one bounded execution unit with one desired snapshot and one captured upstream set, while mixed per-upstream outcomes remain recorded under that same run and stale prior runs are superseded.
+- RFC/doc follow-up: Rewrite the RFC to separate execution-unit completeness from atomicity: one run id, one desired snapshot id, one captured upstream set, mixed per-upstream terminal results, transient marker cleanup, and preserved terminal evidence.
+<!-- RESULT:J:END -->
+
+### Result K
+
+<!-- RESULT:K:START -->
+- Status: pass
+- Latest run: 20260405T031317Z-K-durability-floor
+- Environment: macOS host: Git=git version 2.53.0, Variants=current,git_2_48_1,git_2_52_0, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3, Platform=Darwin, FS=/; Linux host: Git=git version 2.47.3, Variants=current, OpenSSH=OpenSSH_10.0p2 Debian-7+deb13u1, OpenSSL 3.5.5 27 Jan 2026, Python=3.13.5, Platform=Linux, FS=ext2/ext3
+- Evidence: evidence/K/20260405T030348Z-K-durability-floor; evidence/K/20260405T030929Z-K-durability-floor
+- Observed result: On the validated macOS host, baseline SSH and smart-HTTP pushes under `core.fsync=all` and `core.fsyncMethod=fsync` succeeded and produced strict-fsck-clean repositories across Git `2.48.1`, `2.52.0`, and `2.53.0`. On the validated Linux host, baseline SSH and smart-HTTP pushes under the same fsync floor succeeded and produced strict-fsck-clean repositories on `ext2/ext3` with Git `2.47.3`. On both validated platforms, crashes before `pre-receive` left no committed ref, and post-commit crash checkpoints produced committed local state with client-visible ambiguity rather than silent rollback.
+- Decision: Across the validated macOS and Linux hosts, the exercised Git variants upheld the selected authoritative-write crash checkpoints when authoritative repositories used `core.fsync=all` and `core.fsyncMethod=fsync`. The supported durability contract can therefore be limited to those validated platforms and filesystems rather than a broader unproven matrix.
+- RFC/doc follow-up: Rewrite the RFC to require the explicit Git fsync floor for authoritative repositories and to scope durability claims to the supported macOS and Linux platform contract validated here.
+<!-- RESULT:K:END -->
+
+### Result L
+
+<!-- RESULT:L:START -->
+- Status: pass
+- Latest run: 20260405T031318Z-L-deployment-repro
+- Environment: macOS host: Git=git version 2.53.0, Nix=nix (Determinate Nix 3.0.0) 2.26.3, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3; Linux host: Git=git version 2.47.3, Nix=nix (Nix) 2.32.2, OpenSSH=OpenSSH_10.0p2 Debian-7+deb13u1, OpenSSL 3.5.5 27 Jan 2026, Python=3.13.5
+- Evidence: evidence/L/20260405T004939Z-L-deployment-repro; evidence/L/20260405T024755Z-L-deployment-repro
+- Observed result: On the validated macOS and Linux hosts, the repository builds a pinned `git-relay` package, rewrites packaged launchd and systemd templates to the built binary path, validates runtime state and non-empty secrets outside `/nix/store`, records the injected secret count in the runtime profile, installs hook wrappers into a disposable bare repository, records a hook-dispatch event, resolves allowed SSH forced commands against the configured repo root, and successfully exercises service-manager bring-up through launchd on macOS and systemd on Linux.
+- Decision: A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime secret injection outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux.
+- RFC/doc follow-up: Rewrite the RFC to make macOS and Linux the explicit supported deployment platforms, require runtime secrets to stay outside `/nix/store`, and tie deployment claims to the validated launchd/systemd service-manager contract rather than to a broader unverified matrix.
+<!-- RESULT:L:END -->
+
 ## Workstreams
 
 ### 1. Local Accept And Crash Safety
@@ -177,14 +340,16 @@ Pass criteria:
 
 Proposed solution:
 
-- Keep MVP whole-push only.
-- Put all policy rejection in `pre-receive`.
-- Treat any Git ref transaction failure as whole-push failure.
-- Keep local writes on one `git-receive-pack` transaction path and do not layer custom per-ref acceptance.
+- Ordinary multi-ref pushes do not satisfy whole-push local acceptance on the tested Git path.
+- Relay-owned `pre-receive` guards can reject the whole push only for invalid refs that are actually transmitted to the server.
+- That is still insufficient for ordinary pushes because `send-pack` can prune a locally rejected ref before the relay ever sees the full user-requested push set.
+- Candidate solution A: require an explicit client contract such as inbound `--atomic` plus protocol-level verification that the relay can actually detect.
+- Candidate solution B: narrow the local contract to per-ref acceptance or to a relay-controlled API or single-ref push shape.
 
 RFC rewrite required:
 
-- Add an explicit "allowed Git server contract" section that bans behaviors that can reintroduce partial local success.
+- Remove any blanket claim that ordinary multi-ref pushes are whole-push atomic locally.
+- Add an explicit inbound-push contract section defining whether the relay requires `--atomic` with verifiable negotiation, supports only single-ref local acceptance, or exposes best-effort multi-ref acceptance with detectable partial local success.
 
 ### C. Startup classification from local refs plus internal refs plus descriptors
 
@@ -238,12 +403,17 @@ What to build:
   - local bare Git over SSH
   - local Git over smart HTTP if enabled
   - at least one forge implementation used in target deployments
+- a hosted target manifest under `fixtures/hosted/targets.json` that records the
+  actual disposable repositories, transport, host-key policy, and credential
+  source used for the confirmation run
 
 How to verify:
 
 - Probe remote push capability advertisement.
 - Attempt multi-ref `git push --atomic`.
 - Record success, failure mode, and downgrade behavior.
+- Require the hosted target to allow disposable branch create/delete, tag
+  creation, and multi-ref writes without touching production namespaces.
 
 Pass criteria:
 
@@ -309,12 +479,18 @@ What to build:
 
 - A repository with internal refs under `refs/git-relay/...` pointing to unique commits unreachable from exported refs.
 - Client fetch attempts by explicit object ID and normal negotiation.
+- A hosted target manifest that distinguishes managed-forge targets from
+  self-managed targets, because managed forges generally do not expose the
+  server-side controls needed for the same-repository hidden-ref model.
 
 How to verify:
 
 - Set `transfer.hideRefs`, `uploadpack.hideRefs`, and `receive.hideRefs` for the internal namespace.
 - Test clone, fetch, and object-by-id access.
 - Repeat over SSH and smart HTTP if HTTP support is enabled.
+- For hosted confirmation, require a self-managed target when the architecture
+  keeps internal refs in the same authoritative repository. Managed-forge
+  confirmation is not sufficient for that model.
 
 Pass criteria:
 
@@ -324,15 +500,19 @@ Pass criteria:
 
 Proposed solution:
 
+- `hideRefs` alone is not sufficient if SHA-by-id wants are enabled.
 - In MVP, require all of:
   - `transfer.hideRefs=refs/git-relay`
   - `uploadpack.hideRefs=refs/git-relay`
   - `receive.hideRefs=refs/git-relay`
-- If hidden-object tests still fail under supported Git versions, move internal tracking refs into a separate side repository per logical repository instead of the authoritative repo.
+  - `uploadpack.allowReachableSHA1InWant=false`
+  - `uploadpack.allowAnySHA1InWant=false`
+  - `uploadpack.allowTipSHA1InWant=false`
+- If those upload-pack constraints cannot be guaranteed on every supported deployment, move internal tracking refs into a separate side repository per logical repository instead of the authoritative repo.
 
 RFC rewrite required:
 
-- Expand the security and storage sections to define hidden-ref and object-visibility requirements explicitly.
+- Expand the security and storage sections to define hidden-ref and object-visibility requirements explicitly, including the forbidden SHA-by-id upload-pack settings.
 
 ### G. Targeted relock stability across Nix versions
 
@@ -521,6 +701,12 @@ Proposed solution:
 - make the relay itself Nix-built and pinned
 - keep secrets outside the store
 - validate system Git and OpenSSH as part of a deployment profile, not as unconstrained host dependencies
+- package the deployment profile explicitly:
+  - `git-relayd`
+  - `git-relay-install-hooks`
+  - `git-relay-ssh-force-command`
+  - systemd and launchd templates
+  - example config and environment files outside `/nix/store`
 
 ## Recommended Execution Order
 
