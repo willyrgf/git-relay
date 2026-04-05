@@ -15,6 +15,7 @@ use crate::platform::RealPlatformProbe;
 use crate::reconcile::{
     load_divergence_markers, reconcile_repository, replication_status_for_repo, ReconcileError,
 };
+use crate::upstream::{probe_repository_upstreams, UpstreamProbeError};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
 #[derive(Debug, Parser)]
@@ -61,6 +62,7 @@ struct ReplicationCommand {
 
 #[derive(Debug, Subcommand)]
 enum ReplicationSubcommand {
+    ProbeUpstreams(TargetOptions),
     Reconcile(TargetOptions),
     Status(TargetOptions),
 }
@@ -122,6 +124,8 @@ pub enum CliError {
     #[error(transparent)]
     Reconcile(#[from] ReconcileError),
     #[error(transparent)]
+    UpstreamProbe(#[from] UpstreamProbeError),
+    #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
     #[error("repository {0} was not found in the descriptor set")]
     RepositoryNotFound(String),
@@ -142,6 +146,9 @@ where
         },
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
         TopLevelCommand::Replication(command) => match command.command {
+            ReplicationSubcommand::ProbeUpstreams(options) => {
+                run_replication_probe_upstreams(options)
+            }
             ReplicationSubcommand::Reconcile(options) => run_replication_reconcile(options),
             ReplicationSubcommand::Status(options) => run_replication_status(options),
         },
@@ -208,6 +215,17 @@ fn run_replication_reconcile(options: TargetOptions) -> Result<ExitCode, CliErro
     let reports = targets
         .iter()
         .map(|descriptor| reconcile_repository(&config, descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_replication_probe_upstreams(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let reports = targets
+        .iter()
+        .map(|descriptor| probe_repository_upstreams(&config, descriptor))
         .collect::<Result<Vec<_>, _>>()?;
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)

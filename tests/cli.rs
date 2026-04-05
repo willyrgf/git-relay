@@ -383,6 +383,25 @@ fn assert_git_fsck_clean(repo_path: &Path) {
         .expect("git fsck success");
 }
 
+fn assert_no_probe_refs(repo_path: &Path) {
+    let output = StdCommand::new("git")
+        .arg(format!("--git-dir={}", repo_path.display()))
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/git-relay-probe",
+            "refs/tags/git-relay-probe-",
+        ])
+        .output()
+        .expect("git for-each-ref");
+    assert!(output.status.success(), "git for-each-ref failed");
+    let refs = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        refs.trim().is_empty(),
+        "remote probe refs should be cleaned up, found: {refs}"
+    );
+}
+
 #[test]
 fn repo_validate_returns_json_for_valid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
@@ -732,6 +751,121 @@ fn replication_reconcile_records_mixed_results_and_updates_internal_observed_ref
     let local_main = read_git_ref(&repo_path, "refs/heads/main");
     let observed_main = read_git_ref(&repo_path, "refs/git-relay/upstreams/alpha/heads/main");
     assert_eq!(observed_main, local_main);
+}
+
+#[test]
+fn replication_probe_upstreams_classifies_supported_unsupported_and_missing_targets() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_supported = temp.path().join("upstream-supported.git");
+    init_bare_repo(&upstream_supported);
+
+    let upstream_non_atomic = temp.path().join("upstream-non-atomic.git");
+    init_bare_repo(&upstream_non_atomic);
+    StdCommand::new("git")
+        .arg(format!("--git-dir={}", upstream_non_atomic.display()))
+        .args(["config", "receive.advertiseAtomic", "false"])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+
+    let missing_upstream = temp.path().join("missing-upstream.git");
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[
+            ("alpha", upstream_supported.to_str().expect("path"), true),
+            ("beta", upstream_non_atomic.to_str().expect("path"), true),
+            ("gamma", missing_upstream.to_str().expect("path"), false),
+        ],
+    );
+
+    let work_repo = temp.path().join("work-probe-upstreams");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "probe-upstreams",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("probe json");
+    let runs = report.as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(
+        run["source_oid"],
+        read_git_ref(&repo_path, "refs/heads/main")
+    );
+
+    let results = run["results"].as_array().expect("results");
+    assert!(results.iter().any(|item| {
+        item["upstream_id"] == "alpha"
+            && item["access"]["verdict"] == "accessible"
+            && item["atomic_capability"]["verdict"] == "supported"
+            && item["disposable_namespace"]["verdict"] == "supported"
+            && item["supported_for_policy"] == true
+    }));
+    assert!(results.iter().any(|item| {
+        item["upstream_id"] == "beta"
+            && item["access"]["verdict"] == "accessible"
+            && item["atomic_capability"]["verdict"] == "unsupported"
+            && item["atomic_capability"]["error_classification"] == "protocol_unsupported"
+            && item["disposable_namespace"]["verdict"] == "supported"
+            && item["supported_for_policy"] == false
+    }));
+    assert!(results.iter().any(|item| {
+        item["upstream_id"] == "gamma"
+            && item["access"]["verdict"] == "repository_missing"
+            && item["atomic_capability"]["verdict"] == "inconclusive"
+            && item["atomic_capability"]["error_classification"] == "repository_missing"
+            && item["disposable_namespace"]["verdict"] == "not_attempted"
+            && item["supported_for_policy"] == false
+    }));
+
+    assert_no_probe_refs(&upstream_supported);
+    assert_no_probe_refs(&upstream_non_atomic);
+
+    let probe_runs_dir = temp
+        .path()
+        .join("upstream-probes")
+        .join("runs")
+        .join("github.com_example_repo.git");
+    let entries = fs::read_dir(&probe_runs_dir)
+        .expect("probe runs dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("probe runs");
+    assert_eq!(entries.len(), 1, "one probe run record should be persisted");
 }
 
 #[test]

@@ -8,4 +8,5 @@ pub mod hooks;
 pub mod platform;
 pub mod reconcile;
 pub mod ssh_wrapper;
+pub mod upstream;
 pub mod validator;
