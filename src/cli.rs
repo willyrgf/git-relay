@@ -1,0 +1,170 @@
+use std::ffi::OsString;
+use std::io::{self, Write};
+use std::process::ExitCode;
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::classification::classify_startup;
+use crate::config::{AppConfig, ConfigError, RepositoryDescriptor};
+use crate::git::SystemGitExecutor;
+use crate::platform::RealPlatformProbe;
+use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
+
+#[derive(Debug, Parser)]
+#[command(name = "git-relay")]
+#[command(about = "Git Relay control-plane bootstrap and validation CLI")]
+pub struct Cli {
+    #[command(subcommand)]
+    command: TopLevelCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TopLevelCommand {
+    Repo(RepoCommand),
+    Startup(StartupCommand),
+}
+
+#[derive(Debug, Args)]
+struct RepoCommand {
+    #[command(subcommand)]
+    command: RepoSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoSubcommand {
+    Validate(TargetOptions),
+}
+
+#[derive(Debug, Args)]
+struct StartupCommand {
+    #[command(subcommand)]
+    command: StartupSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StartupSubcommand {
+    Classify(TargetOptions),
+}
+
+#[derive(Debug, Clone, Args)]
+struct TargetOptions {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    ValidationInfrastructure(#[from] ValidationInfrastructureError),
+    #[error("repository {0} was not found in the descriptor set")]
+    RepositoryNotFound(String),
+    #[error("failed to write command output: {0}")]
+    Io(#[from] io::Error),
+}
+
+pub fn run<I, T>(args: I) -> Result<ExitCode, CliError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let cli = Cli::parse_from(args);
+    match cli.command {
+        TopLevelCommand::Repo(command) => match command.command {
+            RepoSubcommand::Validate(options) => run_repo_validate(options),
+        },
+        TopLevelCommand::Startup(command) => match command.command {
+            StartupSubcommand::Classify(options) => run_startup_classify(options),
+        },
+    }
+}
+
+fn run_repo_validate(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+    let reports = targets
+        .iter()
+        .map(|descriptor| validator.validate(&config, descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    emit_output(&reports, options.json)?;
+    if reports.iter().all(ValidationReport::passed) {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn run_startup_classify(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+
+    let mut classifications = Vec::new();
+    let mut valid = true;
+    for descriptor in targets {
+        let report = validator.validate(&config, &descriptor)?;
+        if !report.passed() {
+            valid = false;
+        }
+        classifications.push(classify_startup(&descriptor, &report));
+    }
+
+    emit_output(&classifications, options.json)?;
+    if valid {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn load_config_and_descriptors(
+    path: &std::path::Path,
+) -> Result<(AppConfig, Vec<RepositoryDescriptor>), CliError> {
+    let config = AppConfig::load(path)?;
+    let descriptors = config.load_repository_descriptors()?;
+    Ok((config, descriptors))
+}
+
+fn select_repositories(
+    descriptors: Vec<RepositoryDescriptor>,
+    target_repo: Option<&str>,
+) -> Result<Vec<RepositoryDescriptor>, CliError> {
+    if let Some(target_repo) = target_repo {
+        let descriptor = descriptors
+            .into_iter()
+            .find(|descriptor| descriptor.repo_id == target_repo)
+            .ok_or_else(|| CliError::RepositoryNotFound(target_repo.to_owned()))?;
+        Ok(vec![descriptor])
+    } else {
+        Ok(descriptors)
+    }
+}
+
+fn emit_output<T: serde::Serialize>(payload: &T, json: bool) -> Result<(), CliError> {
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    if json {
+        serde_json::to_writer_pretty(&mut stdout, payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+        )?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
