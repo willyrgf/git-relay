@@ -117,18 +117,9 @@ service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "/usr/local/bin/git-relay-ssh-force-command"
 disable_forwarding = true
-runtime_secret_env_file = "{env_file}"
-required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
+runtime_env_file = "{env_file}"
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["{filesystem}"]
-
-[auth_profiles.github-read]
-kind = "https-token"
-secret_ref = "env:GITHUB_READ_TOKEN"
-
-[auth_profiles.github-write]
-kind = "ssh-key"
-secret_ref = "env:GITHUB_WRITE_KEY"
 "#,
         temp.path().display(),
         repo_root.display(),
@@ -138,7 +129,7 @@ secret_ref = "env:GITHUB_WRITE_KEY"
     fs::write(&config_path, config).expect("config");
     fs::write(
         temp.path().join("git-relay.env"),
-        "GITHUB_READ_TOKEN=alpha\nGITHUB_WRITE_KEY=beta\n",
+        "SSH_AUTH_SOCK=/tmp/agent.sock\nGIT_SSH_COMMAND=ssh -F /tmp/ssh-config\n",
     )
     .expect("env file");
     config_path
@@ -180,12 +171,10 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[read_upstreams]]
 name = "github-read"
 url = "https://github.com/example/repo.git"
-auth_profile = "github-read"
 
 [[write_upstreams]]
 name = "github-write"
 url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
 require_atomic = true
 "#,
             repo_path.display()
@@ -208,7 +197,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[write_upstreams]]
 name = "github-write"
 url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
 require_atomic = true
 "#,
             repo_path.display()
@@ -247,7 +235,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[read_upstreams]]
 name = "github-read"
 url = "{read_upstream_url}"
-auth_profile = "github-read"
 "#
         ));
     }
@@ -257,7 +244,6 @@ auth_profile = "github-read"
 [[write_upstreams]]
 name = "github-write"
 url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
 require_atomic = true
 "#,
     );
@@ -295,7 +281,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[write_upstreams]]
 name = "{name}"
 url = "{url}"
-auth_profile = "github-write"
 require_atomic = {require_atomic}
 "#
         ));
@@ -329,7 +314,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[read_upstreams]]
 name = "github-read"
 url = "{read_upstream_url}"
-auth_profile = "github-read"
 "#,
         repo_path.display()
     );
@@ -1043,7 +1027,39 @@ fn startup_classify_fails_closed_for_invalid_authoritative_repo() {
 }
 
 #[test]
-fn deploy_validate_runtime_reports_secret_and_contract_health() {
+fn startup_classify_succeeds_for_healthy_cache_only_repo() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&repo_path);
+    write_cache_only_descriptor(
+        &temp,
+        &repo_path,
+        "ttl:60s",
+        "https://github.com/example/cache.git",
+    );
+
+    let mut command = Command::cargo_bin("git-relay").expect("cargo bin");
+    command
+        .args([
+            "startup",
+            "classify",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"safety\": \"healthy\""))
+        .stdout(predicate::str::contains(
+            "\"write_acceptance_allowed\": false",
+        ));
+}
+
+#[test]
+fn deploy_validate_runtime_reports_environment_and_contract_health() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
     let repo_path = temp.path().join("repos").join("repo.git");
@@ -1063,11 +1079,11 @@ fn deploy_validate_runtime_reports_secret_and_contract_health() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"passed\""))
-        .stdout(predicate::str::contains("\"secret_count\": 2"));
+        .stdout(predicate::str::contains("\"environment_entry_count\": 2"));
 }
 
 #[test]
-fn git_relayd_serve_once_fails_closed_when_runtime_secrets_are_missing() {
+fn git_relayd_serve_once_fails_closed_when_runtime_env_file_is_missing() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
     fs::remove_file(temp.path().join("git-relay.env")).expect("remove env file");
@@ -1082,7 +1098,7 @@ fn git_relayd_serve_once_fails_closed_when_runtime_secrets_are_missing() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("runtime_secret_env_file"));
+        .stderr(predicate::str::contains("runtime_env_file"));
 }
 
 #[test]
@@ -1763,6 +1779,32 @@ fn replication_reconcile_records_mixed_results_and_updates_internal_observed_ref
 }
 
 #[test]
+fn replication_reconcile_fails_closed_for_invalid_authoritative_repo() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed validator re-check before reconcile",
+        ));
+}
+
+#[test]
 fn replication_probe_upstreams_classifies_supported_unsupported_and_missing_targets() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
@@ -1972,7 +2014,18 @@ fn replication_probe_matrix_records_target_metadata_and_policy_support() {
         item["target"]["target_id"] == "self-managed-alpha"
             && item["target"]["class"] == "self-managed"
             && item["target"]["same_repo_hidden_refs"] == true
-            && item["supported_for_policy"] == true
+            && item["supported_for_policy"] == false
+            && item["same_repo_hidden_refs_supported"] == false
+            && item["admission_reasons"]
+                .as_array()
+                .expect("admission reasons")
+                .iter()
+                .any(|reason| {
+                    reason
+                        .as_str()
+                        .map(|value| value.contains("hidden-ref leakage check"))
+                        .unwrap_or(false)
+                })
     }));
     assert!(results.iter().any(|item| {
         item["target"]["target_id"] == "managed-beta"
@@ -2077,9 +2130,20 @@ fn replication_build_release_manifest_fails_closed_for_unproven_targets() {
     let manifest: Value = serde_json::from_slice(&output).expect("release manifest json");
     assert_eq!(manifest["all_entries_admitted"], false);
     let entries = manifest["entries"].as_array().expect("entries");
-    assert!(entries
-        .iter()
-        .any(|item| { item["target_id"] == "supported-alpha" && item["admitted"] == true }));
+    assert!(entries.iter().any(|item| {
+        item["target_id"] == "supported-alpha"
+            && item["admitted"] == false
+            && item["admission_reasons"]
+                .as_array()
+                .expect("admission reasons")
+                .iter()
+                .any(|reason| {
+                    reason
+                        .as_str()
+                        .map(|value| value.contains("hidden-ref leakage check"))
+                        .unwrap_or(false)
+                })
+    }));
     assert!(entries
         .iter()
         .any(|item| { item["target_id"] == "missing-beta" && item["admitted"] == false }));
@@ -3408,6 +3472,32 @@ fn repo_repair_breaks_stale_execution_artifacts_and_rederives_state() {
 }
 
 #[test]
+fn repo_repair_fails_closed_for_invalid_authoritative_repo() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "repair",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed validator re-check before reconcile",
+        ));
+}
+
+#[test]
 fn release_report_records_host_evidence_and_manifest_admission_state() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
@@ -3451,7 +3541,7 @@ fn release_report_records_host_evidence_and_manifest_admission_state() {
             "ssh",
             upstream_supported.to_str().expect("path"),
             true,
-            true,
+            false,
         )],
     );
 

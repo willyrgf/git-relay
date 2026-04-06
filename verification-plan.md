@@ -55,7 +55,7 @@ The relay can still provide high-level "one run handles everything" behavior thr
 | I | pass | 20260404T073519Z-I-locks | Short-lived workers can use advisory lock directories safely if lock contents remain advisory, stale locks are broken via liveness checks, and recovery re-derives work from Git state. |
 | J | pass | 20260404T074302Z-J-execution-unit | A reconcile run can be specified as one bounded execution unit with one desired snapshot and one captured upstream set, while mixed per-upstream outcomes remain recorded under that same run and stale prior runs are superseded. |
 | K | pass | 20260405T031317Z-K-durability-floor | Across the validated macOS and Linux hosts, the exercised Git variants upheld the selected authoritative-write crash checkpoints when authoritative repos used `core.fsync=all` and `core.fsyncMethod=fsync`. The supported durability contract can therefore be limited to those validated platforms and filesystems rather than a broader unproven matrix. |
-| L | pass | 20260405T031318Z-L-deployment-repro | A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime secret injection outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux. |
+| L | pass | 20260405T031318Z-L-deployment-repro | A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime environment-file handling outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux. |
 <!-- EXECUTION_LEDGER:END -->
 
 ### Result A
@@ -197,9 +197,9 @@ The relay can still provide high-level "one run handles everything" behavior thr
 - Latest run: 20260405T031318Z-L-deployment-repro
 - Environment: macOS host: Git=git version 2.53.0, Nix=nix (Determinate Nix 3.0.0) 2.26.3, OpenSSH=OpenSSH_10.2p1, LibreSSL 3.3.6, Python=3.14.3; Linux host: Git=git version 2.47.3, Nix=nix (Nix) 2.32.2, OpenSSH=OpenSSH_10.0p2 Debian-7+deb13u1, OpenSSL 3.5.5 27 Jan 2026, Python=3.13.5
 - Evidence: evidence/L/20260405T004939Z-L-deployment-repro; evidence/L/20260405T024755Z-L-deployment-repro
-- Observed result: On the validated macOS and Linux hosts, the repository builds a pinned `git-relay` package, rewrites packaged launchd and systemd templates to the built binary path, validates runtime state and non-empty secrets outside `/nix/store`, records the injected secret count in the runtime profile, installs hook wrappers into a disposable bare repository, records a hook-dispatch event, resolves allowed SSH forced commands against the configured repo root, and successfully exercises service-manager bring-up through launchd on macOS and systemd on Linux.
-- Decision: A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime secret injection outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux.
-- RFC/doc follow-up: Rewrite the RFC to make macOS and Linux the explicit supported deployment platforms, require runtime secrets to stay outside `/nix/store`, and tie deployment claims to the validated launchd/systemd service-manager contract rather than to a broader unverified matrix.
+- Observed result: On the validated macOS and Linux hosts, the repository builds a pinned `git-relay` package, rewrites packaged launchd and systemd templates to the built binary path, validates the configured runtime environment file outside `/nix/store`, records the parsed environment entry count in the runtime profile, installs hook wrappers into a disposable bare repository, records a hook-dispatch event, resolves allowed SSH forced commands against the configured repo root, and successfully exercises service-manager bring-up through launchd on macOS and systemd on Linux.
+- Decision: A pinned Nix-built deployment scaffold is now reproducible across the validated macOS and Linux hosts: package build, runtime-profile validation, runtime environment-file handling outside `/nix/store`, hook-wrapper installation, SSH forced-command routing, and service-manager bring-up via launchd on macOS and systemd on Linux.
+- RFC/doc follow-up: Rewrite the RFC to make macOS and Linux the explicit supported deployment platforms, require runtime environment files to stay outside `/nix/store`, and tie deployment claims to the validated launchd/systemd service-manager contract rather than to a broader unverified matrix.
 <!-- RESULT:L:END -->
 
 ## Workstreams
@@ -694,12 +694,12 @@ Proposed solution:
 Needed:
 
 - a Nix-built service package with pinned Git and OpenSSH inputs
-- a deployment test that proves service startup, hook wiring, SSH forced-command routing, and runtime secret injection
+- a deployment test that proves service startup, hook wiring, SSH forced-command routing, and runtime environment-file handling
 
 Proposed solution:
 
 - make the relay itself Nix-built and pinned
-- keep secrets outside the store
+- keep runtime environment files outside the store
 - validate system Git and OpenSSH as part of a deployment profile, not as unconstrained host dependencies
 - package the deployment profile explicitly:
   - `git-relayd`

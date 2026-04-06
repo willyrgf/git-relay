@@ -1606,12 +1606,10 @@ mod tests {
                 git_only_command_mode: GitOnlyCommandMode::OpensshForceCommand,
                 forced_command_wrapper: "/usr/local/bin/git-relay-ssh-force-command".into(),
                 disable_forwarding: true,
-                runtime_secret_env_file: "/tmp/runtime.env".into(),
-                required_secret_keys: vec![],
+                runtime_env_file: "/tmp/runtime.env".into(),
                 allowed_git_services: vec![GitService::GitUploadPack, GitService::GitReceivePack],
                 supported_filesystems: vec!["apfs".to_owned()],
             },
-            auth_profiles: BTreeMap::new(),
         }
     }
 

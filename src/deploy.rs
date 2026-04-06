@@ -33,7 +33,7 @@ impl RuntimeValidationIssue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeValidationReport {
     pub status: RuntimeValidationStatus,
-    pub secret_count: usize,
+    pub environment_entry_count: usize,
     pub issues: Vec<RuntimeValidationIssue>,
     pub repository_contracts: Vec<ValidationReport>,
 }
@@ -54,18 +54,18 @@ where
     P: crate::platform::PlatformProbe,
 {
     let mut issues = Vec::new();
-    let env_file = &config.deployment.runtime_secret_env_file;
+    let env_file = &config.deployment.runtime_env_file;
 
     if !env_file.is_absolute() {
         issues.push(RuntimeValidationIssue::new(
-            "deployment.runtime_secret_env_file",
-            "runtime secret env file must be absolute",
+            "deployment.runtime_env_file",
+            "runtime env file must be absolute",
         ));
     }
     if env_file.starts_with(Path::new("/nix/store")) {
         issues.push(RuntimeValidationIssue::new(
-            "deployment.runtime_secret_env_file",
-            "runtime secret env file must remain outside /nix/store",
+            "deployment.runtime_env_file",
+            "runtime env file must remain outside /nix/store",
         ));
     }
     if config.deployment.service_label.trim().is_empty() {
@@ -79,26 +79,12 @@ where
         Ok(secrets) => secrets,
         Err(message) => {
             issues.push(RuntimeValidationIssue::new(
-                "deployment.runtime_secret_env_file",
+                "deployment.runtime_env_file",
                 message,
             ));
             BTreeMap::new()
         }
     };
-
-    for key in &config.deployment.required_secret_keys {
-        match secrets.get(key) {
-            Some(value) if !value.is_empty() => {}
-            Some(_) => issues.push(RuntimeValidationIssue::new(
-                "deployment.required_secret_keys",
-                format!("required runtime secret {key} is present but empty"),
-            )),
-            None => issues.push(RuntimeValidationIssue::new(
-                "deployment.required_secret_keys",
-                format!("required runtime secret {key} is missing"),
-            )),
-        }
-    }
 
     let mut repository_contracts = Vec::new();
     for descriptor in descriptors
@@ -126,7 +112,7 @@ where
 
     Ok(RuntimeValidationReport {
         status,
-        secret_count: secrets.len(),
+        environment_entry_count: secrets.len(),
         issues,
         repository_contracts,
     })
@@ -135,7 +121,7 @@ where
 fn load_env_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
     let source = fs::read_to_string(path).map_err(|error| {
         format!(
-            "failed to read runtime secret env file {}: {error}",
+            "failed to read runtime env file {}: {error}",
             path.display()
         )
     })?;
@@ -148,7 +134,7 @@ fn load_env_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
         let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
         let (key, value) = trimmed.split_once('=').ok_or_else(|| {
             format!(
-                "invalid runtime secret env line {} in {}; expected KEY=value",
+                "invalid runtime env line {} in {}; expected KEY=value",
                 index + 1,
                 path.display()
             )
@@ -181,7 +167,7 @@ fn render_systemd_service(config: &AppConfig, request: &ServiceRenderRequest) ->
     format!(
         "[Unit]\nDescription=Git Relay\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={working_directory}\nEnvironmentFile={env_file}\nExecStart={binary} serve --config {config_path}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
         working_directory = config.paths.state_root.display(),
-        env_file = config.deployment.runtime_secret_env_file.display(),
+        env_file = config.deployment.runtime_env_file.display(),
         binary = request.binary_path.display(),
         config_path = request.config_path.display(),
     )
@@ -190,7 +176,7 @@ fn render_systemd_service(config: &AppConfig, request: &ServiceRenderRequest) ->
 fn render_launchd_service(config: &AppConfig, request: &ServiceRenderRequest) -> String {
     let shell_command = format!(
         "set -a; . {env_file}; exec {binary} serve --config {config_path}",
-        env_file = shell_escape(&config.deployment.runtime_secret_env_file),
+        env_file = shell_escape(&config.deployment.runtime_env_file),
         binary = shell_escape(&request.binary_path),
         config_path = shell_escape(&request.config_path),
     );
@@ -237,18 +223,16 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
     use crate::config::{
-        AppConfig, AuthProfile, AuthProfileKind, AuthorityModel, DeploymentProfile,
-        FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
-        MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReadUpstream,
-        ReconcileConfig, ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle,
-        RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
-        TrackingRefPlacement, WorkerMode, WriteUpstream,
+        AppConfig, AuthorityModel, DeploymentProfile, FreshnessPolicy, GitOnlyCommandMode,
+        GitService, ListenConfig, MigrationConfig, MigrationTransport, PathsConfig, PolicyConfig,
+        PushAckPolicy, ReadUpstream, ReconcileConfig, ReconcilePolicy, RepositoryDescriptor,
+        RepositoryLifecycle, RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform,
+        TargetedRelockMode, TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
     use crate::git::SystemGitExecutor;
     use crate::platform::PlatformProbe;
@@ -369,30 +353,10 @@ mod tests {
                 git_only_command_mode: GitOnlyCommandMode::OpensshForceCommand,
                 forced_command_wrapper: PathBuf::from("/usr/local/bin/git-relay-ssh-force-command"),
                 disable_forwarding: true,
-                runtime_secret_env_file: env_file,
-                required_secret_keys: vec![
-                    "GITHUB_READ_TOKEN".to_owned(),
-                    "GITHUB_WRITE_KEY".to_owned(),
-                ],
+                runtime_env_file: env_file,
                 allowed_git_services: vec![GitService::GitUploadPack, GitService::GitReceivePack],
                 supported_filesystems: vec!["apfs".to_owned()],
             },
-            auth_profiles: BTreeMap::from([
-                (
-                    "github-read".to_owned(),
-                    AuthProfile {
-                        kind: AuthProfileKind::HttpsToken,
-                        secret_ref: "env:GITHUB_READ_TOKEN".to_owned(),
-                    },
-                ),
-                (
-                    "github-write".to_owned(),
-                    AuthProfile {
-                        kind: AuthProfileKind::SshKey,
-                        secret_ref: "env:GITHUB_WRITE_KEY".to_owned(),
-                    },
-                ),
-            ]),
         }
     }
 
@@ -412,12 +376,10 @@ mod tests {
             read_upstreams: vec![ReadUpstream {
                 name: "github-read".to_owned(),
                 url: "https://github.com/example/repo.git".to_owned(),
-                auth_profile: "github-read".to_owned(),
             }],
             write_upstreams: vec![WriteUpstream {
                 name: "github-write".to_owned(),
                 url: "ssh://git@github.com/example/repo.git".to_owned(),
-                auth_profile: "github-write".to_owned(),
                 require_atomic: true,
             }],
         }
@@ -428,8 +390,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let config = app_config(&temp);
         std::fs::write(
-            &config.deployment.runtime_secret_env_file,
-            "GITHUB_READ_TOKEN=alpha\nGITHUB_WRITE_KEY=beta\n",
+            &config.deployment.runtime_env_file,
+            "SSH_AUTH_SOCK=/tmp/agent.sock\nGIT_SSH_COMMAND=ssh -F /tmp/ssh-config\n",
         )
         .expect("env file");
 
@@ -448,18 +410,13 @@ mod tests {
             .expect("runtime validation");
 
         assert!(report.passed());
-        assert_eq!(report.secret_count, 2);
+        assert_eq!(report.environment_entry_count, 2);
     }
 
     #[test]
-    fn runtime_validation_fails_when_required_secret_is_missing() {
+    fn runtime_validation_fails_when_runtime_env_file_is_missing() {
         let temp = TempDir::new().expect("tempdir");
         let config = app_config(&temp);
-        std::fs::write(
-            &config.deployment.runtime_secret_env_file,
-            "GITHUB_READ_TOKEN=alpha\n",
-        )
-        .expect("env file");
 
         let descriptor = authoritative_descriptor(&temp);
         init_bare_repo(&descriptor.repo_path);
@@ -479,7 +436,7 @@ mod tests {
         assert!(report
             .issues
             .iter()
-            .any(|issue| issue.code == "deployment.required_secret_keys"));
+            .any(|issue| issue.code == "deployment.runtime_env_file"));
     }
 
     #[test]

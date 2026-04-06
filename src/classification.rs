@@ -107,12 +107,10 @@ mod tests {
             read_upstreams: vec![ReadUpstream {
                 name: "github-read".to_owned(),
                 url: "ssh://git@github.com/example/repo.git".to_owned(),
-                auth_profile: "read".to_owned(),
             }],
             write_upstreams: vec![WriteUpstream {
                 name: "github-write".to_owned(),
                 url: "ssh://git@github.com/example/repo.git".to_owned(),
-                auth_profile: "write".to_owned(),
                 require_atomic: true,
             }],
         }

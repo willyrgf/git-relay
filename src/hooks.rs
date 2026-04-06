@@ -782,14 +782,9 @@ service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "/usr/local/bin/git-relay-ssh-force-command"
 disable_forwarding = true
-runtime_secret_env_file = "{}"
-required_secret_keys = ["GITHUB_WRITE_KEY"]
+runtime_env_file = "{}"
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["apfs"]
-
-[auth_profiles.github-write]
-kind = "ssh-key"
-secret_ref = "env:GITHUB_WRITE_KEY"
 "#,
             temp.path().display(),
             temp.path().join("repos").display(),
@@ -798,7 +793,11 @@ secret_ref = "env:GITHUB_WRITE_KEY"
         );
         fs::create_dir_all(temp.path().join("repos")).expect("repo root");
         fs::create_dir_all(temp.path().join("repos.d")).expect("descriptor root");
-        fs::write(temp.path().join("git-relay.env"), "GITHUB_WRITE_KEY=beta\n").expect("env");
+        fs::write(
+            temp.path().join("git-relay.env"),
+            "SSH_AUTH_SOCK=/tmp/agent.sock\n",
+        )
+        .expect("env");
         fs::write(&config_path, config).expect("config");
         fs::write(
             temp.path().join("repos.d").join("repo.toml"),
@@ -819,7 +818,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[write_upstreams]]
 name = "github-write"
 url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
 require_atomic = true
 "#,
                 repo_path.display()

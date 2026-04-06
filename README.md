@@ -25,7 +25,7 @@ Implemented in this repository:
 - repository descriptors and typed daemon config
 - validator-enforced authoritative repository contract
 - launchd rendering on macOS and systemd rendering on Linux
-- runtime secret validation outside `/nix/store`
+- runtime environment-file validation outside `/nix/store`
 - SSH ingress through `git-relay-ssh-force-command`
 - hook installation through `git-relay-install-hooks`
 - `local-commit` acknowledgement with crash-window coverage
@@ -90,7 +90,7 @@ The Nix flake exports:
 ## Repository Layout
 
 - [`packaging/example/git-relay.example.toml`](./packaging/example/git-relay.example.toml): example daemon config
-- [`packaging/example/git-relay.env.example`](./packaging/example/git-relay.env.example): runtime secret env file example
+- [`packaging/example/git-relay.env.example`](./packaging/example/git-relay.env.example): runtime environment file example
 - [`git-relay-rfc.md`](./git-relay-rfc.md): design contract and workstreams
 - [`verification-plan.md`](./verification-plan.md): evidence plan and recorded verification results
 
@@ -118,7 +118,6 @@ Daemon config is one TOML file with these top-level sections:
 - `[retention]`
 - `[migration]`
 - `[deployment]`
-- `[auth_profiles.<name>]`
 
 Example:
 
@@ -167,25 +166,16 @@ service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "/usr/local/libexec/git-relay-ssh-force-command"
 disable_forwarding = true
-runtime_secret_env_file = "/etc/git-relay/runtime.env"
-required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
+runtime_env_file = "/etc/git-relay/runtime.env"
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["apfs", "ext2/ext3", "ext4"]
-
-[auth_profiles.github-read]
-kind = "https-token"
-secret_ref = "env:GITHUB_READ_TOKEN"
-
-[auth_profiles.github-write]
-kind = "ssh-key"
-secret_ref = "env:GITHUB_WRITE_KEY"
 ```
 
-Runtime secrets stay outside `/nix/store`. The example env file is:
+Runtime environment files stay outside `/nix/store`. Outbound Git authentication uses the relay process's ambient Git and SSH environment, such as `ssh-agent`, `~/.ssh/config`, `GIT_SSH_COMMAND`, and Git credential helpers. The relay does not select per-upstream credentials in config. The example env file is:
 
 ```sh
-GITHUB_READ_TOKEN=replace-me
-GITHUB_WRITE_KEY=replace-me
+SSH_AUTH_SOCK=/run/user/1000/ssh-agent.sock
+GIT_SSH_COMMAND=ssh -F /etc/git-relay/ssh_config
 ```
 
 ## Repository Descriptors
@@ -210,7 +200,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[write_upstreams]]
 name = "github-write"
 url = "ssh://git@github.com/example/repo.git"
-auth_profile = "github-write"
 require_atomic = true
 ```
 
@@ -232,7 +221,6 @@ exported_refs = ["refs/heads/*", "refs/tags/*"]
 [[read_upstreams]]
 name = "github-read"
 url = "https://github.com/example/cache.git"
-auth_profile = "github-read"
 ```
 
 Important validator rules for write-accepting authoritative repositories:
@@ -242,6 +230,7 @@ Important validator rules for write-accepting authoritative repositories:
 - hidden refs under `refs/git-relay/*` must be enforced
 - SHA-by-id wants must be disabled for same-repo hidden refs
 - the runtime deployment profile and filesystem must match the configured supported platform
+- internal tracking placement defaults to `same-repo-hidden`: keep `refs/git-relay/*` in the local authoritative repository, hide them from clients, and do not push them upstream
 
 ## Persistent State And Recovery Model
 
@@ -252,6 +241,7 @@ Inside the bare repository:
 - visible authoritative refs live under normal `refs/heads/*` and `refs/tags/*`
 - observed upstream refs live under `refs/git-relay/upstreams/<upstream>/heads/*` and `refs/git-relay/upstreams/<upstream>/tags/*`
 - divergence markers live under `refs/git-relay/safety/divergent/*`
+- `refs/git-relay/*` is local relay control-plane state and is not replicated to upstream servers
 
 Under `state_root`:
 

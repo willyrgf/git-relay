@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -20,8 +19,6 @@ pub struct AppConfig {
     pub retention: RetentionConfig,
     pub migration: MigrationConfig,
     pub deployment: DeploymentProfile,
-    #[serde(default)]
-    pub auth_profiles: BTreeMap<String, AuthProfile>,
 }
 
 impl AppConfig {
@@ -178,25 +175,9 @@ pub struct DeploymentProfile {
     pub git_only_command_mode: GitOnlyCommandMode,
     pub forced_command_wrapper: PathBuf,
     pub disable_forwarding: bool,
-    pub runtime_secret_env_file: PathBuf,
-    pub required_secret_keys: Vec<String>,
+    pub runtime_env_file: PathBuf,
     pub allowed_git_services: Vec<GitService>,
     pub supported_filesystems: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthProfile {
-    pub kind: AuthProfileKind,
-    pub secret_ref: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuthProfileKind {
-    SshKey,
-    HttpsToken,
-    EnvSecret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +205,6 @@ pub struct RepositoryDescriptor {
 pub struct ReadUpstream {
     pub name: String,
     pub url: String,
-    pub auth_profile: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +212,6 @@ pub struct ReadUpstream {
 pub struct WriteUpstream {
     pub name: String,
     pub url: String,
-    pub auth_profile: String,
     #[serde(default)]
     pub require_atomic: bool,
 }
@@ -683,8 +662,7 @@ service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "{}"
 disable_forwarding = true
-runtime_secret_env_file = "{}"
-required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
+runtime_env_file = "{}"
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["apfs"]
 "#,

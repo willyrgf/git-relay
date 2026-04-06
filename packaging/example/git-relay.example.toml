@@ -42,15 +42,6 @@ service_label = "dev.git-relay"
 git_only_command_mode = "openssh-force-command"
 forced_command_wrapper = "/usr/local/libexec/git-relay-ssh-force-command"
 disable_forwarding = true
-runtime_secret_env_file = "/etc/git-relay/runtime.env"
-required_secret_keys = ["GITHUB_READ_TOKEN", "GITHUB_WRITE_KEY"]
+runtime_env_file = "/etc/git-relay/runtime.env"
 allowed_git_services = ["git-upload-pack", "git-receive-pack"]
 supported_filesystems = ["apfs", "ext2/ext3", "ext4"]
-
-[auth_profiles.github-read]
-kind = "https-token"
-secret_ref = "env:GITHUB_READ_TOKEN"
-
-[auth_profiles.github-write]
-kind = "ssh-key"
-secret_ref = "env:GITHUB_WRITE_KEY"

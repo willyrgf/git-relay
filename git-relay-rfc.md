@@ -509,10 +509,9 @@ Per repository, policy may define:
 
 - ordered read upstream URLs,
 - ordered write upstream URLs,
-- distinct auth profiles per upstream URL,
 - and whether an upstream requires atomic multi-ref apply.
 
-The relay may try several configured upstream URLs across retries. Each individual refresh or reconcile attempt still uses one concrete URL and one concrete credential set.
+The relay may try several configured upstream URLs across retries. Each individual refresh or reconcile attempt still uses one concrete URL under the relay process's ambient Git and SSH environment.
 
 ### 10.3 Repository migration: direct flake input rewriting
 
@@ -814,40 +813,35 @@ If HTTP ingress is enabled, the web server or reverse proxy is responsible for a
 
 ### 14.2 Relay to upstream
 
-Default to relay-owned machine credentials for read refreshes and background reconciliation.
+Default to ambient machine credentials for read refreshes and background reconciliation.
 
 Reasons:
 
 - background reconciliation must work after the client disconnects,
-- retries and reconciliation need stable credentials,
+- retries and reconciliation need stable host-managed access,
 - and the relay must not depend on client credential presence after acceptance.
 
-Each upstream URL uses an explicit auth profile. That profile may be:
-
-- an SSH key,
-- an HTTPS token,
-- or another transport-specific machine credential supported by policy.
+Outbound Git runs under the relay process's ambient Git and SSH environment. Operators scope access through host-managed mechanisms such as `ssh-agent`, `~/.ssh/config`, `GIT_SSH_COMMAND`, Git credential helpers, or equivalent system integration. The relay does not select per-upstream credentials in declarative config in the initial implementation.
 
 ### 14.3 Attribution and audit
 
-Even when relay-owned machine credentials are used upstream, the relay must record:
+Even when ambient machine credentials are used upstream, the relay must record:
 
 - authenticated client identity,
 - repository identity,
 - accepted ref changes,
 - convergence targets,
-- upstream credential profile used,
 - and convergence outcomes.
 
 Per-user upstream delegation may be added later, but it is not the MVP default.
 
 ### 14.4 Credential handling
 
-Credentials are runtime secrets, not declarative source inputs.
+Credential material is runtime-only, not a declarative source input.
 
-- secrets must not be stored in the Nix store,
-- secrets must be injected at runtime through host-managed environment files or service-manager secret mechanisms,
-- secrets must be isolated by auth profile and repository scope,
+- credential files or environment files must not be stored in the Nix store,
+- runtime environment files may supply ambient Git or SSH variables, but the relay does not define auth profiles in config,
+- host-managed credential scope must remain outside repository descriptors,
 - and operator access to credential material must be auditable.
 
 ## 15. Nix Migration Model
@@ -976,6 +970,7 @@ The foundational persistent state should cover:
 - auth-profile bindings and exported-ref policy,
 - authoritative local refs in the normal bare-repository namespace,
 - observed upstream refs under `refs/git-relay/upstreams/<upstream>/...`,
+- internal refs under `refs/git-relay/*` as local-only relay control-plane state (hidden from clients and not pushed upstream by default),
 - and any side-repository mapping required for internal tracking refs when same-repository hiding is unsupported.
 
 Filesystem lock paths and in-progress markers are transient coordination artifacts, not correctness-critical persistent state. They may be used to serialize refresh and reconcile work, but correctness must remain recoverable without trusting their contents.
@@ -1135,7 +1130,6 @@ Repository-specific configuration in descriptor files or rule files covers:
 - upstream URLs,
 - authority model,
 - exported ref policy,
-- auth profile bindings,
 - per-upstream atomicity requirements,
 - internal tracking-ref placement when same-repository hiding is unsupported,
 - and lifecycle flags.
@@ -1183,13 +1177,13 @@ migration_transport = "git+ssh"
 exported_refs = ["refs/heads/*", "refs/tags/*"]
 
 read_upstreams = [
-  { name = "github-https", url = "https://github.com/%repo%", auth_profile = "github-read-https" },
-  { name = "github-ssh", url = "ssh://git@github.com/%repo%", auth_profile = "github-read-ssh" },
+  { name = "github-https", url = "https://github.com/%repo%" },
+  { name = "github-ssh", url = "ssh://git@github.com/%repo%" },
 ]
 
 write_upstreams = [
-  { name = "github-primary", url = "ssh://git@github.com/%repo%", auth_profile = "github-write-ssh", require_atomic = true },
-  { name = "backup-mirror", url = "https://git.example.com/%repo%.git", auth_profile = "backup-write-token", require_atomic = false },
+  { name = "github-primary", url = "ssh://git@github.com/%repo%", require_atomic = true },
+  { name = "backup-mirror", url = "https://git.example.com/%repo%.git", require_atomic = false },
 ]
 
 [[rule]]
@@ -1199,8 +1193,8 @@ refresh = "ttl:60s"
 migration_transport = "git+https"
 
 read_upstreams = [
-  { name = "github-https", url = "https://github.com/%repo%", auth_profile = "github-read-https" },
-  { name = "github-ssh", url = "ssh://git@github.com/%repo%", auth_profile = "github-read-ssh" },
+  { name = "github-https", url = "https://github.com/%repo%" },
+  { name = "github-ssh", url = "ssh://git@github.com/%repo%" },
 ]
 ```
 
@@ -1346,7 +1340,7 @@ The supported deployment contract for that first supported release is intentiona
 - authoritative repositories run on macOS or Linux only,
 - authoritative repositories must set `core.fsync=all` and `core.fsyncMethod=fsync`,
 - packaged deployment is Nix-built,
-- runtime secrets stay outside `/nix/store`,
+- runtime environment files stay outside `/nix/store`,
 - and service-manager integration is `launchd` on macOS and `systemd` on Linux.
 
 ## 26. Concrete Implementation Plan
@@ -1355,7 +1349,7 @@ This section turns the verified architecture into the implementation plan to exe
 
 ### 26.1 Planning decisions fixed by this RFC
 
-- Internal tracking refs stay in the same authoritative repository in the initial implementation. Startup and provisioning must enforce the Section 13.2 validator strictly. Internal refs must never be pushed upstream.
+- Internal tracking refs default to `same-repo-hidden` in the initial implementation: keep them in the same authoritative repository, enforce the Section 13.2 validator strictly, hide them from clients, and never push them upstream.
 - Automatic reconciliation is `on_push + manual` only in the initial implementation. Periodic reconciliation is deferred.
 - The migration CLI reports unresolved transitive shorthand usage only. It does not generate or apply automatic `follows` or override rewrites in the initial implementation.
 - Implementation planning must cover the full supported upstream matrix for this product, not a reduced prototype subset. Managed and self-managed upstream classes in scope for the supported matrix must all pass the same capability-probing and conformance harness before release.
@@ -1380,7 +1374,7 @@ No downstream workstream may weaken an earlier contract. If later implementation
 
 Deliver:
 
-- repository descriptor schema with explicit authority model, upstream definitions, exported-ref policy, and auth-profile bindings
+- repository descriptor schema with explicit authority model, upstream definitions, and exported-ref policy
 - authoritative repository validator enforcing Section 13.2 before a repository can enter `ready`
 - validator checks for same-repository hidden refs, SHA-by-id upload-pack restrictions, Git-only command restriction, fsync settings, and supported filesystem/profile constraints
 - deterministic startup classification entrypoint that marks all upstreams `unknown` before fresh observation
@@ -1400,17 +1394,17 @@ Deliver:
 
 - Nix-built package outputs for the relay daemon, hook installer, and SSH forced-command wrapper
 - launchd and systemd integration for the supported macOS and Linux profiles
-- runtime secret injection outside `/nix/store`
+- runtime environment-file wiring outside `/nix/store`
 - service startup profile that runs validator checks before enabling authoritative write acceptance
 
 Gate:
 
 - service-manager bring-up must succeed on supported macOS and Linux profiles
-- startup must fail closed when required runtime secrets or repository contracts are missing
+- startup must fail closed when the required runtime environment file or repository contracts are missing
 
 Parallel ownership boundary:
 
-- Team B owns packaging, launchd/systemd templates, runtime profile validation, and secret injection wiring
+- Team B owns packaging, launchd/systemd templates, runtime profile validation, and environment-file wiring
 
 ### 26.5 Workstream 3: Git Ingress And Authoritative Local Acceptance
 
@@ -1533,7 +1527,7 @@ Parallel ownership boundary:
 - Team C and Team D must share one authoritative ref and state-transition vocabulary from Sections 8, 12, 13, 16, and 19.
 - Team E does not redefine upstream semantics. It proves conformance against the existing reconcile contract.
 - Team G does not widen rewrite grammar or relock scope without new validation and an RFC update.
-- Team B cannot bypass validator or secret-handling requirements for convenience in local deployment tooling.
+- Team B cannot bypass validator or runtime-environment handling requirements for convenience in local deployment tooling.
 
 ### 26.12 Release criteria for the first supported implementation
 
@@ -1544,5 +1538,5 @@ The first supported implementation is ready only when all of the following are t
 - reconcile runs obey the bounded execution-unit contract with deterministic recovery
 - every entry in the supported upstream matrix passes conformance
 - migration rewrite and targeted relock obey the validated matrix contract
-- supported macOS and Linux deployment profiles pass packaging, supervision, and secret-injection checks
+- supported macOS and Linux deployment profiles pass packaging, supervision, and runtime-environment checks
 - exact supported Git and Nix floors are recorded from evidence, not inferred from “current major versions”

@@ -260,18 +260,16 @@ pub enum ResolveAndAuthorizeError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
     use crate::config::{
-        AppConfig, AuthProfile, AuthProfileKind, AuthorityModel, DeploymentProfile,
-        FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
-        MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReadUpstream,
-        ReconcileConfig, ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle,
-        RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
-        TrackingRefPlacement, WorkerMode, WriteUpstream,
+        AppConfig, AuthorityModel, DeploymentProfile, FreshnessPolicy, GitOnlyCommandMode,
+        GitService, ListenConfig, MigrationConfig, MigrationTransport, PathsConfig, PolicyConfig,
+        PushAckPolicy, ReadUpstream, ReconcileConfig, ReconcilePolicy, RepositoryDescriptor,
+        RepositoryLifecycle, RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform,
+        TargetedRelockMode, TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
     use crate::git::SystemGitExecutor;
     use crate::platform::PlatformProbe;
@@ -348,27 +346,10 @@ mod tests {
                 git_only_command_mode: GitOnlyCommandMode::OpensshForceCommand,
                 forced_command_wrapper: PathBuf::from("/usr/local/bin/git-relay-ssh-force-command"),
                 disable_forwarding: true,
-                runtime_secret_env_file: temp.path().join("git-relay.env"),
-                required_secret_keys: vec!["GITHUB_WRITE_KEY".to_owned()],
+                runtime_env_file: temp.path().join("git-relay.env"),
                 allowed_git_services: vec![GitService::GitUploadPack, GitService::GitReceivePack],
                 supported_filesystems: vec!["apfs".to_owned()],
             },
-            auth_profiles: BTreeMap::from([
-                (
-                    "github-read".to_owned(),
-                    AuthProfile {
-                        kind: AuthProfileKind::HttpsToken,
-                        secret_ref: "env:GITHUB_READ_TOKEN".to_owned(),
-                    },
-                ),
-                (
-                    "github-write".to_owned(),
-                    AuthProfile {
-                        kind: AuthProfileKind::SshKey,
-                        secret_ref: "env:GITHUB_WRITE_KEY".to_owned(),
-                    },
-                ),
-            ]),
         }
     }
 
@@ -389,7 +370,6 @@ mod tests {
             write_upstreams: vec![WriteUpstream {
                 name: "github-write".to_owned(),
                 url: "ssh://git@github.com/example/repo.git".to_owned(),
-                auth_profile: "github-write".to_owned(),
                 require_atomic: true,
             }],
         }
@@ -411,7 +391,6 @@ mod tests {
             read_upstreams: vec![ReadUpstream {
                 name: "github-read".to_owned(),
                 url: "https://github.com/example/cache.git".to_owned(),
-                auth_profile: "github-read".to_owned(),
             }],
             write_upstreams: Vec::new(),
         }
@@ -517,7 +496,11 @@ mod tests {
         let config = base_config(&temp);
         let repo = temp.path().join("repos").join("example.git");
         std::fs::create_dir_all(temp.path().join("repos")).expect("repo root");
-        std::fs::write(temp.path().join("git-relay.env"), "GITHUB_WRITE_KEY=beta\n").expect("env");
+        std::fs::write(
+            temp.path().join("git-relay.env"),
+            "SSH_AUTH_SOCK=/tmp/agent.sock\n",
+        )
+        .expect("env");
         init_bare_repo(&repo);
         configure_authoritative_repo(&repo);
 

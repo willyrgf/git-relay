@@ -441,8 +441,7 @@ fn run_hook_dispatch(options: HookDispatchCommand) -> Result<ExitCode, CliError>
         writeln!(
             stdout,
             "{}",
-            serde_json::to_string_pretty(&event)
-                .map_err(io::Error::other)?
+            serde_json::to_string_pretty(&event).map_err(io::Error::other)?
         )?;
         stdout.flush()?;
     }
@@ -704,7 +703,12 @@ fn run_startup_classify(options: TargetOptions) -> Result<ExitCode, CliError> {
                 classification.write_acceptance_allowed = false;
             }
         }
-        if !classification.write_acceptance_allowed {
+        if !report.passed()
+            || matches!(
+                classification.safety,
+                RepositorySafetyState::Divergent | RepositorySafetyState::Quarantined
+            )
+        {
             valid = false;
         }
         classifications.push(classification);
@@ -826,15 +830,13 @@ fn select_repositories(
 fn emit_output<T: serde::Serialize>(payload: &T, json: bool) -> Result<(), CliError> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     if json {
-        serde_json::to_writer_pretty(&mut stdout, payload)
-            .map_err(io::Error::other)?;
+        serde_json::to_writer_pretty(&mut stdout, payload).map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
     } else {
         writeln!(
             stdout,
             "{}",
-            serde_json::to_string_pretty(payload)
-                .map_err(io::Error::other)?
+            serde_json::to_string_pretty(payload).map_err(io::Error::other)?
         )?;
     }
     stdout.flush()?;

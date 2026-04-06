@@ -15,6 +15,9 @@ use crate::classification::{RepositorySafetyState, UpstreamConvergenceState};
 use crate::config::{
     AppConfig, AuthorityModel, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
 };
+use crate::git::SystemGitExecutor;
+use crate::platform::RealPlatformProbe;
+use crate::validator::{ValidationInfrastructureError, Validator};
 
 const INTERNAL_UPSTREAM_REF_PREFIX: &str = "refs/git-relay/upstreams";
 const INTERNAL_DIVERGENCE_REF_PREFIX: &str = "refs/git-relay/safety/divergent";
@@ -127,6 +130,10 @@ pub enum ReconcileError {
     },
     #[error("repository {repo_id} already has a live reconcile run in progress")]
     RunInProgress { repo_id: String },
+    #[error("repository {repo_id} failed validator re-check before reconcile: {details}")]
+    ValidationFailed { repo_id: String, details: String },
+    #[error("validator infrastructure failed during reconcile: {0}")]
+    ValidationInfra(#[from] ValidationInfrastructureError),
     #[error("failed to create directory {path}: {error}", path = path.display())]
     CreateDir {
         path: PathBuf,
@@ -313,6 +320,7 @@ pub fn process_pending_reconcile_requests(
         match reconcile_repository(config, descriptor) {
             Ok(run) => runs.push(run),
             Err(ReconcileError::RunInProgress { .. }) => {}
+            Err(ReconcileError::ValidationFailed { .. }) => {}
             Err(error) => return Err(error),
         }
     }
@@ -335,6 +343,7 @@ pub fn reconcile_repository(
             lifecycle: descriptor.lifecycle,
         });
     }
+    validate_reconcile_target(config, descriptor)?;
 
     let run_id = generate_run_id();
     let pending_request = read_pending_request(&config.paths.state_root, &descriptor.repo_id)?;
@@ -485,11 +494,7 @@ fn reconcile_one_upstream(
                 return Ok(ReconcileUpstreamResult {
                     upstream_id: upstream.name.clone(),
                     require_atomic: true,
-                    state: if probe == AtomicCapabilityVerdict::Unsupported {
-                        UpstreamConvergenceState::Unsupported
-                    } else {
-                        UpstreamConvergenceState::Stalled
-                    },
+                    state: UpstreamConvergenceState::Unsupported,
                     divergent: false,
                     apply_attempted: false,
                     detail: Some(match probe {
@@ -670,6 +675,30 @@ fn supersede_stale_run_if_present(
         let _ = fs::remove_file(marker_path);
     }
     Ok(())
+}
+
+fn validate_reconcile_target(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<(), ReconcileError> {
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+    let validation = validator.validate(config, descriptor)?;
+    if validation.passed() {
+        Ok(())
+    } else {
+        let details = validation
+            .issues
+            .iter()
+            .map(|issue| issue.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(ReconcileError::ValidationFailed {
+            repo_id: descriptor.repo_id.clone(),
+            details,
+        })
+    }
 }
 
 fn persist_run_record(config: &AppConfig, run: &ReconcileRunRecord) -> Result<(), ReconcileError> {
@@ -1408,7 +1437,6 @@ fn pid_is_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -1417,13 +1445,13 @@ mod tests {
 
     use crate::classification::RepositorySafetyState;
     use crate::config::{
-        AppConfig, AuthProfile, AuthProfileKind, AuthorityModel, DeploymentProfile,
-        FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
-        MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReconcileConfig,
-        ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
-        RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
+        AppConfig, AuthorityModel, DeploymentProfile, FreshnessPolicy, GitOnlyCommandMode,
+        GitService, ListenConfig, MigrationConfig, MigrationTransport, PathsConfig, PolicyConfig,
+        PushAckPolicy, ReconcileConfig, ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle,
+        RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
         TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
+    use crate::platform::{PlatformProbe, RealPlatformProbe};
 
     use super::{
         enqueue_reconcile_request, observed_ref_prefix, read_observed_refs, reconcile_lock_path,
@@ -1539,6 +1567,20 @@ mod tests {
     }
 
     fn app_config(temp: &TempDir) -> AppConfig {
+        let platform = match std::env::consts::OS {
+            "macos" => SupportedPlatform::Macos,
+            "linux" => SupportedPlatform::Linux,
+            other => panic!("unsupported host {other}"),
+        };
+        let service_manager = match std::env::consts::OS {
+            "macos" => ServiceManager::Launchd,
+            "linux" => ServiceManager::Systemd,
+            other => panic!("unsupported host {other}"),
+        };
+        let filesystem = RealPlatformProbe
+            .filesystem_type(temp.path())
+            .expect("filesystem type");
+
         AppConfig {
             listen: ListenConfig {
                 ssh: "127.0.0.1:4222".to_owned(),
@@ -1571,24 +1613,16 @@ mod tests {
                 targeted_relock_mode: TargetedRelockMode::ValidatedOnly,
             },
             deployment: DeploymentProfile {
-                platform: SupportedPlatform::Macos,
-                service_manager: ServiceManager::Launchd,
+                platform,
+                service_manager,
                 service_label: "dev.git-relay".to_owned(),
                 git_only_command_mode: GitOnlyCommandMode::OpensshForceCommand,
                 forced_command_wrapper: "/usr/local/bin/git-relay-ssh-force-command".into(),
                 disable_forwarding: true,
-                runtime_secret_env_file: temp.path().join("runtime.env"),
-                required_secret_keys: vec!["TOKEN".to_owned()],
+                runtime_env_file: temp.path().join("runtime.env"),
                 allowed_git_services: vec![GitService::GitUploadPack, GitService::GitReceivePack],
-                supported_filesystems: vec!["apfs".to_owned()],
+                supported_filesystems: vec![filesystem],
             },
-            auth_profiles: BTreeMap::from([(
-                "github-write".to_owned(),
-                AuthProfile {
-                    kind: AuthProfileKind::SshKey,
-                    secret_ref: "env:TOKEN".to_owned(),
-                },
-            )]),
         }
     }
 
@@ -1646,7 +1680,6 @@ mod tests {
                 WriteUpstream {
                     name: "alpha".to_owned(),
                     url: upstream_ok.to_str().expect("path").to_owned(),
-                    auth_profile: "github-write".to_owned(),
                     require_atomic: false,
                 },
                 WriteUpstream {
@@ -1657,7 +1690,6 @@ mod tests {
                         .to_str()
                         .expect("path")
                         .to_owned(),
-                    auth_profile: "github-write".to_owned(),
                     require_atomic: false,
                 },
             ],
@@ -1713,7 +1745,6 @@ mod tests {
             vec![WriteUpstream {
                 name: "alpha".to_owned(),
                 url: upstream.to_str().expect("path").to_owned(),
-                auth_profile: "github-write".to_owned(),
                 require_atomic: false,
             }],
         );
@@ -1792,7 +1823,6 @@ mod tests {
             vec![WriteUpstream {
                 name: "alpha".to_owned(),
                 url: upstream.to_str().expect("path").to_owned(),
-                auth_profile: "github-write".to_owned(),
                 require_atomic: false,
             }],
         );
@@ -1850,6 +1880,53 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_treats_inconclusive_atomic_probe_as_unsupported() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = app_config(&temp);
+        fs::create_dir_all(&config.paths.repo_root).expect("repo root");
+        let authoritative = config.paths.repo_root.join("repo.git");
+        init_bare_repo(&authoritative);
+        configure_authoritative_repo(&authoritative);
+
+        let work = temp.path().join("authoritative-work");
+        init_work_repo(&work);
+        commit_file(&work, "README.md", "authoritative\n", "initial");
+        push_branch(&work, &authoritative, "main");
+
+        let upstream = temp.path().join("checked-out-upstream");
+        init_work_repo(&upstream);
+        commit_file(&upstream, "README.md", "upstream\n", "initial");
+
+        let descriptor = descriptor(
+            &authoritative,
+            vec![WriteUpstream {
+                name: "alpha".to_owned(),
+                url: upstream.to_str().expect("path").to_owned(),
+                require_atomic: true,
+            }],
+        );
+
+        let run = reconcile_repository(&config, &descriptor).expect("reconcile");
+        let result = run.upstream_results.first().expect("upstream result");
+
+        assert_eq!(result.upstream_id, "alpha");
+        assert_eq!(result.state, UpstreamConvergenceState::Unsupported);
+        assert_eq!(
+            result.atomic_capability,
+            Some(super::AtomicCapabilityVerdict::Inconclusive)
+        );
+        assert!(!result.apply_attempted);
+        assert!(
+            result
+                .detail
+                .as_deref()
+                .expect("detail")
+                .contains("treated as unsupported"),
+            "inconclusive probes should fail closed"
+        );
+    }
+
+    #[test]
     fn enqueue_reconcile_request_coalesces_by_repo_path() {
         let temp = TempDir::new().expect("tempdir");
         let config = app_config(&temp);
@@ -1858,7 +1935,6 @@ mod tests {
             vec![WriteUpstream {
                 name: "alpha".to_owned(),
                 url: "/tmp/upstream.git".to_owned(),
-                auth_profile: "github-write".to_owned(),
                 require_atomic: false,
             }],
         );

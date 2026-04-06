@@ -583,7 +583,6 @@ fn probe_matrix_target(
     let write_upstream = WriteUpstream {
         name: target.target_id.clone(),
         url: target.url.clone(),
-        auth_profile: target.credential_source.clone(),
         require_atomic: target.require_atomic,
     };
     let probe_refs = disposable_probe_refs(run_id, &target.target_id);
@@ -643,10 +642,12 @@ fn probe_matrix_target(
         ));
     }
 
-    let same_repo_hidden_refs_supported =
-        !target.same_repo_hidden_refs || target.class == MatrixTargetClass::SelfManaged;
-    if target.same_repo_hidden_refs && !same_repo_hidden_refs_supported {
-        admission_reasons.push("same-repo hidden refs require a self-managed target".to_owned());
+    let same_repo_hidden_refs_supported = !target.same_repo_hidden_refs;
+    if target.same_repo_hidden_refs {
+        admission_reasons.push(
+            "same-repo hidden refs are not admitted until matrix probing adds an explicit hidden-ref leakage check"
+                .to_owned(),
+        );
     }
 
     let supported_for_policy = admission_reasons.is_empty();
