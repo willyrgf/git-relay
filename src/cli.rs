@@ -435,14 +435,14 @@ fn run_hook_dispatch(options: HookDispatchCommand) -> Result<ExitCode, CliError>
         &git,
         &platform,
     )
-    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    .map_err(io::Error::other)?;
     if options.json {
         let mut stdout = io::BufWriter::new(io::stdout().lock());
         writeln!(
             stdout,
             "{}",
             serde_json::to_string_pretty(&event)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+                .map_err(io::Error::other)?
         )?;
         stdout.flush()?;
     }
@@ -827,14 +827,14 @@ fn emit_output<T: serde::Serialize>(payload: &T, json: bool) -> Result<(), CliEr
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     if json {
         serde_json::to_writer_pretty(&mut stdout, payload)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+            .map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
     } else {
         writeln!(
             stdout,
             "{}",
             serde_json::to_string_pretty(payload)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+                .map_err(io::Error::other)?
         )?;
     }
     stdout.flush()?;

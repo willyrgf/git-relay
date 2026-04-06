@@ -356,17 +356,14 @@ fn evaluate_reference_transaction(args: &[String]) -> HookEvaluation {
 }
 
 fn evaluate_post_receive(context: &HookContext) -> HookEvaluation {
-    let reconcile_requested = match (&context.config, &context.descriptor) {
+    let reconcile_requested = matches!(
+        (&context.config, &context.descriptor),
         (Some(config), Some(descriptor))
             if config.reconcile.on_push
                 && descriptor.mode == RepositoryMode::Authoritative
                 && descriptor.lifecycle == RepositoryLifecycle::Ready
-                && !descriptor.write_upstreams.is_empty() =>
-        {
-            true
-        }
-        _ => false,
-    };
+                && !descriptor.write_upstreams.is_empty()
+    );
 
     HookEvaluation {
         status: HookStatus::Accepted,

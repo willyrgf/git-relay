@@ -120,7 +120,7 @@ pub fn build_release_conformance_report(
 
     let selected = descriptors
         .iter()
-        .filter(|descriptor| target_repo.map_or(true, |repo_id| descriptor.repo_id == repo_id))
+        .filter(|descriptor| target_repo.is_none_or(|repo_id| descriptor.repo_id == repo_id))
         .collect::<Vec<_>>();
     let repo_manifests = selected
         .into_iter()

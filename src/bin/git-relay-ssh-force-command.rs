@@ -147,7 +147,7 @@ fn prepare_read_path(
 #[cfg(unix)]
 fn exit_code_from_status(status: ExitStatus) -> ExitCode {
     match status.code() {
-        Some(code) if code == 0 => ExitCode::SUCCESS,
+        Some(0) => ExitCode::SUCCESS,
         Some(code) => ExitCode::from(code as u8),
         None => ExitCode::from(1),
     }

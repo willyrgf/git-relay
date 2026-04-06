@@ -63,9 +63,9 @@ pub fn classify_startup(
 
     let safety = if descriptor.mode == RepositoryMode::Authoritative && !validation.passed() {
         RepositorySafetyState::Quarantined
-    } else if descriptor.lifecycle == RepositoryLifecycle::Provisioning {
-        RepositorySafetyState::Degraded
-    } else if descriptor.mode == RepositoryMode::Authoritative && !upstreams.is_empty() {
+    } else if descriptor.lifecycle == RepositoryLifecycle::Provisioning
+        || (descriptor.mode == RepositoryMode::Authoritative && !upstreams.is_empty())
+    {
         RepositorySafetyState::Degraded
     } else {
         RepositorySafetyState::Healthy

@@ -584,11 +584,11 @@ fn git_approxidate(duration: HumanDuration) -> String {
     if seconds == 0 {
         return "now".to_owned();
     }
-    if seconds % (24 * 60 * 60) == 0 {
+    if seconds.is_multiple_of(24 * 60 * 60) {
         format!("{}.days.ago", seconds / (24 * 60 * 60))
-    } else if seconds % (60 * 60) == 0 {
+    } else if seconds.is_multiple_of(60 * 60) {
         format!("{}.hours.ago", seconds / (60 * 60))
-    } else if seconds % 60 == 0 {
+    } else if seconds.is_multiple_of(60) {
         format!("{}.minutes.ago", seconds / 60)
     } else {
         format!("{seconds}.seconds.ago")

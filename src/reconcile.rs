@@ -544,8 +544,6 @@ fn reconcile_one_upstream(
         require_atomic: upstream.require_atomic,
         state: if same_snapshot(&observed_after, desired_snapshot) {
             UpstreamConvergenceState::InSync
-        } else if detail.is_some() {
-            UpstreamConvergenceState::OutOfSync
         } else {
             UpstreamConvergenceState::OutOfSync
         },

@@ -444,8 +444,8 @@ impl Display for HumanDuration {
         let seconds = self.0.as_secs();
         match seconds {
             0 => f.write_str("0s"),
-            _ if seconds % 3600 == 0 => write!(f, "{}h", seconds / 3600),
-            _ if seconds % 60 == 0 => write!(f, "{}m", seconds / 60),
+            _ if seconds.is_multiple_of(3600) => write!(f, "{}h", seconds / 3600),
+            _ if seconds.is_multiple_of(60) => write!(f, "{}m", seconds / 60),
             _ => write!(f, "{seconds}s"),
         }
     }
