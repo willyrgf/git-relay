@@ -10,6 +10,7 @@ pub mod migration;
 pub mod platform;
 pub mod read_path;
 pub mod reconcile;
+pub mod release;
 pub mod ssh_wrapper;
 pub mod upstream;
 pub mod validator;

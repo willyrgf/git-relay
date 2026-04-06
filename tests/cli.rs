@@ -2897,3 +2897,136 @@ fn repo_repair_breaks_stale_execution_artifacts_and_rederives_state() {
         "repair should remove the stale in-progress marker"
     );
 }
+
+#[test]
+fn release_report_records_host_evidence_and_manifest_admission_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_supported = temp.path().join("release-report-supported.git");
+    init_bare_repo(&upstream_supported);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_supported.to_str().expect("path"), true)],
+    );
+
+    let work_repo = temp.path().join("work-release-report");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let manifest_path = write_matrix_targets_fixture(
+        &temp,
+        "release-report-targets.json",
+        &[(
+            "supported-alpha",
+            "local-git",
+            "self-managed",
+            "ssh",
+            upstream_supported.to_str().expect("path"),
+            true,
+            true,
+        )],
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "build-release-manifest",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--targets",
+            manifest_path.to_str().expect("manifest"),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let unused_lock = temp.path().join("release-report-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-report",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("release report json");
+    assert!(report["current_host"]["observed_git_version"]
+        .as_str()
+        .expect("git version")
+        .contains("git version"));
+    assert!(!report["current_host"]["observed_nix_version"]
+        .as_str()
+        .expect("nix version")
+        .is_empty());
+    assert_eq!(report["repo_manifests"][0]["repo_id"], repo_id);
+    assert_eq!(report["repo_manifests"][0]["manifest_present"], true);
+    assert_eq!(report["repo_manifests"][0]["all_entries_admitted"], true);
+    assert_eq!(
+        report["exact_nix_floor"],
+        "nix (Determinate Nix 3.0.0) 2.26.3"
+    );
+    assert_eq!(report["exact_nix_floor_status"], "open");
+    assert_eq!(report["exact_git_floor_status"], "open");
+    assert!(report["blocking_reasons"]
+        .as_array()
+        .expect("blocking reasons")
+        .iter()
+        .any(|item| item
+            .as_str()
+            .map(|value| value.contains("Git floor evidence remains open"))
+            .unwrap_or(false)));
+
+    let host_evidence_path =
+        temp.path()
+            .join("release")
+            .join("hosts")
+            .join(match std::env::consts::OS {
+                "macos" => "macos.json",
+                "linux" => "linux.json",
+                other => panic!("unsupported host {other}"),
+            });
+    assert!(
+        host_evidence_path.exists(),
+        "release report should persist current host evidence"
+    );
+}

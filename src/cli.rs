@@ -23,6 +23,7 @@ use crate::reconcile::{
     load_divergence_markers, reconcile_repository, repair_repository, replication_status_for_repo,
     DivergenceMarker, ReconcileError, ReplicationStatus, RepoRepairReport,
 };
+use crate::release::{build_release_conformance_report, ReleaseError};
 use crate::upstream::{
     build_release_manifest, probe_matrix_targets, probe_repository_upstreams, UpstreamProbeError,
 };
@@ -45,6 +46,7 @@ enum TopLevelCommand {
     Migration(MigrationCommand),
     MigrateFlakeInputs(MigrationApplyOptions),
     Read(ReadCommand),
+    Release(ReleaseCommand),
     Replication(ReplicationCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
@@ -54,6 +56,12 @@ enum TopLevelCommand {
 struct DeployCommand {
     #[command(subcommand)]
     command: DeploySubcommand,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseCommand {
+    #[command(subcommand)]
+    command: ReleaseSubcommand,
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +79,11 @@ enum DeploySubcommand {
 #[derive(Debug, Subcommand)]
 enum MigrationSubcommand {
     Inspect(MigrationInspectOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseSubcommand {
+    Report(TargetOptions),
 }
 
 #[derive(Debug, Args)]
@@ -215,6 +228,8 @@ pub enum CliError {
     ReadPath(#[from] ReadPathError),
     #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
+    #[error(transparent)]
+    Release(#[from] ReleaseError),
     #[error("repository {0} was not found in the descriptor set")]
     RepositoryNotFound(String),
     #[error("failed to write command output: {0}")]
@@ -261,6 +276,9 @@ where
         TopLevelCommand::MigrateFlakeInputs(options) => run_migrate_flake_inputs(options),
         TopLevelCommand::Read(command) => match command.command {
             ReadSubcommand::Prepare(options) => run_read_prepare(options),
+        },
+        TopLevelCommand::Release(command) => match command.command {
+            ReleaseSubcommand::Report(options) => run_release_report(options),
         },
         TopLevelCommand::Replication(command) => match command.command {
             ReplicationSubcommand::BuildReleaseManifest(options) => {
@@ -384,6 +402,23 @@ fn run_replication_reconcile(options: TargetOptions) -> Result<ExitCode, CliErro
         }),
     );
     emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_release_report(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let report = build_release_conformance_report(&config, &descriptors, options.repo.as_deref())?;
+    record_cli_command_event(
+        &config,
+        "release.report",
+        options.repo.as_deref(),
+        serde_json::json!({
+            "repo_manifest_count": report.repo_manifests.len(),
+            "exact_git_floor_status": report.exact_git_floor_status,
+            "exact_nix_floor_status": report.exact_nix_floor_status,
+        }),
+    );
+    emit_output(&report, options.json)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -16,6 +16,10 @@ const SUPPORTED_NIX_VERSIONS: &[&str] = &[
     "nix (Nix) 2.31.3",
 ];
 
+pub fn validated_targeted_relock_nix_versions() -> &'static [&'static str] {
+    SUPPORTED_NIX_VERSIONS
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MigrationRepoClass {
