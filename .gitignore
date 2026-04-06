@@ -1,1 +1,12 @@
 /target
+/result
+/result-*
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.kdbx
