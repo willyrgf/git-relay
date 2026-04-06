@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use git_relay::audit::structured_log_file_path;
 use git_relay::hooks::push_trace_file_path;
 use git_relay::platform::{PlatformProbe, RealPlatformProbe};
 use git_relay::reconcile::pending_request_file_path;
@@ -774,6 +775,33 @@ fn read_push_trace(state_root: &Path, repo_id: &str, push_id: &str) -> Vec<Value
         .lines()
         .map(|line| serde_json::from_str(line).expect("trace json"))
         .collect()
+}
+
+fn read_structured_logs(state_root: &Path) -> Vec<Value> {
+    let path = structured_log_file_path(state_root);
+    let source = fs::read_to_string(path).expect("structured logs");
+    source
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("structured log json"))
+        .collect()
+}
+
+fn sanitize_repo_state_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 fn read_git_ref(repo_path: &Path, ref_name: &str) -> String {
@@ -2687,5 +2715,185 @@ fn migrate_flake_inputs_fails_outside_the_validated_nix_version_matrix() {
     assert_eq!(
         fs::read_to_string(project.join("flake.lock")).expect("flake.lock"),
         migration_lock_source()
+    );
+}
+
+#[test]
+fn structured_logs_capture_hook_reconcile_and_operator_fields() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream = temp.path().join("structured-upstream.git");
+    init_bare_repo(&upstream);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream.to_str().expect("path"), false)],
+    );
+
+    let dispatcher = cargo_bin_path("git-relay");
+    Command::cargo_bin("git-relay-install-hooks")
+        .expect("cargo bin")
+        .args([
+            "--repo",
+            repo_path.to_str().expect("repo"),
+            "--dispatcher",
+            dispatcher.to_str().expect("dispatcher"),
+            "--config",
+            config_path.to_str().expect("config"),
+        ])
+        .assert()
+        .success();
+
+    let work_repo = temp.path().join("work-structured-logs");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .env("GIT_RELAY_REQUEST_ID", "request-structured")
+        .env("GIT_RELAY_PUSH_ID", "push-structured")
+        .env("GIT_RELAY_CLIENT_IDENTITY", "push-user@example.test")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("push success");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_CLIENT_IDENTITY", "operator@example.test")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let logs = read_structured_logs(temp.path());
+    assert!(logs.iter().any(|event| {
+        event["event_type"] == "hook.dispatch"
+            && event["request_id"] == "request-structured"
+            && event["push_id"] == "push-structured"
+            && event["repo_id"] == repo_id
+            && event["client_identity"] == "push-user@example.test"
+    }));
+    assert!(logs.iter().any(|event| {
+        event["event_type"] == "reconcile.upstream"
+            && event["repo_id"] == repo_id
+            && event["push_id"] == "push-structured"
+            && event["request_id"] == "request-structured"
+            && event["upstream_id"] == "alpha"
+            && event["reconcile_run_id"].as_str().is_some()
+            && event["attempt_id"].as_str().is_some()
+    }));
+    assert!(logs.iter().any(|event| {
+        event["event_type"] == "cli.command"
+            && event["client_identity"] == "operator@example.test"
+            && event["payload"]["command"] == "replication.reconcile"
+    }));
+}
+
+#[test]
+fn repo_repair_breaks_stale_execution_artifacts_and_rederives_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream = temp.path().join("repair-upstream.git");
+    init_bare_repo(&upstream);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream.to_str().expect("path"), false)],
+    );
+
+    let repo_component = sanitize_repo_state_component(repo_id);
+    let lock_dir = temp
+        .path()
+        .join("reconcile")
+        .join("locks")
+        .join(format!("{repo_component}.lock"));
+    fs::create_dir_all(&lock_dir).expect("lock dir");
+    fs::write(
+        lock_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": repo_id,
+            "run_id": "stale-run",
+            "pid": 999_999u32,
+            "acquired_at_ms": 0u128,
+        }))
+        .expect("lock metadata"),
+    )
+    .expect("write lock metadata");
+
+    let in_progress_path = temp
+        .path()
+        .join("reconcile")
+        .join("in-progress")
+        .join(format!("{repo_component}.json"));
+    fs::create_dir_all(
+        in_progress_path
+            .parent()
+            .expect("in-progress parent directory"),
+    )
+    .expect("in-progress dir");
+    fs::write(
+        &in_progress_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": repo_id,
+            "run_id": "stale-run",
+            "pid": 999_999u32,
+            "started_at_ms": 0u128,
+        }))
+        .expect("in-progress marker"),
+    )
+    .expect("write in-progress marker");
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "repair",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report = parse_single_report(&output);
+    assert_eq!(report["repair"]["repo_id"], repo_id);
+    assert_eq!(report["repair"]["stale_lock_broken"], true);
+    assert_eq!(report["repair"]["stale_in_progress_marker_cleared"], true);
+    assert_eq!(report["repair"]["reconcile_run"]["repo_safety"], "healthy");
+    assert!(
+        !lock_dir.exists(),
+        "repair should remove the stale reconcile lock"
+    );
+    assert!(
+        !in_progress_path.exists(),
+        "repair should remove the stale in-progress marker"
     );
 }

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use serde_json::json;
 use thiserror::Error;
 
+use crate::audit::{new_structured_log_event, record_structured_log};
 use crate::config::{
     AppConfig, ConfigError, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
 };
@@ -199,6 +201,9 @@ where
         reconcile_requested: evaluation.reconcile_requested,
     };
     record_hook_event(&event, context.config.as_ref());
+    if let Some(config) = context.config.as_ref() {
+        record_structured_hook_event(config, &event);
+    }
     maybe_hit_hook_checkpoint(&event);
     if event.reconcile_requested {
         if let (Some(config), Some(descriptor)) =
@@ -213,6 +218,22 @@ where
         }
     }
     Ok(event)
+}
+
+fn record_structured_hook_event(config: &AppConfig, event: &HookDispatchEvent) {
+    let mut structured = new_structured_log_event("hook.dispatch");
+    structured.request_id = event.request_id.clone();
+    structured.repo_id = Some(event.repo_id.clone());
+    structured.push_id = Some(event.push_id.clone());
+    structured.payload = json!({
+        "hook": event.hook,
+        "phase": event.phase,
+        "status": event.status,
+        "message": event.message,
+        "reconcile_requested": event.reconcile_requested,
+        "update_count": event.updates.len(),
+    });
+    let _ = record_structured_log(&config.paths.state_root, &structured);
 }
 
 #[derive(Debug)]

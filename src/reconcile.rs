@@ -7,8 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use thiserror::Error;
 
+use crate::audit::{new_structured_log_event, record_structured_log};
 use crate::classification::{RepositorySafetyState, UpstreamConvergenceState};
 use crate::config::{
     AppConfig, AuthorityModel, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
@@ -143,6 +145,12 @@ pub enum ReconcileError {
         #[source]
         error: std::io::Error,
     },
+    #[error("failed to remove {path}: {error}", path = path.display())]
+    Remove {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
     #[error("failed to write git input for args {args:?}: {error}")]
     WriteGitInput {
         args: Vec<String>,
@@ -198,6 +206,16 @@ pub struct ReplicationStatus {
     pub latest_run: Option<ReconcileRunRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoRepairReport {
+    pub repo_id: String,
+    pub stale_lock_broken: bool,
+    pub stale_in_progress_marker_cleared: bool,
+    pub pending_request_present: bool,
+    pub reconcile_run: ReconcileRunRecord,
+    pub divergence_markers_after: Vec<DivergenceMarker>,
+}
+
 pub fn load_pending_reconcile_requests(
     state_root: &Path,
 ) -> Result<Vec<PendingReconcileRequest>, ReconcileError> {
@@ -246,6 +264,28 @@ pub fn load_divergence_markers(repo_path: &Path) -> Result<Vec<DivergenceMarker>
         .collect::<Result<Vec<_>, _>>()?;
     markers.sort_by(|left, right| left.upstream_id.cmp(&right.upstream_id));
     Ok(markers)
+}
+
+pub fn repair_repository(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<RepoRepairReport, ReconcileError> {
+    let stale_lock_broken = break_stale_reconcile_lock_if_present(config, &descriptor.repo_id)?;
+    let stale_in_progress_marker_cleared =
+        clear_stale_in_progress_marker_if_present(config, &descriptor.repo_id)?;
+    let pending_request_present =
+        read_pending_request(&config.paths.state_root, &descriptor.repo_id)?.is_some();
+    let reconcile_run = reconcile_repository(config, descriptor)?;
+    let divergence_markers_after = load_divergence_markers(&descriptor.repo_path)?;
+
+    Ok(RepoRepairReport {
+        repo_id: descriptor.repo_id.clone(),
+        stale_lock_broken,
+        stale_in_progress_marker_cleared,
+        pending_request_present,
+        reconcile_run,
+        divergence_markers_after,
+    })
 }
 
 pub fn process_pending_reconcile_requests(
@@ -297,6 +337,7 @@ pub fn reconcile_repository(
     }
 
     let run_id = generate_run_id();
+    let pending_request = read_pending_request(&config.paths.state_root, &descriptor.repo_id)?;
     let _lock = acquire_reconcile_lock(config, descriptor, &run_id)?;
     let started_at_ms = current_time_ms();
     let desired_snapshot =
@@ -336,10 +377,28 @@ pub fn reconcile_repository(
         upstream_results: Vec::new(),
     };
     persist_run_record(config, &run)?;
+    record_reconcile_run_event(
+        config,
+        &run,
+        pending_request.as_ref(),
+        "reconcile.started",
+        None,
+    );
 
     for upstream in &upstreams {
         let result = reconcile_one_upstream(descriptor, upstream, &desired_snapshot);
         run.upstream_results.push(result?);
+        let current_result = run
+            .upstream_results
+            .last()
+            .expect("reconcile upstream result just pushed");
+        record_reconcile_run_event(
+            config,
+            &run,
+            pending_request.as_ref(),
+            "reconcile.upstream",
+            Some(current_result),
+        );
         persist_run_record(config, &run)?;
     }
 
@@ -353,6 +412,13 @@ pub fn reconcile_repository(
     run.status = ReconcileRunStatus::Completed;
     run.completed_at_ms = Some(current_time_ms());
     persist_run_record(config, &run)?;
+    record_reconcile_run_event(
+        config,
+        &run,
+        pending_request.as_ref(),
+        "reconcile.completed",
+        None,
+    );
     clear_in_progress_marker(config, &descriptor.repo_id);
     clear_pending_request(config, &descriptor.repo_id);
 
@@ -492,6 +558,39 @@ fn reconcile_one_upstream(
     })
 }
 
+fn record_reconcile_run_event(
+    config: &AppConfig,
+    run: &ReconcileRunRecord,
+    pending_request: Option<&PendingReconcileRequest>,
+    event_type: &str,
+    result: Option<&ReconcileUpstreamResult>,
+) {
+    let mut event = new_structured_log_event(event_type);
+    event.request_id = pending_request.and_then(|value| value.last_request_id.clone());
+    event.repo_id = Some(run.repo_id.clone());
+    event.push_id = pending_request.and_then(|value| value.last_push_id.clone());
+    event.reconcile_run_id = Some(run.run_id.clone());
+    if let Some(result) = result {
+        event.upstream_id = Some(result.upstream_id.clone());
+        event.attempt_id = Some(format!("{}:{}:apply", run.run_id, result.upstream_id));
+        event.payload = json!({
+            "state": result.state,
+            "divergent": result.divergent,
+            "apply_attempted": result.apply_attempted,
+            "detail": result.detail,
+            "atomic_capability": result.atomic_capability,
+        });
+    } else {
+        event.payload = json!({
+            "status": run.status,
+            "repo_safety": run.repo_safety,
+            "captured_upstreams": run.captured_upstreams,
+            "desired_ref_count": run.desired_snapshot.len(),
+        });
+    }
+    let _ = record_structured_log(&config.paths.state_root, &event);
+}
+
 fn acquire_reconcile_lock(
     config: &AppConfig,
     descriptor: &RepositoryDescriptor,
@@ -586,6 +685,48 @@ fn clear_in_progress_marker(config: &AppConfig, repo_id: &str) {
 
 fn clear_pending_request(config: &AppConfig, repo_id: &str) {
     let _ = fs::remove_file(pending_request_path(&config.paths.state_root, repo_id));
+}
+
+fn break_stale_reconcile_lock_if_present(
+    config: &AppConfig,
+    repo_id: &str,
+) -> Result<bool, ReconcileError> {
+    let lock_path = reconcile_lock_path(&config.paths.state_root, repo_id);
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    if !lock_is_stale(config, &lock_path)? {
+        return Ok(false);
+    }
+    fs::remove_dir_all(&lock_path).map_err(|error| ReconcileError::Remove {
+        path: lock_path.clone(),
+        error,
+    })?;
+    Ok(true)
+}
+
+fn clear_stale_in_progress_marker_if_present(
+    config: &AppConfig,
+    repo_id: &str,
+) -> Result<bool, ReconcileError> {
+    let marker_path = in_progress_marker_path(&config.paths.state_root, repo_id);
+    let Some(marker) = read_json_optional::<InProgressMarker>(&marker_path)? else {
+        return Ok(false);
+    };
+    if pid_is_alive(marker.pid) {
+        return Ok(false);
+    }
+
+    let lock_path = reconcile_lock_path(&config.paths.state_root, repo_id);
+    if lock_path.exists() && !lock_is_stale(config, &lock_path)? {
+        return Ok(false);
+    }
+
+    fs::remove_file(&marker_path).map_err(|error| ReconcileError::Remove {
+        path: marker_path.clone(),
+        error,
+    })?;
+    Ok(true)
 }
 
 fn read_pending_request(

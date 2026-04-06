@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::audit::{new_structured_log_event, record_structured_log};
 use crate::classification::{classify_startup, RepositorySafetyState, StartupClassification};
 use crate::config::{AppConfig, ConfigError, RepositoryDescriptor};
 use crate::deploy::{
@@ -19,8 +20,8 @@ use crate::migration::{
 use crate::platform::RealPlatformProbe;
 use crate::read_path::{operator_prepare_repository_for_read, ReadPathError};
 use crate::reconcile::{
-    load_divergence_markers, reconcile_repository, replication_status_for_repo, DivergenceMarker,
-    ReconcileError, ReplicationStatus,
+    load_divergence_markers, reconcile_repository, repair_repository, replication_status_for_repo,
+    DivergenceMarker, ReconcileError, ReplicationStatus, RepoRepairReport,
 };
 use crate::upstream::{
     build_release_manifest, probe_matrix_targets, probe_repository_upstreams, UpstreamProbeError,
@@ -107,6 +108,7 @@ enum ReadSubcommand {
 #[derive(Debug, Subcommand)]
 enum RepoSubcommand {
     Inspect(TargetOptions),
+    Repair(TargetOptions),
     Validate(TargetOptions),
 }
 
@@ -229,6 +231,12 @@ struct RepoInspectionReport {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+struct RepoRepairEnvelope {
+    descriptor: RepositoryDescriptor,
+    repair: RepoRepairReport,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 struct DoctorReport {
     runtime_validation: RuntimeValidationReport,
     repositories: Vec<RepoInspectionReport>,
@@ -267,6 +275,7 @@ where
         },
         TopLevelCommand::Repo(command) => match command.command {
             RepoSubcommand::Inspect(options) => run_repo_inspect(options),
+            RepoSubcommand::Repair(options) => run_repo_repair(options),
             RepoSubcommand::Validate(options) => run_repo_validate(options),
         },
         TopLevelCommand::Startup(command) => match command.command {
@@ -279,6 +288,16 @@ fn run_migration_inspect(options: MigrationInspectOptions) -> Result<ExitCode, C
     let config = AppConfig::load(&options.policy.config)?;
     let request = build_migration_request(&options.policy, false)?;
     let report = inspect_migration(&config, &request)?;
+    record_cli_command_event(
+        &config,
+        "migration.inspect",
+        None,
+        serde_json::json!({
+            "flake": request.flake_path,
+            "planned_rewrite_count": report.planned_rewrites.len(),
+            "unresolved_transitive_shorthand_count": report.unresolved_transitive_shorthand.len(),
+        }),
+    );
     emit_output(&report, options.policy.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -287,6 +306,16 @@ fn run_migrate_flake_inputs(options: MigrationApplyOptions) -> Result<ExitCode, 
     let config = AppConfig::load(&options.policy.config)?;
     let request = build_migration_request(&options.policy, options.allow_dirty)?;
     let report = migrate_flake_inputs(&config, &request)?;
+    record_cli_command_event(
+        &config,
+        "migrate-flake-inputs",
+        None,
+        serde_json::json!({
+            "flake": request.flake_path,
+            "relocked_inputs": report.relocked_inputs.clone(),
+            "planned_rewrite_count": report.planned_rewrites.len(),
+        }),
+    );
     emit_output(&report, options.policy.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -346,6 +375,14 @@ fn run_replication_reconcile(options: TargetOptions) -> Result<ExitCode, CliErro
         .iter()
         .map(|descriptor| reconcile_repository(&config, descriptor))
         .collect::<Result<Vec<_>, _>>()?;
+    record_cli_command_event(
+        &config,
+        "replication.reconcile",
+        options.repo.as_deref(),
+        serde_json::json!({
+            "run_count": reports.len(),
+        }),
+    );
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -404,6 +441,7 @@ fn run_replication_status(options: TargetOptions) -> Result<ExitCode, CliError> 
 fn run_doctor(options: TargetOptions) -> Result<ExitCode, CliError> {
     let (config, descriptors) = load_config_and_descriptors(&options.config)?;
     let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let target_count = targets.len();
     let git = SystemGitExecutor;
     let platform = RealPlatformProbe;
     let validator = Validator::new(&git, &platform);
@@ -424,6 +462,14 @@ fn run_doctor(options: TargetOptions) -> Result<ExitCode, CliError> {
         },
         options.json,
     )?;
+    record_cli_command_event(
+        &config,
+        "doctor",
+        options.repo.as_deref(),
+        serde_json::json!({
+            "repository_count": target_count,
+        }),
+    );
     if passed {
         Ok(ExitCode::SUCCESS)
     } else {
@@ -449,6 +495,36 @@ fn run_repo_inspect(options: TargetOptions) -> Result<ExitCode, CliError> {
     let platform = RealPlatformProbe;
     let validator = Validator::new(&git, &platform);
     let reports = build_repo_inspections(&config, targets, &validator)?;
+    record_cli_command_event(
+        &config,
+        "repo.inspect",
+        options.repo.as_deref(),
+        serde_json::json!({
+            "repository_count": reports.len(),
+        }),
+    );
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_repo_repair(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let reports = targets
+        .into_iter()
+        .map(|descriptor| {
+            let repair = repair_repository(&config, &descriptor)?;
+            Ok(RepoRepairEnvelope { descriptor, repair })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    record_cli_command_event(
+        &config,
+        "repo.repair",
+        options.repo.as_deref(),
+        serde_json::json!({
+            "repository_count": reports.len(),
+        }),
+    );
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -578,6 +654,21 @@ fn build_migration_request(
         allow_dirty,
         policy,
     })
+}
+
+fn record_cli_command_event(
+    config: &AppConfig,
+    command_name: &str,
+    repo_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let mut event = new_structured_log_event("cli.command");
+    event.repo_id = repo_id.map(str::to_owned);
+    event.payload = serde_json::json!({
+        "command": command_name,
+        "details": payload,
+    });
+    let _ = record_structured_log(&config.paths.state_root, &event);
 }
 
 fn load_config_and_descriptors(
