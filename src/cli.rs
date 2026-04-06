@@ -18,7 +18,10 @@ use crate::migration::{
     MigrationRequest,
 };
 use crate::platform::RealPlatformProbe;
-use crate::read_path::{operator_prepare_repository_for_read, ReadPathError};
+use crate::read_path::{
+    cache_retention_status, evict_cache_repository, operator_prepare_repository_for_read,
+    pin_cache_repository, CacheControlError, CacheRetentionStatus, ReadPathError,
+};
 use crate::reconcile::{
     load_divergence_markers, reconcile_repository, repair_repository, replication_status_for_repo,
     DivergenceMarker, ReconcileError, ReplicationStatus, RepoRepairReport,
@@ -39,6 +42,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    Cache(CacheCommand),
     Deploy(DeployCommand),
     Doctor(TargetOptions),
     #[command(hide = true)]
@@ -50,6 +54,12 @@ enum TopLevelCommand {
     Replication(ReplicationCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
+}
+
+#[derive(Debug, Args)]
+struct CacheCommand {
+    #[command(subcommand)]
+    command: CacheSubcommand,
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +89,12 @@ enum DeploySubcommand {
 #[derive(Debug, Subcommand)]
 enum MigrationSubcommand {
     Inspect(MigrationInspectOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheSubcommand {
+    Evict(CacheTargetOptions),
+    Pin(CacheTargetOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +230,16 @@ struct HookDispatchCommand {
     args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Args)]
+struct CacheTargetOptions {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -226,6 +252,8 @@ pub enum CliError {
     UpstreamProbe(#[from] UpstreamProbeError),
     #[error(transparent)]
     ReadPath(#[from] ReadPathError),
+    #[error(transparent)]
+    CacheControl(#[from] CacheControlError),
     #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
     #[error(transparent)]
@@ -243,6 +271,7 @@ struct RepoInspectionReport {
     startup: StartupClassification,
     replication: ReplicationStatus,
     divergence_markers: Vec<DivergenceMarker>,
+    cache: Option<CacheRetentionStatus>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -264,6 +293,10 @@ where
 {
     let cli = Cli::parse_from(args);
     match cli.command {
+        TopLevelCommand::Cache(command) => match command.command {
+            CacheSubcommand::Evict(options) => run_cache_evict(options),
+            CacheSubcommand::Pin(options) => run_cache_pin(options),
+        },
         TopLevelCommand::Deploy(command) => match command.command {
             DeploySubcommand::ValidateRuntime(options) => run_deploy_validate_runtime(options),
             DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
@@ -300,6 +333,50 @@ where
             StartupSubcommand::Classify(options) => run_startup_classify(options),
         },
     }
+}
+
+fn run_cache_pin(options: CacheTargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let descriptor = select_repositories(descriptors, Some(&options.repo))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::RepositoryNotFound(options.repo.clone()))?;
+    let report = pin_cache_repository(&config, &descriptor)?;
+    record_cli_command_event(
+        &config,
+        "cache.pin",
+        Some(&descriptor.repo_id),
+        serde_json::json!({
+            "changed": report.changed,
+            "pinned": report.status.pinned,
+            "repo_accessible": report.status.repo_accessible,
+        }),
+    );
+    emit_output(&report, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_cache_evict(options: CacheTargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let descriptor = select_repositories(descriptors, Some(&options.repo))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::RepositoryNotFound(options.repo.clone()))?;
+    let report = evict_cache_repository(&config, &descriptor)?;
+    record_cli_command_event(
+        &config,
+        "cache.evict",
+        Some(&descriptor.repo_id),
+        serde_json::json!({
+            "changed": report.changed,
+            "removed_visible_ref_count": report.removed_visible_ref_count,
+            "cleared_refresh_state": report.cleared_refresh_state,
+            "cleared_negative_cache": report.cleared_negative_cache,
+            "pinned": report.status.pinned,
+        }),
+    );
+    emit_output(&report, options.json)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_migration_inspect(options: MigrationInspectOptions) -> Result<ExitCode, CliError> {
@@ -664,6 +741,11 @@ where
         startup.write_acceptance_allowed = false;
     }
     let replication = replication_status_for_repo(config, &descriptor)?;
+    let cache = if descriptor.mode == crate::config::RepositoryMode::CacheOnly {
+        Some(cache_retention_status(config, &descriptor)?)
+    } else {
+        None
+    };
 
     Ok(RepoInspectionReport {
         descriptor,
@@ -671,6 +753,7 @@ where
         startup,
         replication,
         divergence_markers,
+        cache,
     })
 }
 

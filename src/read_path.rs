@@ -45,6 +45,44 @@ pub struct ReadPreparationReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegativeCacheStatus {
+    pub failure_class: ProbeFailureClass,
+    pub detail: String,
+    pub expires_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRetentionStatus {
+    pub repo_id: String,
+    pub repo_path: PathBuf,
+    pub pinned: bool,
+    pub repo_accessible: bool,
+    pub has_visible_refs: Option<bool>,
+    pub last_successful_refresh_at_ms: Option<u128>,
+    pub last_refresh_upstream_id: Option<String>,
+    pub negative_cache: Option<NegativeCacheStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePinReport {
+    pub repo_id: String,
+    pub repo_path: PathBuf,
+    pub changed: bool,
+    pub status: CacheRetentionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEvictionReport {
+    pub repo_id: String,
+    pub repo_path: PathBuf,
+    pub changed: bool,
+    pub removed_visible_ref_count: usize,
+    pub cleared_refresh_state: bool,
+    pub cleared_negative_cache: bool,
+    pub status: CacheRetentionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RefreshState {
     repo_id: String,
     last_successful_refresh_at_ms: u128,
@@ -57,6 +95,12 @@ struct NegativeCacheEntry {
     failure_class: ProbeFailureClass,
     detail: String,
     expires_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachePinState {
+    repo_id: String,
+    pinned_at_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,11 +181,121 @@ pub enum ReadPathError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum CacheControlError {
+    #[error("repository {repo_id} is {mode:?} and does not support cache operator commands")]
+    NotCacheOnly {
+        repo_id: String,
+        mode: RepositoryMode,
+    },
+    #[error("cache repository {repo_id} does not exist on disk at {repo_path}")]
+    MissingRepository { repo_id: String, repo_path: PathBuf },
+    #[error("cache repository {repo_id} at {repo_path} is not a bare Git repository")]
+    NotBareRepository { repo_id: String, repo_path: PathBuf },
+    #[error(
+        "cache repository {repo_id} is busy with a refresh operation and cannot be evicted right now"
+    )]
+    RefreshBusy { repo_id: String },
+    #[error(transparent)]
+    ReadPath(#[from] ReadPathError),
+}
+
 pub fn prepare_repository_for_read(
     config: &AppConfig,
     descriptor: &RepositoryDescriptor,
 ) -> Result<ReadPreparationReport, ReadPathError> {
     prepare_repository_for_read_with_intent(config, descriptor, ReadPreparationIntent::ClientServe)
+}
+
+pub fn cache_retention_status(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<CacheRetentionStatus, CacheControlError> {
+    ensure_cache_only(descriptor)?;
+    build_cache_retention_status(config, descriptor)
+}
+
+pub fn pin_cache_repository(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<CachePinReport, CacheControlError> {
+    ensure_cache_only(descriptor)?;
+    ensure_mutable_cache_repository(descriptor)?;
+
+    let already_pinned = read_pin_state(&config.paths.state_root, &descriptor.repo_id)?.is_some();
+    if !already_pinned {
+        write_json(
+            &pin_state_path(&config.paths.state_root, &descriptor.repo_id),
+            &CachePinState {
+                repo_id: descriptor.repo_id.clone(),
+                pinned_at_ms: current_time_ms(),
+            },
+        )?;
+    }
+
+    let status = build_cache_retention_status(config, descriptor)?;
+    Ok(CachePinReport {
+        repo_id: descriptor.repo_id.clone(),
+        repo_path: descriptor.repo_path.clone(),
+        changed: !already_pinned,
+        status,
+    })
+}
+
+pub fn evict_cache_repository(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<CacheEvictionReport, CacheControlError> {
+    ensure_cache_only(descriptor)?;
+    ensure_mutable_cache_repository(descriptor)?;
+
+    let _guard = acquire_refresh_lock(config, descriptor)?.ok_or_else(|| {
+        CacheControlError::RefreshBusy {
+            repo_id: descriptor.repo_id.clone(),
+        }
+    })?;
+
+    let visible_refs = list_visible_refs(&descriptor.repo_path)?;
+    for ref_name in &visible_refs {
+        run_git_expect_success(
+            Some(&descriptor.repo_path),
+            &["update-ref".to_owned(), "-d".to_owned(), ref_name.clone()],
+        )?;
+    }
+    run_git_expect_success(
+        Some(&descriptor.repo_path),
+        &[
+            "reflog".to_owned(),
+            "expire".to_owned(),
+            "--expire=all".to_owned(),
+            "--expire-unreachable=all".to_owned(),
+            "--all".to_owned(),
+        ],
+    )?;
+    run_git_expect_success(
+        Some(&descriptor.repo_path),
+        &["gc".to_owned(), "--prune=now".to_owned()],
+    )?;
+
+    let cleared_refresh_state = remove_optional_file(&refresh_state_path(
+        &config.paths.state_root,
+        &descriptor.repo_id,
+    ))?;
+    let cleared_negative_cache = remove_optional_file(&negative_cache_path(
+        &config.paths.state_root,
+        &descriptor.repo_id,
+    ))?;
+    let status = build_cache_retention_status(config, descriptor)?;
+
+    Ok(CacheEvictionReport {
+        repo_id: descriptor.repo_id.clone(),
+        repo_path: descriptor.repo_path.clone(),
+        changed: !visible_refs.is_empty() || cleared_refresh_state || cleared_negative_cache,
+        removed_visible_ref_count: visible_refs.len(),
+        cleared_refresh_state,
+        cleared_negative_cache,
+        status,
+    })
 }
 
 pub fn operator_prepare_repository_for_read(
@@ -489,6 +643,68 @@ fn refresh_from_upstreams(
     })
 }
 
+fn ensure_cache_only(descriptor: &RepositoryDescriptor) -> Result<(), CacheControlError> {
+    if descriptor.mode != RepositoryMode::CacheOnly {
+        return Err(CacheControlError::NotCacheOnly {
+            repo_id: descriptor.repo_id.clone(),
+            mode: descriptor.mode,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_mutable_cache_repository(
+    descriptor: &RepositoryDescriptor,
+) -> Result<(), CacheControlError> {
+    if !descriptor.repo_path.exists() {
+        return Err(CacheControlError::MissingRepository {
+            repo_id: descriptor.repo_id.clone(),
+            repo_path: descriptor.repo_path.clone(),
+        });
+    }
+    if !is_bare_repository(&descriptor.repo_path)? {
+        return Err(CacheControlError::NotBareRepository {
+            repo_id: descriptor.repo_id.clone(),
+            repo_path: descriptor.repo_path.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn build_cache_retention_status(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+) -> Result<CacheRetentionStatus, CacheControlError> {
+    let repo_accessible =
+        descriptor.repo_path.exists() && is_bare_repository(&descriptor.repo_path)?;
+    let has_visible_refs = if repo_accessible {
+        Some(repository_has_visible_refs(&descriptor.repo_path)?)
+    } else {
+        None
+    };
+    let refresh_state = read_refresh_state(&config.paths.state_root, &descriptor.repo_id)?;
+    let negative_cache = active_negative_cache(config, &descriptor.repo_id, current_time_ms())?
+        .map(|entry| NegativeCacheStatus {
+            failure_class: entry.failure_class,
+            detail: entry.detail,
+            expires_at_ms: entry.expires_at_ms,
+        });
+    let pinned = read_pin_state(&config.paths.state_root, &descriptor.repo_id)?.is_some();
+
+    Ok(CacheRetentionStatus {
+        repo_id: descriptor.repo_id.clone(),
+        repo_path: descriptor.repo_path.clone(),
+        pinned,
+        repo_accessible,
+        has_visible_refs,
+        last_successful_refresh_at_ms: refresh_state
+            .as_ref()
+            .map(|state| state.last_successful_refresh_at_ms),
+        last_refresh_upstream_id: refresh_state.map(|state| state.last_upstream_id),
+        negative_cache,
+    })
+}
+
 fn refresh_from_one_upstream(repo_path: &Path, url: &str) -> Result<(), ReadPathError> {
     run_git_expect_success(
         Some(repo_path),
@@ -505,6 +721,11 @@ fn refresh_from_one_upstream(repo_path: &Path, url: &str) -> Result<(), ReadPath
 }
 
 fn repository_has_visible_refs(repo_path: &Path) -> Result<bool, ReadPathError> {
+    let refs = list_visible_refs(repo_path)?;
+    Ok(!refs.is_empty())
+}
+
+fn list_visible_refs(repo_path: &Path) -> Result<Vec<String>, ReadPathError> {
     let output = run_git_expect_success(
         Some(repo_path),
         &[
@@ -514,7 +735,13 @@ fn repository_has_visible_refs(repo_path: &Path) -> Result<bool, ReadPathError> 
             "refs/tags".to_owned(),
         ],
     )?;
-    Ok(output.stdout.lines().any(|line| !line.trim().is_empty()))
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn acquire_refresh_lock(
@@ -610,6 +837,13 @@ fn read_refresh_state(
     read_json_optional(&refresh_state_path(state_root, repo_id))
 }
 
+fn read_pin_state(
+    state_root: &Path,
+    repo_id: &str,
+) -> Result<Option<CachePinState>, ReadPathError> {
+    read_json_optional(&pin_state_path(state_root, repo_id))
+}
+
 fn write_refresh_state(
     config: &AppConfig,
     repo_id: &str,
@@ -632,6 +866,13 @@ fn negative_cache_path(state_root: &Path, repo_id: &str) -> PathBuf {
     state_root
         .join("read-refresh")
         .join("negative")
+        .join(format!("{}.json", sanitize_path_component(repo_id)))
+}
+
+fn pin_state_path(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("cache-retention")
+        .join("pins")
         .join(format!("{}.json", sanitize_path_component(repo_id)))
 }
 
@@ -677,6 +918,17 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ReadPathError>
     })
 }
 
+fn remove_optional_file(path: &Path) -> Result<bool, ReadPathError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ReadPathError::Write {
+            path: path.to_path_buf(),
+            error,
+        }),
+    }
+}
+
 fn read_json_optional<T: for<'de> Deserialize<'de>>(
     path: &Path,
 ) -> Result<Option<T>, ReadPathError> {
@@ -712,6 +964,14 @@ fn run_git(repo_path: Option<&Path>, args: &[String]) -> Result<GitProcessOutput
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         args: args.to_vec(),
     })
+}
+
+fn is_bare_repository(repo_path: &Path) -> Result<bool, ReadPathError> {
+    let output = run_git(
+        Some(repo_path),
+        &["rev-parse".to_owned(), "--is-bare-repository".to_owned()],
+    )?;
+    Ok(output.success && output.stdout.trim() == "true")
 }
 
 fn run_git_expect_success(

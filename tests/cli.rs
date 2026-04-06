@@ -1269,6 +1269,224 @@ fn read_prepare_serves_stale_under_explicit_policy_and_negative_cache() {
 }
 
 #[test]
+fn cache_pin_persists_retention_state_and_operator_visibility() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+
+    let upstream_path = temp.path().join("upstream-pin.git");
+    init_bare_repo(&upstream_path);
+    let cache_repo = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&cache_repo);
+    write_cache_only_descriptor(
+        &temp,
+        &cache_repo,
+        "always-refresh",
+        upstream_path.to_str().expect("path"),
+    );
+
+    let first = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "cache",
+            "pin",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_report: Value = serde_json::from_slice(&first).expect("cache pin json");
+    assert_eq!(first_report["changed"], true);
+    assert_eq!(first_report["status"]["pinned"], true);
+    assert_eq!(first_report["status"]["repo_accessible"], true);
+
+    let second = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "cache",
+            "pin",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_report: Value = serde_json::from_slice(&second).expect("cache pin json");
+    assert_eq!(second_report["changed"], false);
+    assert_eq!(second_report["status"]["pinned"], true);
+
+    let inspect = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "inspect",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_report = parse_single_report(&inspect);
+    assert_eq!(inspect_report["cache"]["pinned"], true);
+    assert_eq!(inspect_report["cache"]["repo_accessible"], true);
+
+    let logs = read_structured_logs(temp.path());
+    assert!(logs.iter().any(|event| {
+        event["event_type"] == "cli.command"
+            && event["repo_id"] == "github.com/example/cache.git"
+            && event["payload"]["command"] == "cache.pin"
+            && event["payload"]["details"]["pinned"] == true
+    }));
+}
+
+#[test]
+fn cache_evict_clears_local_cache_state_and_allows_repopulation() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+
+    let upstream_path = temp.path().join("upstream-evict.git");
+    init_bare_repo(&upstream_path);
+    let upstream_work = temp.path().join("work-upstream-evict");
+    init_work_repo(&upstream_work);
+    commit_file(&upstream_work, "README.md", "upstream\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            upstream_work.to_str().expect("work repo"),
+            "push",
+            upstream_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("upstream push success");
+
+    let cache_repo = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&cache_repo);
+    write_cache_only_descriptor(
+        &temp,
+        &cache_repo,
+        "always-refresh",
+        upstream_path.to_str().expect("path"),
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(git_ref_exists(&cache_repo, "refs/heads/main"));
+
+    let evict = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "cache",
+            "evict",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let evict_report: Value = serde_json::from_slice(&evict).expect("cache evict json");
+    assert_eq!(evict_report["changed"], true);
+    assert_eq!(evict_report["removed_visible_ref_count"], 1);
+    assert_eq!(evict_report["cleared_refresh_state"], true);
+    assert_eq!(evict_report["status"]["pinned"], false);
+    assert_eq!(evict_report["status"]["has_visible_refs"], false);
+    assert!(!git_ref_exists(&cache_repo, "refs/heads/main"));
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(git_ref_exists(&cache_repo, "refs/heads/main"));
+}
+
+#[test]
+fn cache_commands_fail_closed_for_authoritative_repositories() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "cache",
+            "pin",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "does not support cache operator commands",
+        ));
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "cache",
+            "evict",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "does not support cache operator commands",
+        ));
+}
+
+#[test]
 fn ssh_crash_checkpoints_match_the_local_commit_boundary() {
     let checkpoints = [
         ("before_pre_receive", false),
