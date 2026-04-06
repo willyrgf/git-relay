@@ -97,6 +97,14 @@ default_refresh = "ttl:60s"
 negative_cache_ttl = "5s"
 default_push_ack = "local-commit"
 
+[retention]
+maintenance_interval = "24h"
+cache_idle_ttl = "336h"
+terminal_run_ttl = "720h"
+terminal_run_keep_count = 20
+authoritative_reflog_ttl = "720h"
+authoritative_prune_ttl = "168h"
+
 [migration]
 supported_targets = ["git+https", "git+ssh"]
 refuse_dirty_worktree = true
@@ -134,6 +142,19 @@ secret_ref = "env:GITHUB_WRITE_KEY"
     )
     .expect("env file");
     config_path
+}
+
+fn rewrite_retention_config(config_path: &Path, replacement_block: &str) {
+    let source = fs::read_to_string(config_path).expect("config source");
+    let start = source.find("[retention]").expect("retention block start");
+    let end = source
+        .find("\n[migration]\n")
+        .expect("migration block start");
+    let mut updated = String::new();
+    updated.push_str(&source[..start]);
+    updated.push_str(replacement_block);
+    updated.push_str(&source[end..]);
+    fs::write(config_path, updated).expect("updated config");
 }
 
 fn write_authoritative_descriptor(
@@ -802,6 +823,34 @@ fn sanitize_repo_state_component(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn maintenance_report_path(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("retention")
+        .join("maintenance")
+        .join(format!("{}.json", sanitize_repo_state_component(repo_id)))
+}
+
+fn reconcile_run_dir(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("reconcile")
+        .join("runs")
+        .join(sanitize_repo_state_component(repo_id))
+}
+
+fn upstream_probe_run_dir(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("upstream-probes")
+        .join("runs")
+        .join(sanitize_repo_state_component(repo_id))
+}
+
+fn matrix_probe_run_dir(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("upstream-probes")
+        .join("matrix-runs")
+        .join(sanitize_repo_state_component(repo_id))
 }
 
 fn read_git_ref(repo_path: &Path, ref_name: &str) -> String {
@@ -2330,6 +2379,248 @@ fn git_relayd_serve_once_drains_pending_reconcile_requests() {
     let observed_main = read_git_ref(&repo_path, "refs/git-relay/upstreams/alpha/heads/main");
     assert_eq!(upstream_main, local_main);
     assert_eq!(observed_main, local_main);
+}
+
+#[test]
+fn git_relayd_serve_once_applies_retention_defaults_and_reports_them() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    rewrite_retention_config(
+        &config_path,
+        r#"[retention]
+maintenance_interval = "0s"
+cache_idle_ttl = "0s"
+terminal_run_ttl = "0s"
+terminal_run_keep_count = 20
+authoritative_reflog_ttl = "0s"
+authoritative_prune_ttl = "0s"
+"#,
+    );
+
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let cache_upstream = temp.path().join("cache-upstream.git");
+    init_bare_repo(&cache_upstream);
+    let cache_upstream_work = temp.path().join("work-cache-upstream");
+    init_work_repo(&cache_upstream_work);
+    commit_file(&cache_upstream_work, "README.md", "cached\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            cache_upstream_work.to_str().expect("work repo"),
+            "push",
+            cache_upstream.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("cache upstream push success");
+
+    let cache_repo = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&cache_repo);
+    write_cache_only_descriptor(
+        &temp,
+        &cache_repo,
+        "always-refresh",
+        cache_upstream.to_str().expect("path"),
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(git_ref_exists(&cache_repo, "refs/heads/main"));
+
+    let output = Command::cargo_bin("git-relayd")
+        .expect("cargo bin")
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("serve report");
+
+    let maintenance = report["maintenance_reports"]
+        .as_array()
+        .expect("maintenance reports");
+    assert!(maintenance.iter().any(|item| {
+        item["repo_id"] == "github.com/example/cache.git"
+            && item["cache"]["outcome"] == "evicted"
+            && item["cache"]["removed_visible_ref_count"] == 1
+    }));
+    assert!(maintenance.iter().any(|item| {
+        item["repo_id"] == "github.com/example/repo.git"
+            && item["authoritative"]["applied"] == true
+            && item["error"].is_null()
+    }));
+    assert!(!git_ref_exists(&cache_repo, "refs/heads/main"));
+
+    let inspect = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "inspect",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_report = parse_single_report(&inspect);
+    assert_eq!(
+        inspect_report["retention"]["policy"]["cache_idle_ttl"],
+        "0s"
+    );
+    assert_eq!(
+        inspect_report["retention"]["last_maintenance"]["cache"]["outcome"],
+        "evicted"
+    );
+    assert!(
+        maintenance_report_path(temp.path(), "github.com/example/cache.git").exists(),
+        "cache maintenance report should be persisted"
+    );
+}
+
+#[test]
+fn git_relayd_serve_once_prunes_terminal_run_evidence_by_default_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    rewrite_retention_config(
+        &config_path,
+        r#"[retention]
+maintenance_interval = "0s"
+cache_idle_ttl = "336h"
+terminal_run_ttl = "0s"
+terminal_run_keep_count = 2
+authoritative_reflog_ttl = "720h"
+authoritative_prune_ttl = "168h"
+"#,
+    );
+
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let repo_id = "github.com/example/repo.git";
+    let reconcile_dir = reconcile_run_dir(temp.path(), repo_id);
+    let upstream_dir = upstream_probe_run_dir(temp.path(), repo_id);
+    let matrix_dir = matrix_probe_run_dir(temp.path(), repo_id);
+    fs::create_dir_all(&reconcile_dir).expect("reconcile dir");
+    fs::create_dir_all(&upstream_dir).expect("upstream dir");
+    fs::create_dir_all(&matrix_dir).expect("matrix dir");
+
+    for (name, started, completed) in [("old-a", 1, 1), ("old-b", 2, 2), ("keep-c", 3, 3)] {
+        fs::write(
+            reconcile_dir.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "run_id": name,
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "started_at_ms": started,
+                "completed_at_ms": completed,
+            }))
+            .expect("reconcile json"),
+        )
+        .expect("reconcile file");
+        fs::write(
+            upstream_dir.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "run_id": name,
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "started_at_ms": started,
+                "completed_at_ms": completed,
+            }))
+            .expect("upstream json"),
+        )
+        .expect("upstream file");
+        fs::write(
+            matrix_dir.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "run_id": name,
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "started_at_ms": started,
+                "completed_at_ms": completed,
+            }))
+            .expect("matrix json"),
+        )
+        .expect("matrix file");
+    }
+
+    let output = Command::cargo_bin("git-relayd")
+        .expect("cargo bin")
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("serve report");
+    let maintenance = report["maintenance_reports"]
+        .as_array()
+        .expect("maintenance reports");
+    let repo_report = maintenance
+        .iter()
+        .find(|item| item["repo_id"] == repo_id)
+        .expect("repo maintenance report");
+    assert_eq!(repo_report["evidence_pruned"]["reconcile_runs_removed"], 1);
+    assert_eq!(
+        repo_report["evidence_pruned"]["upstream_probe_runs_removed"],
+        1
+    );
+    assert_eq!(
+        repo_report["evidence_pruned"]["matrix_probe_runs_removed"],
+        1
+    );
+
+    assert_eq!(
+        fs::read_dir(&reconcile_dir)
+            .expect("reconcile entries")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_dir(&upstream_dir)
+            .expect("upstream entries")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_dir(&matrix_dir).expect("matrix entries").count(),
+        2
+    );
 }
 
 #[test]

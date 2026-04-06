@@ -9,6 +9,7 @@ use serde::Serialize;
 use git_relay::config::AppConfig;
 use git_relay::deploy::validate_runtime_profile;
 use git_relay::git::SystemGitExecutor;
+use git_relay::maintenance::{run_retention_maintenance, RepositoryMaintenanceReport};
 use git_relay::platform::RealPlatformProbe;
 use git_relay::reconcile::{process_pending_reconcile_requests, ReconcileRunRecord};
 use git_relay::validator::Validator;
@@ -38,6 +39,7 @@ struct ServeArgs {
 struct ServeCycleReport {
     runtime_validation: git_relay::deploy::RuntimeValidationReport,
     processed_reconciles: Vec<ReconcileRunRecord>,
+    maintenance_reports: Vec<RepositoryMaintenanceReport>,
 }
 
 fn main() -> ExitCode {
@@ -88,8 +90,10 @@ fn run_cycle(
     runtime_validation: git_relay::deploy::RuntimeValidationReport,
 ) -> Result<ServeCycleReport, Box<dyn std::error::Error>> {
     let processed_reconciles = process_pending_reconcile_requests(config, descriptors)?;
+    let maintenance_reports = run_retention_maintenance(config, descriptors);
     Ok(ServeCycleReport {
         runtime_validation,
         processed_reconciles,
+        maintenance_reports,
     })
 }

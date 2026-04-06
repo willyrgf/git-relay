@@ -1562,8 +1562,8 @@ mod tests {
     use crate::config::{
         AppConfig, DeploymentProfile, FreshnessPolicy, GitOnlyCommandMode, GitService,
         ListenConfig, MigrationConfig, MigrationTransport, PathsConfig, PolicyConfig,
-        PushAckPolicy, ReconcileConfig, RepositoryMode, ServiceManager, SupportedPlatform,
-        TargetedRelockMode, WorkerMode,
+        PushAckPolicy, ReconcileConfig, RepositoryMode, RetentionConfig, ServiceManager,
+        SupportedPlatform, TargetedRelockMode, WorkerMode,
     };
     use serde_json::json;
 
@@ -1593,6 +1593,7 @@ mod tests {
                 negative_cache_ttl: "5s".parse().expect("duration"),
                 default_push_ack: PushAckPolicy::LocalCommit,
             },
+            retention: RetentionConfig::default(),
             migration: MigrationConfig {
                 supported_targets: vec![MigrationTransport::GitHttps, MigrationTransport::GitSsh],
                 refuse_dirty_worktree: true,

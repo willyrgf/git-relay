@@ -534,7 +534,7 @@ mod tests {
         FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
         MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReadUpstream,
         ReconcileConfig, ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle,
-        RepositoryMode, ServiceManager, SupportedPlatform, TargetedRelockMode,
+        RepositoryMode, RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
         TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
     use crate::git::{GitCommandError, GitExecutor, SystemGitExecutor};
@@ -601,6 +601,7 @@ mod tests {
                 negative_cache_ttl: "5s".parse().expect("duration"),
                 default_push_ack: PushAckPolicy::LocalCommit,
             },
+            retention: RetentionConfig::default(),
             migration: MigrationConfig {
                 supported_targets: vec![MigrationTransport::GitHttps, MigrationTransport::GitSsh],
                 refuse_dirty_worktree: true,

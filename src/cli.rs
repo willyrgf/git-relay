@@ -13,6 +13,10 @@ use crate::deploy::{
 };
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
+use crate::maintenance::{
+    retention_policy_report, retention_status_for_repo, MaintenanceError, RepoRetentionStatus,
+    RetentionPolicyReport,
+};
 use crate::migration::{
     inspect_migration, migrate_flake_inputs, parse_policy_overrides, MigrationError,
     MigrationRequest,
@@ -255,6 +259,8 @@ pub enum CliError {
     #[error(transparent)]
     CacheControl(#[from] CacheControlError),
     #[error(transparent)]
+    Maintenance(#[from] MaintenanceError),
+    #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
     #[error(transparent)]
     Release(#[from] ReleaseError),
@@ -272,6 +278,7 @@ struct RepoInspectionReport {
     replication: ReplicationStatus,
     divergence_markers: Vec<DivergenceMarker>,
     cache: Option<CacheRetentionStatus>,
+    retention: RepoRetentionStatus,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -283,6 +290,7 @@ struct RepoRepairEnvelope {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DoctorReport {
     runtime_validation: RuntimeValidationReport,
+    retention_policy: RetentionPolicyReport,
     repositories: Vec<RepoInspectionReport>,
 }
 
@@ -570,6 +578,7 @@ fn run_doctor(options: TargetOptions) -> Result<ExitCode, CliError> {
     emit_output(
         &DoctorReport {
             runtime_validation,
+            retention_policy: retention_policy_report(&config),
             repositories,
         },
         options.json,
@@ -746,6 +755,7 @@ where
     } else {
         None
     };
+    let retention = retention_status_for_repo(config, &descriptor)?;
 
     Ok(RepoInspectionReport {
         descriptor,
@@ -754,6 +764,7 @@ where
         replication,
         divergence_markers,
         cache,
+        retention,
     })
 }
 

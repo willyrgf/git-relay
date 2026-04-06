@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub paths: PathsConfig,
     pub reconcile: ReconcileConfig,
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     pub migration: MigrationConfig,
     pub deployment: DeploymentProfile,
     #[serde(default)]
@@ -140,6 +142,23 @@ pub struct PolicyConfig {
     pub default_refresh: FreshnessPolicy,
     pub negative_cache_ttl: HumanDuration,
     pub default_push_ack: PushAckPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    #[serde(default = "default_maintenance_interval")]
+    pub maintenance_interval: HumanDuration,
+    #[serde(default = "default_cache_idle_ttl")]
+    pub cache_idle_ttl: HumanDuration,
+    #[serde(default = "default_terminal_run_ttl")]
+    pub terminal_run_ttl: HumanDuration,
+    #[serde(default = "default_terminal_run_keep_count")]
+    pub terminal_run_keep_count: usize,
+    #[serde(default = "default_authoritative_reflog_ttl")]
+    pub authoritative_reflog_ttl: HumanDuration,
+    #[serde(default = "default_authoritative_prune_ttl")]
+    pub authoritative_prune_ttl: HumanDuration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +475,43 @@ impl FromStr for HumanDuration {
         };
         Ok(Self(duration))
     }
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            maintenance_interval: default_maintenance_interval(),
+            cache_idle_ttl: default_cache_idle_ttl(),
+            terminal_run_ttl: default_terminal_run_ttl(),
+            terminal_run_keep_count: default_terminal_run_keep_count(),
+            authoritative_reflog_ttl: default_authoritative_reflog_ttl(),
+            authoritative_prune_ttl: default_authoritative_prune_ttl(),
+        }
+    }
+}
+
+fn default_maintenance_interval() -> HumanDuration {
+    HumanDuration(Duration::from_secs(24 * 60 * 60))
+}
+
+fn default_cache_idle_ttl() -> HumanDuration {
+    HumanDuration(Duration::from_secs(14 * 24 * 60 * 60))
+}
+
+fn default_terminal_run_ttl() -> HumanDuration {
+    HumanDuration(Duration::from_secs(30 * 24 * 60 * 60))
+}
+
+fn default_terminal_run_keep_count() -> usize {
+    20
+}
+
+fn default_authoritative_reflog_ttl() -> HumanDuration {
+    HumanDuration(Duration::from_secs(30 * 24 * 60 * 60))
+}
+
+fn default_authoritative_prune_ttl() -> HumanDuration {
+    HumanDuration(Duration::from_secs(7 * 24 * 60 * 60))
 }
 
 mod human_duration_serde {

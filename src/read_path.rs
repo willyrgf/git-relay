@@ -58,6 +58,8 @@ pub struct CacheRetentionStatus {
     pub pinned: bool,
     pub repo_accessible: bool,
     pub has_visible_refs: Option<bool>,
+    pub last_read_at_ms: Option<u128>,
+    pub last_activity_at_ms: Option<u128>,
     pub last_successful_refresh_at_ms: Option<u128>,
     pub last_refresh_upstream_id: Option<String>,
     pub negative_cache: Option<NegativeCacheStatus>,
@@ -101,6 +103,12 @@ struct NegativeCacheEntry {
 struct CachePinState {
     repo_id: String,
     pinned_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CacheAccessState {
+    repo_id: String,
+    last_read_at_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +293,10 @@ pub fn evict_cache_repository(
         &config.paths.state_root,
         &descriptor.repo_id,
     ))?;
+    let _ = remove_optional_file(&access_state_path(
+        &config.paths.state_root,
+        &descriptor.repo_id,
+    ))?;
     let status = build_cache_retention_status(config, descriptor)?;
 
     Ok(CacheEvictionReport {
@@ -381,6 +393,7 @@ fn prepare_cache_only_read(
         intent,
     ) {
         clear_negative_cache(config, &descriptor.repo_id);
+        record_cache_activity(config, &descriptor.repo_id)?;
         return Ok(ReadPreparationReport {
             repo_id: descriptor.repo_id.clone(),
             repo_path: descriptor.repo_path.clone(),
@@ -404,7 +417,13 @@ fn prepare_cache_only_read(
 
     if honor_initial_negative_cache(descriptor.refresh, intent) {
         if let Some(entry) = active_negative_cache(config, &descriptor.repo_id, now_ms)? {
-            return negative_cache_response(descriptor, state.as_ref(), entry, has_local_refs);
+            return negative_cache_response(
+                config,
+                descriptor,
+                state.as_ref(),
+                entry,
+                has_local_refs,
+            );
         }
     }
 
@@ -422,6 +441,7 @@ fn prepare_cache_only_read(
                 intent,
             ) {
                 clear_negative_cache(config, &descriptor.repo_id);
+                record_cache_activity(config, &descriptor.repo_id)?;
                 return Ok(ReadPreparationReport {
                     repo_id: descriptor.repo_id.clone(),
                     repo_path: descriptor.repo_path.clone(),
@@ -443,6 +463,7 @@ fn prepare_cache_only_read(
             match refresh_from_upstreams(config, descriptor) {
                 Ok(state) => {
                     clear_negative_cache(config, &descriptor.repo_id);
+                    record_cache_activity(config, &descriptor.repo_id)?;
                     return Ok(ReadPreparationReport {
                         repo_id: descriptor.repo_id.clone(),
                         repo_path: descriptor.repo_path.clone(),
@@ -474,6 +495,7 @@ fn prepare_cache_only_read(
 
                     return match descriptor.refresh {
                         FreshnessPolicy::StaleIfError if has_local_refs_now => {
+                            record_cache_activity(config, &descriptor.repo_id)?;
                             Ok(ReadPreparationReport {
                                 repo_id: descriptor.repo_id.clone(),
                                 repo_path: descriptor.repo_path.clone(),
@@ -516,6 +538,7 @@ fn prepare_cache_only_read(
             intent,
         ) {
             clear_negative_cache(config, &descriptor.repo_id);
+            record_cache_activity(config, &descriptor.repo_id)?;
             return Ok(ReadPreparationReport {
                 repo_id: descriptor.repo_id.clone(),
                 repo_path: descriptor.repo_path.clone(),
@@ -536,6 +559,7 @@ fn prepare_cache_only_read(
 
         if let Some(entry) = active_negative_cache(config, &descriptor.repo_id, now_ms)? {
             return negative_cache_response(
+                config,
                 descriptor,
                 refreshed_state.as_ref(),
                 entry,
@@ -591,25 +615,30 @@ fn honor_initial_negative_cache(policy: FreshnessPolicy, intent: ReadPreparation
 }
 
 fn negative_cache_response(
+    config: &AppConfig,
     descriptor: &RepositoryDescriptor,
     state: Option<&RefreshState>,
     entry: NegativeCacheEntry,
     has_local_refs: bool,
 ) -> Result<ReadPreparationReport, ReadPathError> {
     match descriptor.refresh {
-        FreshnessPolicy::StaleIfError if has_local_refs => Ok(ReadPreparationReport {
-            repo_id: descriptor.repo_id.clone(),
-            repo_path: descriptor.repo_path.clone(),
-            repo_mode: descriptor.mode,
-            refresh_policy: descriptor.refresh.to_string(),
-            action: ReadAction::ServedStale,
-            refreshed: false,
-            stale_served: true,
-            negative_cache_hit: true,
-            source_upstream: state.map(|state| state.last_upstream_id.clone()),
-            detail: Some(entry.detail),
-            last_successful_refresh_at_ms: state.map(|state| state.last_successful_refresh_at_ms),
-        }),
+        FreshnessPolicy::StaleIfError if has_local_refs => {
+            record_cache_activity(config, &descriptor.repo_id)?;
+            Ok(ReadPreparationReport {
+                repo_id: descriptor.repo_id.clone(),
+                repo_path: descriptor.repo_path.clone(),
+                repo_mode: descriptor.mode,
+                refresh_policy: descriptor.refresh.to_string(),
+                action: ReadAction::ServedStale,
+                refreshed: false,
+                stale_served: true,
+                negative_cache_hit: true,
+                source_upstream: state.map(|state| state.last_upstream_id.clone()),
+                detail: Some(entry.detail),
+                last_successful_refresh_at_ms: state
+                    .map(|state| state.last_successful_refresh_at_ms),
+            })
+        }
         _ => Err(ReadPathError::NegativeCacheActive {
             repo_id: descriptor.repo_id.clone(),
             detail: entry.detail,
@@ -683,6 +712,7 @@ fn build_cache_retention_status(
         None
     };
     let refresh_state = read_refresh_state(&config.paths.state_root, &descriptor.repo_id)?;
+    let access_state = read_access_state(&config.paths.state_root, &descriptor.repo_id)?;
     let negative_cache = active_negative_cache(config, &descriptor.repo_id, current_time_ms())?
         .map(|entry| NegativeCacheStatus {
             failure_class: entry.failure_class,
@@ -690,6 +720,11 @@ fn build_cache_retention_status(
             expires_at_ms: entry.expires_at_ms,
         });
     let pinned = read_pin_state(&config.paths.state_root, &descriptor.repo_id)?.is_some();
+    let last_read_at_ms = access_state.as_ref().map(|state| state.last_read_at_ms);
+    let last_successful_refresh_at_ms = refresh_state
+        .as_ref()
+        .map(|state| state.last_successful_refresh_at_ms);
+    let last_activity_at_ms = last_read_at_ms.max(last_successful_refresh_at_ms);
 
     Ok(CacheRetentionStatus {
         repo_id: descriptor.repo_id.clone(),
@@ -697,9 +732,9 @@ fn build_cache_retention_status(
         pinned,
         repo_accessible,
         has_visible_refs,
-        last_successful_refresh_at_ms: refresh_state
-            .as_ref()
-            .map(|state| state.last_successful_refresh_at_ms),
+        last_read_at_ms,
+        last_activity_at_ms,
+        last_successful_refresh_at_ms,
         last_refresh_upstream_id: refresh_state.map(|state| state.last_upstream_id),
         negative_cache,
     })
@@ -844,6 +879,13 @@ fn read_pin_state(
     read_json_optional(&pin_state_path(state_root, repo_id))
 }
 
+fn read_access_state(
+    state_root: &Path,
+    repo_id: &str,
+) -> Result<Option<CacheAccessState>, ReadPathError> {
+    read_json_optional(&access_state_path(state_root, repo_id))
+}
+
 fn write_refresh_state(
     config: &AppConfig,
     repo_id: &str,
@@ -852,6 +894,16 @@ fn write_refresh_state(
     write_json(
         &refresh_state_path(&config.paths.state_root, repo_id),
         state,
+    )
+}
+
+fn record_cache_activity(config: &AppConfig, repo_id: &str) -> Result<(), ReadPathError> {
+    write_json(
+        &access_state_path(&config.paths.state_root, repo_id),
+        &CacheAccessState {
+            repo_id: repo_id.to_owned(),
+            last_read_at_ms: current_time_ms(),
+        },
     )
 }
 
@@ -873,6 +925,13 @@ fn pin_state_path(state_root: &Path, repo_id: &str) -> PathBuf {
     state_root
         .join("cache-retention")
         .join("pins")
+        .join(format!("{}.json", sanitize_path_component(repo_id)))
+}
+
+fn access_state_path(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("read-refresh")
+        .join("access")
         .join(format!("{}.json", sanitize_path_component(repo_id)))
 }
 

@@ -1422,8 +1422,9 @@ mod tests {
         AppConfig, AuthProfile, AuthProfileKind, AuthorityModel, DeploymentProfile,
         FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
         MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReconcileConfig,
-        ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode, ServiceManager,
-        SupportedPlatform, TargetedRelockMode, TrackingRefPlacement, WorkerMode, WriteUpstream,
+        ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
+        RetentionConfig, ServiceManager, SupportedPlatform, TargetedRelockMode,
+        TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
 
     use super::{
@@ -1565,6 +1566,7 @@ mod tests {
                 negative_cache_ttl: "5s".parse().expect("duration"),
                 default_push_ack: PushAckPolicy::LocalCommit,
             },
+            retention: RetentionConfig::default(),
             migration: MigrationConfig {
                 supported_targets: vec![MigrationTransport::GitHttps, MigrationTransport::GitSsh],
                 refuse_dirty_worktree: true,

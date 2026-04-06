@@ -22,6 +22,14 @@ default_refresh = "ttl:60s"
 negative_cache_ttl = "5s"
 default_push_ack = "local-commit"
 
+[retention]
+maintenance_interval = "24h"
+cache_idle_ttl = "336h"
+terminal_run_ttl = "720h"
+terminal_run_keep_count = 20
+authoritative_reflog_ttl = "720h"
+authoritative_prune_ttl = "168h"
+
 [migration]
 supported_targets = ["git+https", "git+ssh"]
 refuse_dirty_worktree = true
