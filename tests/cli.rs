@@ -515,6 +515,75 @@ fn repo_validate_returns_json_for_valid_authoritative_repo() {
 }
 
 #[test]
+fn repo_inspect_reports_descriptor_validation_and_replication_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "inspect",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report = parse_single_report(&output);
+    assert_eq!(report["descriptor"]["mode"], "authoritative");
+    assert_eq!(report["validation"]["status"], "passed");
+    assert_eq!(report["startup"]["safety"], "degraded");
+    assert!(report["divergence_markers"]
+        .as_array()
+        .expect("divergence markers")
+        .is_empty());
+    assert!(report["replication"]["pending_request"].is_null());
+    assert!(report["replication"]["latest_run"].is_null());
+}
+
+#[test]
+fn doctor_reports_runtime_and_repository_health() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "doctor",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("doctor json");
+    assert_eq!(report["runtime_validation"]["status"], "passed");
+    let repositories = report["repositories"].as_array().expect("repositories");
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0]["validation"]["status"], "passed");
+    assert_eq!(repositories[0]["startup"]["safety"], "degraded");
+}
+
+#[test]
 fn startup_classify_fails_closed_for_invalid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);

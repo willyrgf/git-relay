@@ -4,17 +4,19 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::classification::{classify_startup, RepositorySafetyState};
+use crate::classification::{classify_startup, RepositorySafetyState, StartupClassification};
 use crate::config::{AppConfig, ConfigError, RepositoryDescriptor};
 use crate::deploy::{
-    render_service, validate_runtime_profile, ServiceFormat, ServiceRenderRequest,
+    render_service, validate_runtime_profile, RuntimeValidationReport, ServiceFormat,
+    ServiceRenderRequest,
 };
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
 use crate::read_path::{operator_prepare_repository_for_read, ReadPathError};
 use crate::reconcile::{
-    load_divergence_markers, reconcile_repository, replication_status_for_repo, ReconcileError,
+    load_divergence_markers, reconcile_repository, replication_status_for_repo, DivergenceMarker,
+    ReconcileError, ReplicationStatus,
 };
 use crate::upstream::{probe_repository_upstreams, UpstreamProbeError};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
@@ -30,6 +32,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
     Deploy(DeployCommand),
+    Doctor(TargetOptions),
     #[command(hide = true)]
     HookDispatch(HookDispatchCommand),
     Read(ReadCommand),
@@ -82,6 +85,7 @@ enum ReadSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum RepoSubcommand {
+    Inspect(TargetOptions),
     Validate(TargetOptions),
 }
 
@@ -148,6 +152,21 @@ pub enum CliError {
     Io(#[from] io::Error),
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct RepoInspectionReport {
+    descriptor: RepositoryDescriptor,
+    validation: ValidationReport,
+    startup: StartupClassification,
+    replication: ReplicationStatus,
+    divergence_markers: Vec<DivergenceMarker>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorReport {
+    runtime_validation: RuntimeValidationReport,
+    repositories: Vec<RepoInspectionReport>,
+}
+
 pub fn run<I, T>(args: I) -> Result<ExitCode, CliError>
 where
     I: IntoIterator<Item = T>,
@@ -159,6 +178,7 @@ where
             DeploySubcommand::ValidateRuntime(options) => run_deploy_validate_runtime(options),
             DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
         },
+        TopLevelCommand::Doctor(options) => run_doctor(options),
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
         TopLevelCommand::Read(command) => match command.command {
             ReadSubcommand::Prepare(options) => run_read_prepare(options),
@@ -171,6 +191,7 @@ where
             ReplicationSubcommand::Status(options) => run_replication_status(options),
         },
         TopLevelCommand::Repo(command) => match command.command {
+            RepoSubcommand::Inspect(options) => run_repo_inspect(options),
             RepoSubcommand::Validate(options) => run_repo_validate(options),
         },
         TopLevelCommand::Startup(command) => match command.command {
@@ -260,6 +281,36 @@ fn run_replication_status(options: TargetOptions) -> Result<ExitCode, CliError> 
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_doctor(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+    let runtime_validation = validate_runtime_profile(&config, &targets, &validator)?;
+    let repositories = build_repo_inspections(&config, targets, &validator)?;
+    let passed = runtime_validation.passed()
+        && repositories.iter().all(|report| {
+            report.validation.passed()
+                && !matches!(
+                    report.startup.safety,
+                    RepositorySafetyState::Divergent | RepositorySafetyState::Quarantined
+                )
+        });
+    emit_output(
+        &DoctorReport {
+            runtime_validation,
+            repositories,
+        },
+        options.json,
+    )?;
+    if passed {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
 fn run_read_prepare(options: TargetOptions) -> Result<ExitCode, CliError> {
     let (config, descriptors) = load_config_and_descriptors(&options.config)?;
     let targets = select_repositories(descriptors, options.repo.as_deref())?;
@@ -267,6 +318,17 @@ fn run_read_prepare(options: TargetOptions) -> Result<ExitCode, CliError> {
         .iter()
         .map(|descriptor| operator_prepare_repository_for_read(&config, descriptor))
         .collect::<Result<Vec<_>, _>>()?;
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_repo_inspect(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let git = SystemGitExecutor;
+    let platform = RealPlatformProbe;
+    let validator = Validator::new(&git, &platform);
+    let reports = build_repo_inspections(&config, targets, &validator)?;
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -337,6 +399,48 @@ fn run_startup_classify(options: TargetOptions) -> Result<ExitCode, CliError> {
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+fn build_repo_inspections<G, P>(
+    config: &AppConfig,
+    descriptors: Vec<RepositoryDescriptor>,
+    validator: &Validator<'_, G, P>,
+) -> Result<Vec<RepoInspectionReport>, CliError>
+where
+    G: crate::git::GitExecutor,
+    P: crate::platform::PlatformProbe,
+{
+    descriptors
+        .into_iter()
+        .map(|descriptor| build_repo_inspection(config, descriptor, validator))
+        .collect()
+}
+
+fn build_repo_inspection<G, P>(
+    config: &AppConfig,
+    descriptor: RepositoryDescriptor,
+    validator: &Validator<'_, G, P>,
+) -> Result<RepoInspectionReport, CliError>
+where
+    G: crate::git::GitExecutor,
+    P: crate::platform::PlatformProbe,
+{
+    let validation = validator.validate(config, &descriptor)?;
+    let divergence_markers = load_divergence_markers(&descriptor.repo_path)?;
+    let mut startup = classify_startup(&descriptor, &validation);
+    if validation.passed() && !divergence_markers.is_empty() {
+        startup.safety = RepositorySafetyState::Divergent;
+        startup.write_acceptance_allowed = false;
+    }
+    let replication = replication_status_for_repo(config, &descriptor)?;
+
+    Ok(RepoInspectionReport {
+        descriptor,
+        validation,
+        startup,
+        replication,
+        divergence_markers,
+    })
 }
 
 fn load_config_and_descriptors(
