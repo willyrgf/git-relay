@@ -316,6 +316,46 @@ auth_profile = "github-read"
     path
 }
 
+fn write_matrix_targets_fixture(
+    temp: &TempDir,
+    file_name: &str,
+    targets: &[(&str, &str, &str, &str, &str, bool, bool)],
+) -> PathBuf {
+    let mut encoded_targets = Vec::new();
+    for (target_id, product, class, transport, url, require_atomic, same_repo_hidden_refs) in
+        targets
+    {
+        let host_key_policy = match *transport {
+            "ssh" => "pinned-known-hosts",
+            "smart-http" => "not-applicable",
+            other => panic!("unsupported transport {other}"),
+        };
+        encoded_targets.push(serde_json::json!({
+            "target_id": target_id,
+            "product": product,
+            "class": class,
+            "transport": transport,
+            "url": url,
+            "credential_source": format!("env:{}_CREDENTIAL", target_id.to_uppercase()),
+            "host_key_policy": host_key_policy,
+            "require_atomic": require_atomic,
+            "same_repo_hidden_refs": same_repo_hidden_refs,
+        }));
+    }
+
+    let path = temp.path().join(file_name);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "targets": encoded_targets,
+        }))
+        .expect("manifest json"),
+    )
+    .expect("manifest");
+    path
+}
+
 fn init_work_repo(path: &Path) {
     fs::create_dir_all(path).expect("work repo");
     StdCommand::new("git")
@@ -1223,6 +1263,225 @@ fn replication_probe_upstreams_classifies_supported_unsupported_and_missing_targ
         .collect::<Result<Vec<_>, _>>()
         .expect("probe runs");
     assert_eq!(entries.len(), 1, "one probe run record should be persisted");
+}
+
+#[test]
+fn replication_probe_matrix_records_target_metadata_and_policy_support() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_supported = temp.path().join("matrix-supported.git");
+    init_bare_repo(&upstream_supported);
+
+    let upstream_non_atomic = temp.path().join("matrix-non-atomic.git");
+    init_bare_repo(&upstream_non_atomic);
+    StdCommand::new("git")
+        .arg(format!("--git-dir={}", upstream_non_atomic.display()))
+        .args(["config", "receive.advertiseAtomic", "false"])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_supported.to_str().expect("path"), true)],
+    );
+
+    let work_repo = temp.path().join("work-probe-matrix");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let manifest_path = write_matrix_targets_fixture(
+        &temp,
+        "matrix-targets.json",
+        &[
+            (
+                "self-managed-alpha",
+                "local-git",
+                "self-managed",
+                "ssh",
+                upstream_supported.to_str().expect("path"),
+                true,
+                true,
+            ),
+            (
+                "managed-beta",
+                "local-git",
+                "managed",
+                "ssh",
+                upstream_non_atomic.to_str().expect("path"),
+                true,
+                false,
+            ),
+        ],
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "probe-matrix",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--targets",
+            manifest_path.to_str().expect("manifest"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let report: Value = serde_json::from_slice(&output).expect("probe matrix json");
+    let results = report["results"].as_array().expect("results");
+    assert!(results.iter().any(|item| {
+        item["target"]["target_id"] == "self-managed-alpha"
+            && item["target"]["class"] == "self-managed"
+            && item["target"]["same_repo_hidden_refs"] == true
+            && item["supported_for_policy"] == true
+    }));
+    assert!(results.iter().any(|item| {
+        item["target"]["target_id"] == "managed-beta"
+            && item["atomic_capability"]["verdict"] == "unsupported"
+            && item["supported_for_policy"] == false
+    }));
+
+    let matrix_runs_dir = temp
+        .path()
+        .join("upstream-probes")
+        .join("matrix-runs")
+        .join("github.com_example_repo.git");
+    let entries = fs::read_dir(&matrix_runs_dir)
+        .expect("matrix runs dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("matrix runs");
+    assert_eq!(
+        entries.len(),
+        1,
+        "one matrix run record should be persisted"
+    );
+}
+
+#[test]
+fn replication_build_release_manifest_fails_closed_for_unproven_targets() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_supported = temp.path().join("release-supported.git");
+    init_bare_repo(&upstream_supported);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_supported.to_str().expect("path"), true)],
+    );
+
+    let work_repo = temp.path().join("work-release-matrix");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let missing_upstream = temp.path().join("release-missing.git");
+    let manifest_path = write_matrix_targets_fixture(
+        &temp,
+        "release-targets.json",
+        &[
+            (
+                "supported-alpha",
+                "local-git",
+                "self-managed",
+                "ssh",
+                upstream_supported.to_str().expect("path"),
+                true,
+                true,
+            ),
+            (
+                "missing-beta",
+                "local-git",
+                "managed",
+                "ssh",
+                missing_upstream.to_str().expect("path"),
+                false,
+                false,
+            ),
+        ],
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "build-release-manifest",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--targets",
+            manifest_path.to_str().expect("manifest"),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let manifest: Value = serde_json::from_slice(&output).expect("release manifest json");
+    assert_eq!(manifest["all_entries_admitted"], false);
+    let entries = manifest["entries"].as_array().expect("entries");
+    assert!(entries
+        .iter()
+        .any(|item| { item["target_id"] == "supported-alpha" && item["admitted"] == true }));
+    assert!(entries
+        .iter()
+        .any(|item| { item["target_id"] == "missing-beta" && item["admitted"] == false }));
+
+    let latest_manifest_path = temp
+        .path()
+        .join("upstream-probes")
+        .join("release-manifests")
+        .join("github.com_example_repo.git")
+        .join("latest.json");
+    assert!(
+        latest_manifest_path.exists(),
+        "release manifest latest pointer should be persisted"
+    );
 }
 
 #[test]

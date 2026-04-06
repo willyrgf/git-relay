@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "target_id": "replace-me-self-managed-ssh",
+      "product": "replace-me",
+      "class": "self-managed",
+      "transport": "ssh",
+      "url": "ssh://git@example.invalid/replace-me.git",
+      "credential_source": "env:REPLACE_ME_CREDENTIAL",
+      "host_key_policy": "pinned-known-hosts",
+      "require_atomic": true,
+      "same_repo_hidden_refs": true
+    }
+  ]
+}

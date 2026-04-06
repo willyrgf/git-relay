@@ -93,6 +93,98 @@ pub struct UpstreamConformanceRunRecord {
     pub results: Vec<UpstreamConformanceResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatrixTargetClass {
+    Managed,
+    SelfManaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatrixTargetTransport {
+    Ssh,
+    SmartHttp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostKeyPolicy {
+    PinnedKnownHosts,
+    AcceptNew,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixTargetManifest {
+    pub schema_version: u32,
+    pub targets: Vec<MatrixTargetEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixTargetEntry {
+    pub target_id: String,
+    pub product: String,
+    pub class: MatrixTargetClass,
+    pub transport: MatrixTargetTransport,
+    pub url: String,
+    pub credential_source: String,
+    pub host_key_policy: HostKeyPolicy,
+    #[serde(default)]
+    pub require_atomic: bool,
+    #[serde(default)]
+    pub same_repo_hidden_refs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixProbeResult {
+    pub target: MatrixTargetEntry,
+    pub access: UpstreamAccessProbe,
+    pub atomic_capability: AtomicCapabilityProbe,
+    pub disposable_namespace: DisposableNamespaceProbe,
+    pub supported_for_policy: bool,
+    pub same_repo_hidden_refs_supported: bool,
+    pub admission_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixProbeRunRecord {
+    pub run_id: String,
+    pub repo_id: String,
+    pub repo_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub started_at_ms: u128,
+    pub completed_at_ms: u128,
+    pub source_oid: String,
+    pub results: Vec<MatrixProbeResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamReleaseManifestEntry {
+    pub target_id: String,
+    pub product: String,
+    pub class: MatrixTargetClass,
+    pub transport: MatrixTargetTransport,
+    pub url: String,
+    pub require_atomic: bool,
+    pub same_repo_hidden_refs: bool,
+    pub admitted: bool,
+    pub evidence_path: PathBuf,
+    pub admission_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamReleaseManifest {
+    pub generated_at_ms: u128,
+    pub repo_id: String,
+    pub repo_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub probe_run_id: String,
+    pub probe_run_path: PathBuf,
+    pub all_entries_admitted: bool,
+    pub entries: Vec<UpstreamReleaseManifestEntry>,
+}
+
 #[derive(Debug, Error)]
 pub enum UpstreamProbeError {
     #[error("repository {repo_id} is {mode:?}; upstream probing is supported only for authoritative repositories")]
@@ -107,8 +199,16 @@ pub enum UpstreamProbeError {
     },
     #[error("repository {repo_id} has no exported local refs available as a probe source")]
     NoLocalProbeSource { repo_id: String },
+    #[error("target manifest {path} is invalid: {detail}", path = path.display())]
+    InvalidManifest { path: PathBuf, detail: String },
     #[error("failed to create directory {path}: {error}", path = path.display())]
     CreateDir {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("failed to read {path}: {error}", path = path.display())]
+    Read {
         path: PathBuf,
         #[source]
         error: std::io::Error,
@@ -143,18 +243,7 @@ pub fn probe_repository_upstreams(
     config: &AppConfig,
     descriptor: &RepositoryDescriptor,
 ) -> Result<UpstreamConformanceRunRecord, UpstreamProbeError> {
-    if descriptor.mode != RepositoryMode::Authoritative {
-        return Err(UpstreamProbeError::UnsupportedRepositoryMode {
-            repo_id: descriptor.repo_id.clone(),
-            mode: descriptor.mode,
-        });
-    }
-    if descriptor.lifecycle != RepositoryLifecycle::Ready {
-        return Err(UpstreamProbeError::RepositoryNotReady {
-            repo_id: descriptor.repo_id.clone(),
-            lifecycle: descriptor.lifecycle,
-        });
-    }
+    ensure_probe_ready(descriptor)?;
 
     let run_id = generate_run_id();
     let started_at_ms = current_time_ms();
@@ -187,6 +276,86 @@ pub fn probe_repository_upstreams(
     };
     persist_run_record(config, &run)?;
     Ok(run)
+}
+
+pub fn probe_matrix_targets(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+    manifest_path: &Path,
+) -> Result<MatrixProbeRunRecord, UpstreamProbeError> {
+    ensure_probe_ready(descriptor)?;
+    let manifest = load_matrix_manifest(manifest_path)?;
+
+    let run_id = generate_run_id();
+    let started_at_ms = current_time_ms();
+    let source_oid = pick_probe_source_oid(&descriptor.repo_path, &descriptor.exported_refs)?
+        .ok_or_else(|| UpstreamProbeError::NoLocalProbeSource {
+            repo_id: descriptor.repo_id.clone(),
+        })?;
+
+    let mut targets = manifest.targets;
+    targets.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+
+    let mut results = Vec::new();
+    for target in &targets {
+        results.push(probe_matrix_target(
+            &descriptor.repo_path,
+            &run_id,
+            &source_oid,
+            target,
+        )?);
+    }
+
+    let run = MatrixProbeRunRecord {
+        run_id: run_id.clone(),
+        repo_id: descriptor.repo_id.clone(),
+        repo_path: descriptor.repo_path.clone(),
+        manifest_path: manifest_path.to_path_buf(),
+        started_at_ms,
+        completed_at_ms: current_time_ms(),
+        source_oid,
+        results,
+    };
+    persist_matrix_run_record(config, &run)?;
+    Ok(run)
+}
+
+pub fn build_release_manifest(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+    manifest_path: &Path,
+) -> Result<UpstreamReleaseManifest, UpstreamProbeError> {
+    let run = probe_matrix_targets(config, descriptor, manifest_path)?;
+    let probe_run_path =
+        matrix_run_record_path(&config.paths.state_root, &run.repo_id, &run.run_id);
+    let entries = run
+        .results
+        .iter()
+        .map(|result| UpstreamReleaseManifestEntry {
+            target_id: result.target.target_id.clone(),
+            product: result.target.product.clone(),
+            class: result.target.class,
+            transport: result.target.transport,
+            url: result.target.url.clone(),
+            require_atomic: result.target.require_atomic,
+            same_repo_hidden_refs: result.target.same_repo_hidden_refs,
+            admitted: result.supported_for_policy && result.same_repo_hidden_refs_supported,
+            evidence_path: probe_run_path.clone(),
+            admission_reasons: result.admission_reasons.clone(),
+        })
+        .collect::<Vec<_>>();
+    let manifest = UpstreamReleaseManifest {
+        generated_at_ms: current_time_ms(),
+        repo_id: descriptor.repo_id.clone(),
+        repo_path: descriptor.repo_path.clone(),
+        manifest_path: manifest_path.to_path_buf(),
+        probe_run_id: run.run_id.clone(),
+        probe_run_path,
+        all_entries_admitted: entries.iter().all(|entry| entry.admitted),
+        entries,
+    };
+    persist_release_manifest(config, &manifest)?;
+    Ok(manifest)
 }
 
 pub fn probe_atomic_capability(
@@ -222,6 +391,129 @@ pub fn probe_atomic_capability(
         AtomicCapabilityVerdict::Inconclusive
     };
     Ok((verdict, Some(classification), Some(detail)))
+}
+
+fn ensure_probe_ready(descriptor: &RepositoryDescriptor) -> Result<(), UpstreamProbeError> {
+    if descriptor.mode != RepositoryMode::Authoritative {
+        return Err(UpstreamProbeError::UnsupportedRepositoryMode {
+            repo_id: descriptor.repo_id.clone(),
+            mode: descriptor.mode,
+        });
+    }
+    if descriptor.lifecycle != RepositoryLifecycle::Ready {
+        return Err(UpstreamProbeError::RepositoryNotReady {
+            repo_id: descriptor.repo_id.clone(),
+            lifecycle: descriptor.lifecycle,
+        });
+    }
+    Ok(())
+}
+
+fn load_matrix_manifest(path: &Path) -> Result<MatrixTargetManifest, UpstreamProbeError> {
+    let source = fs::read_to_string(path).map_err(|error| UpstreamProbeError::Read {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let manifest = serde_json::from_str::<MatrixTargetManifest>(&source).map_err(|error| {
+        UpstreamProbeError::ParseJson {
+            path: path.to_path_buf(),
+            error,
+        }
+    })?;
+    validate_matrix_manifest(path, &manifest)?;
+    Ok(manifest)
+}
+
+fn validate_matrix_manifest(
+    path: &Path,
+    manifest: &MatrixTargetManifest,
+) -> Result<(), UpstreamProbeError> {
+    if manifest.schema_version != 1 {
+        return Err(UpstreamProbeError::InvalidManifest {
+            path: path.to_path_buf(),
+            detail: format!(
+                "unsupported schema_version {}; expected 1",
+                manifest.schema_version
+            ),
+        });
+    }
+    if manifest.targets.is_empty() {
+        return Err(UpstreamProbeError::InvalidManifest {
+            path: path.to_path_buf(),
+            detail: "target manifest must contain at least one target".to_owned(),
+        });
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for target in &manifest.targets {
+        if target.target_id.trim().is_empty() {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: "target_id must not be empty".to_owned(),
+            });
+        }
+        if !seen.insert(target.target_id.clone()) {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: format!("duplicate target_id {}", target.target_id),
+            });
+        }
+        if target.product.trim().is_empty() {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: format!("target {} product must not be empty", target.target_id),
+            });
+        }
+        if target.url.trim().is_empty() {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: format!("target {} url must not be empty", target.target_id),
+            });
+        }
+        if target.credential_source.trim().is_empty() {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "target {} credential_source must not be empty",
+                    target.target_id
+                ),
+            });
+        }
+        if target.same_repo_hidden_refs && target.class != MatrixTargetClass::SelfManaged {
+            return Err(UpstreamProbeError::InvalidManifest {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "target {} declares same_repo_hidden_refs but is not self-managed",
+                    target.target_id
+                ),
+            });
+        }
+        match (target.transport, target.host_key_policy) {
+            (MatrixTargetTransport::SmartHttp, HostKeyPolicy::NotApplicable)
+            | (MatrixTargetTransport::Ssh, HostKeyPolicy::PinnedKnownHosts)
+            | (MatrixTargetTransport::Ssh, HostKeyPolicy::AcceptNew) => {}
+            (MatrixTargetTransport::SmartHttp, _) => {
+                return Err(UpstreamProbeError::InvalidManifest {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "target {} uses smart-http and must set host_key_policy=not-applicable",
+                        target.target_id
+                    ),
+                });
+            }
+            (MatrixTargetTransport::Ssh, HostKeyPolicy::NotApplicable) => {
+                return Err(UpstreamProbeError::InvalidManifest {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "target {} uses ssh and must set an SSH host-key policy",
+                        target.target_id
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn probe_one_upstream(
@@ -279,6 +571,93 @@ fn probe_one_upstream(
         atomic_capability,
         disposable_namespace,
         supported_for_policy,
+    })
+}
+
+fn probe_matrix_target(
+    repo_path: &Path,
+    run_id: &str,
+    source_oid: &str,
+    target: &MatrixTargetEntry,
+) -> Result<MatrixProbeResult, UpstreamProbeError> {
+    let write_upstream = WriteUpstream {
+        name: target.target_id.clone(),
+        url: target.url.clone(),
+        auth_profile: target.credential_source.clone(),
+        require_atomic: target.require_atomic,
+    };
+    let probe_refs = disposable_probe_refs(run_id, &target.target_id);
+    let multi_refspecs = vec![
+        format!("{source_oid}:{}", probe_refs.branch_ref),
+        format!("{source_oid}:{}", probe_refs.tag_ref),
+    ];
+
+    let access = probe_access(&write_upstream, repo_path)?;
+    let (atomic_capability, disposable_namespace) = if access.verdict
+        == UpstreamAccessVerdict::Accessible
+    {
+        let (atomic_verdict, atomic_classification, atomic_detail) =
+            probe_atomic_capability(repo_path, &target.url, &multi_refspecs)?;
+        (
+            AtomicCapabilityProbe {
+                verdict: atomic_verdict,
+                error_classification: atomic_classification,
+                detail: atomic_detail,
+            },
+            probe_disposable_namespace(repo_path, &write_upstream, &probe_refs, &multi_refspecs)?,
+        )
+    } else {
+        (
+            AtomicCapabilityProbe {
+                verdict: AtomicCapabilityVerdict::Inconclusive,
+                error_classification: access.error_classification,
+                detail: access.detail.clone(),
+            },
+            DisposableNamespaceProbe {
+                verdict: DisposableNamespaceVerdict::NotAttempted,
+                branch_ref: probe_refs.branch_ref,
+                tag_ref: probe_refs.tag_ref,
+                error_classification: access.error_classification,
+                detail: access.detail.clone(),
+            },
+        )
+    };
+
+    let mut admission_reasons = Vec::new();
+    if access.verdict != UpstreamAccessVerdict::Accessible {
+        admission_reasons.push(format!(
+            "access verdict {}",
+            serialize_label(&access.verdict)
+        ));
+    }
+    if target.require_atomic && atomic_capability.verdict != AtomicCapabilityVerdict::Supported {
+        admission_reasons.push(format!(
+            "atomic capability {}",
+            serialize_label(&atomic_capability.verdict)
+        ));
+    }
+    if disposable_namespace.verdict != DisposableNamespaceVerdict::Supported {
+        admission_reasons.push(format!(
+            "disposable namespace {}",
+            serialize_label(&disposable_namespace.verdict)
+        ));
+    }
+
+    let same_repo_hidden_refs_supported =
+        !target.same_repo_hidden_refs || target.class == MatrixTargetClass::SelfManaged;
+    if target.same_repo_hidden_refs && !same_repo_hidden_refs_supported {
+        admission_reasons.push("same-repo hidden refs require a self-managed target".to_owned());
+    }
+
+    let supported_for_policy = admission_reasons.is_empty();
+    Ok(MatrixProbeResult {
+        target: target.clone(),
+        access,
+        atomic_capability,
+        disposable_namespace,
+        supported_for_policy,
+        same_repo_hidden_refs_supported,
+        admission_reasons,
     })
 }
 
@@ -502,6 +881,30 @@ fn persist_run_record(
     write_json(&path, run)
 }
 
+fn persist_matrix_run_record(
+    config: &AppConfig,
+    run: &MatrixProbeRunRecord,
+) -> Result<(), UpstreamProbeError> {
+    let path = matrix_run_record_path(&config.paths.state_root, &run.repo_id, &run.run_id);
+    write_json(&path, run)
+}
+
+fn persist_release_manifest(
+    config: &AppConfig,
+    manifest: &UpstreamReleaseManifest,
+) -> Result<(), UpstreamProbeError> {
+    let path = release_manifest_path(
+        &config.paths.state_root,
+        &manifest.repo_id,
+        &manifest.probe_run_id,
+    );
+    write_json(&path, manifest)?;
+    write_json(
+        &release_manifest_latest_path(&config.paths.state_root, &manifest.repo_id),
+        manifest,
+    )
+}
+
 fn run_git(
     repo_path: Option<&Path>,
     args: &[String],
@@ -674,6 +1077,37 @@ fn run_record_path(state_root: &Path, repo_id: &str, run_id: &str) -> PathBuf {
         .join("runs")
         .join(sanitize_component(repo_id))
         .join(format!("{run_id}.json"))
+}
+
+fn matrix_run_record_path(state_root: &Path, repo_id: &str, run_id: &str) -> PathBuf {
+    state_root
+        .join("upstream-probes")
+        .join("matrix-runs")
+        .join(sanitize_component(repo_id))
+        .join(format!("{run_id}.json"))
+}
+
+fn release_manifest_path(state_root: &Path, repo_id: &str, run_id: &str) -> PathBuf {
+    state_root
+        .join("upstream-probes")
+        .join("release-manifests")
+        .join(sanitize_component(repo_id))
+        .join(format!("{run_id}.json"))
+}
+
+fn release_manifest_latest_path(state_root: &Path, repo_id: &str) -> PathBuf {
+    state_root
+        .join("upstream-probes")
+        .join("release-manifests")
+        .join(sanitize_component(repo_id))
+        .join("latest.json")
+}
+
+fn serialize_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), UpstreamProbeError> {

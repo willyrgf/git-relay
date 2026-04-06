@@ -18,7 +18,9 @@ use crate::reconcile::{
     load_divergence_markers, reconcile_repository, replication_status_for_repo, DivergenceMarker,
     ReconcileError, ReplicationStatus,
 };
-use crate::upstream::{probe_repository_upstreams, UpstreamProbeError};
+use crate::upstream::{
+    build_release_manifest, probe_matrix_targets, probe_repository_upstreams, UpstreamProbeError,
+};
 use crate::validator::{ValidationInfrastructureError, ValidationReport, Validator};
 
 #[derive(Debug, Parser)]
@@ -73,6 +75,8 @@ struct ReadCommand {
 
 #[derive(Debug, Subcommand)]
 enum ReplicationSubcommand {
+    BuildReleaseManifest(MatrixTargetOptions),
+    ProbeMatrix(MatrixTargetOptions),
     ProbeUpstreams(TargetOptions),
     Reconcile(TargetOptions),
     Status(TargetOptions),
@@ -118,6 +122,18 @@ struct RenderServiceOptions {
     format: ServiceFormat,
     #[arg(long)]
     binary_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct MatrixTargetOptions {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    targets: std::path::PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -184,6 +200,10 @@ where
             ReadSubcommand::Prepare(options) => run_read_prepare(options),
         },
         TopLevelCommand::Replication(command) => match command.command {
+            ReplicationSubcommand::BuildReleaseManifest(options) => {
+                run_replication_build_release_manifest(options)
+            }
+            ReplicationSubcommand::ProbeMatrix(options) => run_replication_probe_matrix(options),
             ReplicationSubcommand::ProbeUpstreams(options) => {
                 run_replication_probe_upstreams(options)
             }
@@ -268,6 +288,35 @@ fn run_replication_probe_upstreams(options: TargetOptions) -> Result<ExitCode, C
         .collect::<Result<Vec<_>, _>>()?;
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_replication_probe_matrix(options: MatrixTargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let target = select_repositories(descriptors, Some(&options.repo))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::RepositoryNotFound(options.repo.clone()))?;
+    let report = probe_matrix_targets(&config, &target, &options.targets)?;
+    emit_output(&report, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_replication_build_release_manifest(
+    options: MatrixTargetOptions,
+) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let target = select_repositories(descriptors, Some(&options.repo))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::RepositoryNotFound(options.repo.clone()))?;
+    let manifest = build_release_manifest(&config, &target, &options.targets)?;
+    let all_entries_admitted = manifest.all_entries_admitted;
+    emit_output(&manifest, options.json)?;
+    if all_entries_admitted {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
 
 fn run_replication_status(options: TargetOptions) -> Result<ExitCode, CliError> {
