@@ -197,6 +197,54 @@ require_atomic = true
     path
 }
 
+fn write_authoritative_descriptor_with_custom_read_upstream(
+    temp: &TempDir,
+    repo_path: &Path,
+    read_upstream_url: Option<&str>,
+) -> PathBuf {
+    let mut descriptor = format!(
+        r#"
+repo_id = "github.com/example/repo.git"
+canonical_identity = "github.com/example/repo.git"
+repo_path = "{}"
+mode = "authoritative"
+lifecycle = "ready"
+authority_model = "relay-authoritative"
+tracking_refs = "same-repo-hidden"
+refresh = "authoritative-local"
+push_ack = "local-commit"
+reconcile_policy = "on-push+manual"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
+"#,
+        repo_path.display()
+    );
+    if let Some(read_upstream_url) = read_upstream_url {
+        descriptor.push_str(&format!(
+            r#"
+
+[[read_upstreams]]
+name = "github-read"
+url = "{read_upstream_url}"
+auth_profile = "github-read"
+"#
+        ));
+    }
+    descriptor.push_str(
+        r#"
+
+[[write_upstreams]]
+name = "github-write"
+url = "ssh://git@github.com/example/repo.git"
+auth_profile = "github-write"
+require_atomic = true
+"#,
+    );
+
+    let path = temp.path().join("repos.d").join("repo.toml");
+    fs::write(&path, descriptor).expect("descriptor");
+    path
+}
+
 fn write_authoritative_descriptor_with_write_upstreams(
     temp: &TempDir,
     repo_path: &Path,
@@ -232,6 +280,38 @@ require_atomic = {require_atomic}
     }
 
     let path = temp.path().join("repos.d").join("repo.toml");
+    fs::write(&path, descriptor).expect("descriptor");
+    path
+}
+
+fn write_cache_only_descriptor(
+    temp: &TempDir,
+    repo_path: &Path,
+    refresh: &str,
+    read_upstream_url: &str,
+) -> PathBuf {
+    let descriptor = format!(
+        r#"
+repo_id = "github.com/example/cache.git"
+canonical_identity = "github.com/example/cache.git"
+repo_path = "{}"
+mode = "cache-only"
+lifecycle = "ready"
+authority_model = "upstream-source"
+tracking_refs = "same-repo-hidden"
+refresh = "{refresh}"
+push_ack = "local-commit"
+reconcile_policy = "on-push+manual"
+exported_refs = ["refs/heads/*", "refs/tags/*"]
+
+[[read_upstreams]]
+name = "github-read"
+url = "{read_upstream_url}"
+auth_profile = "github-read"
+"#,
+        repo_path.display()
+    );
+    let path = temp.path().join("repos.d").join("cache.toml");
     fs::write(&path, descriptor).expect("descriptor");
     path
 }
@@ -402,6 +482,12 @@ fn assert_no_probe_refs(repo_path: &Path) {
     );
 }
 
+fn parse_single_report(output: &[u8]) -> Value {
+    let reports = serde_json::from_slice::<Vec<Value>>(output).expect("json reports");
+    assert_eq!(reports.len(), 1, "expected exactly one report");
+    reports.into_iter().next().expect("one report")
+}
+
 #[test]
 fn repo_validate_returns_json_for_valid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
@@ -524,6 +610,208 @@ fn ssh_force_command_accepts_only_git_pack_services_under_repo_root() {
             repo_path.to_str().expect("repo path"),
         ))
         .stdout(predicate::str::contains("\"repo_mode\": \"authoritative\""));
+}
+
+#[test]
+fn authoritative_upload_pack_serves_local_refs_without_read_upstream_refresh() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    let missing_read_upstream = temp.path().join("missing-read-upstream.git");
+    write_authoritative_descriptor_with_custom_read_upstream(
+        &temp,
+        &repo_path,
+        Some(missing_read_upstream.to_str().expect("path")),
+    );
+
+    let work_repo = temp.path().join("work-authoritative-read");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let fake_ssh = write_fake_ssh_command(&temp, &config_path);
+    let output = StdCommand::new("git")
+        .env("GIT_SSH", &fake_ssh)
+        .args(["ls-remote", "relay:repo.git", "refs/heads/main"])
+        .output()
+        .expect("git ls-remote");
+    assert!(
+        output.status.success(),
+        "authoritative upload-pack should succeed without consulting the broken read upstream"
+    );
+
+    let local_main = read_git_ref(&repo_path, "refs/heads/main");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&local_main),
+        "ls-remote should advertise the locally accepted authoritative ref"
+    );
+}
+
+#[test]
+fn cache_only_upload_pack_refreshes_before_serving_refs() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+
+    let upstream_path = temp.path().join("upstream-read.git");
+    init_bare_repo(&upstream_path);
+    let upstream_work = temp.path().join("work-upstream-read");
+    init_work_repo(&upstream_work);
+    commit_file(&upstream_work, "README.md", "upstream\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            upstream_work.to_str().expect("work repo"),
+            "push",
+            upstream_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("upstream push success");
+
+    let cache_repo = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&cache_repo);
+    write_cache_only_descriptor(
+        &temp,
+        &cache_repo,
+        "always-refresh",
+        upstream_path.to_str().expect("path"),
+    );
+
+    let fake_ssh = write_fake_ssh_command(&temp, &config_path);
+    let output = StdCommand::new("git")
+        .env("GIT_SSH", &fake_ssh)
+        .args(["ls-remote", "relay:cache.git", "refs/heads/main"])
+        .output()
+        .expect("git ls-remote");
+    assert!(output.status.success(), "git ls-remote should succeed");
+
+    let upstream_main = read_git_ref(&upstream_path, "refs/heads/main");
+    let cache_main = read_git_ref(&cache_repo, "refs/heads/main");
+    assert_eq!(cache_main, upstream_main);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&upstream_main),
+        "ls-remote should advertise the refreshed cache ref"
+    );
+}
+
+#[test]
+fn read_prepare_serves_stale_under_explicit_policy_and_negative_cache() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+
+    let upstream_path = temp.path().join("upstream-stale.git");
+    init_bare_repo(&upstream_path);
+    let upstream_work = temp.path().join("work-upstream-stale");
+    init_work_repo(&upstream_work);
+    commit_file(&upstream_work, "README.md", "upstream\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            upstream_work.to_str().expect("work repo"),
+            "push",
+            upstream_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("upstream push success");
+
+    let cache_repo = temp.path().join("repos").join("cache.git");
+    init_bare_repo(&cache_repo);
+    write_cache_only_descriptor(
+        &temp,
+        &cache_repo,
+        "stale-if-error",
+        upstream_path.to_str().expect("path"),
+    );
+
+    let first = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_report = parse_single_report(&first);
+    assert_eq!(first_report["action"], "refreshed");
+    assert_eq!(first_report["negative_cache_hit"], false);
+
+    let cached_main = read_git_ref(&cache_repo, "refs/heads/main");
+    let moved_upstream = temp.path().join("upstream-stale-moved.git");
+    fs::rename(&upstream_path, &moved_upstream).expect("move upstream away");
+
+    let second = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_report = parse_single_report(&second);
+    assert_eq!(second_report["action"], "served_stale");
+    assert_eq!(second_report["negative_cache_hit"], false);
+    assert_eq!(read_git_ref(&cache_repo, "refs/heads/main"), cached_main);
+
+    let third = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "read",
+            "prepare",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/cache.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let third_report = parse_single_report(&third);
+    assert_eq!(third_report["action"], "served_stale");
+    assert_eq!(third_report["negative_cache_hit"], true);
+    assert_eq!(read_git_ref(&cache_repo, "refs/heads/main"), cached_main);
 }
 
 #[test]

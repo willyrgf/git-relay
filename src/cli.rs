@@ -12,6 +12,7 @@ use crate::deploy::{
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
 use crate::platform::RealPlatformProbe;
+use crate::read_path::{operator_prepare_repository_for_read, ReadPathError};
 use crate::reconcile::{
     load_divergence_markers, reconcile_repository, replication_status_for_repo, ReconcileError,
 };
@@ -31,6 +32,7 @@ enum TopLevelCommand {
     Deploy(DeployCommand),
     #[command(hide = true)]
     HookDispatch(HookDispatchCommand),
+    Read(ReadCommand),
     Replication(ReplicationCommand),
     Repo(RepoCommand),
     Startup(StartupCommand),
@@ -60,11 +62,22 @@ struct ReplicationCommand {
     command: ReplicationSubcommand,
 }
 
+#[derive(Debug, Args)]
+struct ReadCommand {
+    #[command(subcommand)]
+    command: ReadSubcommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum ReplicationSubcommand {
     ProbeUpstreams(TargetOptions),
     Reconcile(TargetOptions),
     Status(TargetOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum ReadSubcommand {
+    Prepare(TargetOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,6 +139,8 @@ pub enum CliError {
     #[error(transparent)]
     UpstreamProbe(#[from] UpstreamProbeError),
     #[error(transparent)]
+    ReadPath(#[from] ReadPathError),
+    #[error(transparent)]
     ValidationInfrastructure(#[from] ValidationInfrastructureError),
     #[error("repository {0} was not found in the descriptor set")]
     RepositoryNotFound(String),
@@ -145,6 +160,9 @@ where
             DeploySubcommand::RenderService(options) => run_deploy_render_service(options),
         },
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
+        TopLevelCommand::Read(command) => match command.command {
+            ReadSubcommand::Prepare(options) => run_read_prepare(options),
+        },
         TopLevelCommand::Replication(command) => match command.command {
             ReplicationSubcommand::ProbeUpstreams(options) => {
                 run_replication_probe_upstreams(options)
@@ -237,6 +255,17 @@ fn run_replication_status(options: TargetOptions) -> Result<ExitCode, CliError> 
     let reports = targets
         .iter()
         .map(|descriptor| replication_status_for_repo(&config, descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_output(&reports, options.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_read_prepare(options: TargetOptions) -> Result<ExitCode, CliError> {
+    let (config, descriptors) = load_config_and_descriptors(&options.config)?;
+    let targets = select_repositories(descriptors, options.repo.as_deref())?;
+    let reports = targets
+        .iter()
+        .map(|descriptor| operator_prepare_repository_for_read(&config, descriptor))
         .collect::<Result<Vec<_>, _>>()?;
     emit_output(&reports, options.json)?;
     Ok(ExitCode::SUCCESS)

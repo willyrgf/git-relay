@@ -5,9 +5,11 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use git_relay::config::AppConfig;
 use git_relay::crash::{self, CrashCheckpoint};
 use git_relay::git::SystemGitExecutor;
 use git_relay::platform::RealPlatformProbe;
+use git_relay::read_path::prepare_repository_for_read;
 use git_relay::ssh_wrapper::{resolve_and_authorize_ssh_command, AuthorizedSshCommand};
 
 #[cfg(unix)]
@@ -48,6 +50,10 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if cli.check_only {
         println!("{}", serde_json::to_string_pretty(&resolved)?);
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if resolved.service == "git-upload-pack" {
+        prepare_read_path(&cli.config, &resolved)?;
     }
 
     #[cfg(unix)]
@@ -117,6 +123,25 @@ fn build_command(resolved: &AuthorizedSshCommand) -> Command {
         command.env(PUSH_ID_ENV, generate_session_id("push"));
     }
     command
+}
+
+fn prepare_read_path(
+    config_path: &std::path::Path,
+    resolved: &AuthorizedSshCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let descriptors = config.load_repository_descriptors()?;
+    let descriptor = descriptors
+        .iter()
+        .find(|descriptor| descriptor.repo_id == resolved.repo_id)
+        .ok_or_else(|| {
+            format!(
+                "repository {} disappeared from the descriptor set before read preparation",
+                resolved.repo_id
+            )
+        })?;
+    let _ = prepare_repository_for_read(&config, descriptor)?;
+    Ok(())
 }
 
 #[cfg(unix)]

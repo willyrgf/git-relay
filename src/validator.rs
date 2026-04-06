@@ -5,8 +5,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::{
-    AppConfig, AuthorityModel, GitOnlyCommandMode, GitService, PushAckPolicy, ReconcilePolicy,
-    RepositoryDescriptor, RepositoryLifecycle, RepositoryMode, TrackingRefPlacement,
+    AppConfig, AuthorityModel, FreshnessPolicy, GitOnlyCommandMode, GitService, PushAckPolicy,
+    ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode,
+    TrackingRefPlacement,
 };
 use crate::git::{GitCommandError, GitExecutor};
 use crate::platform::{PlatformProbe, PlatformProbeError};
@@ -36,8 +37,13 @@ where
         self.validate_descriptor_shape(config, descriptor, &mut issues)?;
         self.validate_deployment_contract(config, descriptor, &mut issues)?;
 
-        if descriptor.mode == RepositoryMode::Authoritative {
-            self.validate_authoritative_repository(config, descriptor, &mut issues)?;
+        match descriptor.mode {
+            RepositoryMode::Authoritative => {
+                self.validate_authoritative_repository(config, descriptor, &mut issues)?;
+            }
+            RepositoryMode::CacheOnly => {
+                self.validate_cache_only_repository(descriptor, &mut issues)?;
+            }
         }
 
         let passed = issues.is_empty();
@@ -115,6 +121,36 @@ where
                 "reconcile_policy",
                 "only on-push+manual reconciliation is supported",
             ));
+        }
+        match descriptor.mode {
+            RepositoryMode::Authoritative => {
+                if descriptor.refresh != FreshnessPolicy::AuthoritativeLocal {
+                    issues.push(ValidationIssue::new(
+                        "refresh",
+                        "authoritative repositories must use authoritative-local freshness",
+                    ));
+                }
+            }
+            RepositoryMode::CacheOnly => {
+                if descriptor.refresh == FreshnessPolicy::AuthoritativeLocal {
+                    issues.push(ValidationIssue::new(
+                        "refresh",
+                        "cache-only repositories cannot use authoritative-local freshness",
+                    ));
+                }
+                if descriptor.read_upstreams.is_empty() {
+                    issues.push(ValidationIssue::new(
+                        "read_upstreams",
+                        "cache-only repositories require at least one read upstream",
+                    ));
+                }
+                if !descriptor.write_upstreams.is_empty() {
+                    issues.push(ValidationIssue::new(
+                        "write_upstreams",
+                        "cache-only repositories must not define write upstreams",
+                    ));
+                }
+            }
         }
 
         if !config.reconcile.on_push
@@ -241,25 +277,25 @@ where
             ));
         }
 
-        if descriptor.mode == RepositoryMode::Authoritative {
-            let state_root_filesystem = self
-                .platform
-                .filesystem_type(&config.paths.state_root)
-                .map_err(ValidationInfrastructureError::Platform)?;
-            if !config
-                .deployment
-                .supported_filesystems
-                .iter()
-                .any(|expected| expected == &state_root_filesystem)
-            {
-                issues.push(ValidationIssue::new(
-                    "paths.state_root",
-                    format!(
-                        "state root filesystem {state_root_filesystem} is not in the supported deployment profile"
-                    ),
-                ));
-            }
+        let state_root_filesystem = self
+            .platform
+            .filesystem_type(&config.paths.state_root)
+            .map_err(ValidationInfrastructureError::Platform)?;
+        if !config
+            .deployment
+            .supported_filesystems
+            .iter()
+            .any(|expected| expected == &state_root_filesystem)
+        {
+            issues.push(ValidationIssue::new(
+                "paths.state_root",
+                format!(
+                    "state root filesystem {state_root_filesystem} is not in the supported deployment profile"
+                ),
+            ));
+        }
 
+        if descriptor.repo_path.exists() {
             let repo_filesystem = self
                 .platform
                 .filesystem_type(&descriptor.repo_path)
@@ -355,6 +391,29 @@ where
         )?;
         self.require_git_config(&descriptor.repo_path, "core.fsync", "all", issues)?;
         self.require_git_config(&descriptor.repo_path, "core.fsyncMethod", "fsync", issues)?;
+
+        Ok(())
+    }
+
+    fn validate_cache_only_repository(
+        &self,
+        descriptor: &RepositoryDescriptor,
+        issues: &mut Vec<ValidationIssue>,
+    ) -> Result<(), ValidationInfrastructureError> {
+        if !descriptor.repo_path.exists() {
+            issues.push(ValidationIssue::new(
+                "repo_path",
+                "cache-only repositories must already exist on disk before entering ready",
+            ));
+            return Ok(());
+        }
+
+        if !self.is_bare_repository(&descriptor.repo_path)? {
+            issues.push(ValidationIssue::new(
+                "repo_path",
+                "cache-only repository path must point to a bare Git repository",
+            ));
+        }
 
         Ok(())
     }

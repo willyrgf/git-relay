@@ -95,34 +95,22 @@ where
     }
 
     match resolved.service.as_str() {
-        "git-upload-pack" => Ok(AuthorizedSshCommand {
-            service: resolved.service,
-            repo_id: descriptor.repo_id.clone(),
-            repo_mode: descriptor.mode,
-            repo_path: descriptor.repo_path.clone(),
-        }),
+        "git-upload-pack" => {
+            validate_repository_for_ssh(config, descriptor, git, platform)?;
+            Ok(AuthorizedSshCommand {
+                service: resolved.service,
+                repo_id: descriptor.repo_id.clone(),
+                repo_mode: descriptor.mode,
+                repo_path: descriptor.repo_path.clone(),
+            })
+        }
         "git-receive-pack" => {
             if descriptor.mode != RepositoryMode::Authoritative {
                 return Err(SshAuthorizationError::WritesRequireAuthoritative {
                     repo_id: descriptor.repo_id.clone(),
                 });
             }
-            let validator = Validator::new(git, platform);
-            let validation = validator
-                .validate(config, descriptor)
-                .map_err(SshAuthorizationError::ValidationInfra)?;
-            if !validation.passed() {
-                let details = validation
-                    .issues
-                    .iter()
-                    .map(|issue| issue.message.clone())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(SshAuthorizationError::ValidationFailed {
-                    repo_id: descriptor.repo_id.clone(),
-                    details,
-                });
-            }
+            validate_repository_for_ssh(config, descriptor, git, platform)?;
             let divergence_markers = load_divergence_markers(&descriptor.repo_path)
                 .map_err(SshAuthorizationError::ReconcileState)?;
             if !divergence_markers.is_empty() {
@@ -145,6 +133,36 @@ where
             })
         }
         other => Err(SshAuthorizationError::UnsupportedService(other.to_owned())),
+    }
+}
+
+fn validate_repository_for_ssh<G, P>(
+    config: &AppConfig,
+    descriptor: &RepositoryDescriptor,
+    git: &G,
+    platform: &P,
+) -> Result<(), SshAuthorizationError>
+where
+    G: GitExecutor,
+    P: PlatformProbe,
+{
+    let validator = Validator::new(git, platform);
+    let validation = validator
+        .validate(config, descriptor)
+        .map_err(SshAuthorizationError::ValidationInfra)?;
+    if validation.passed() {
+        Ok(())
+    } else {
+        let details = validation
+            .issues
+            .iter()
+            .map(|issue| issue.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(SshAuthorizationError::ValidationFailed {
+            repo_id: descriptor.repo_id.clone(),
+            details,
+        })
     }
 }
 
@@ -250,9 +268,10 @@ mod tests {
     use crate::config::{
         AppConfig, AuthProfile, AuthProfileKind, AuthorityModel, DeploymentProfile,
         FreshnessPolicy, GitOnlyCommandMode, GitService, ListenConfig, MigrationConfig,
-        MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReconcileConfig,
-        ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle, RepositoryMode, ServiceManager,
-        SupportedPlatform, TargetedRelockMode, TrackingRefPlacement, WorkerMode, WriteUpstream,
+        MigrationTransport, PathsConfig, PolicyConfig, PushAckPolicy, ReadUpstream,
+        ReconcileConfig, ReconcilePolicy, RepositoryDescriptor, RepositoryLifecycle,
+        RepositoryMode, ServiceManager, SupportedPlatform, TargetedRelockMode,
+        TrackingRefPlacement, WorkerMode, WriteUpstream,
     };
     use crate::git::SystemGitExecutor;
     use crate::platform::PlatformProbe;
@@ -333,13 +352,22 @@ mod tests {
                 allowed_git_services: vec![GitService::GitUploadPack, GitService::GitReceivePack],
                 supported_filesystems: vec!["apfs".to_owned()],
             },
-            auth_profiles: BTreeMap::from([(
-                "github-write".to_owned(),
-                AuthProfile {
-                    kind: AuthProfileKind::SshKey,
-                    secret_ref: "env:GITHUB_WRITE_KEY".to_owned(),
-                },
-            )]),
+            auth_profiles: BTreeMap::from([
+                (
+                    "github-read".to_owned(),
+                    AuthProfile {
+                        kind: AuthProfileKind::HttpsToken,
+                        secret_ref: "env:GITHUB_READ_TOKEN".to_owned(),
+                    },
+                ),
+                (
+                    "github-write".to_owned(),
+                    AuthProfile {
+                        kind: AuthProfileKind::SshKey,
+                        secret_ref: "env:GITHUB_WRITE_KEY".to_owned(),
+                    },
+                ),
+            ]),
         }
     }
 
@@ -379,7 +407,11 @@ mod tests {
             push_ack: PushAckPolicy::LocalCommit,
             reconcile_policy: ReconcilePolicy::OnPushManual,
             exported_refs: vec!["refs/heads/*".to_owned()],
-            read_upstreams: Vec::new(),
+            read_upstreams: vec![ReadUpstream {
+                name: "github-read".to_owned(),
+                url: "https://github.com/example/cache.git".to_owned(),
+                auth_profile: "github-read".to_owned(),
+            }],
             write_upstreams: Vec::new(),
         }
     }
@@ -504,5 +536,31 @@ mod tests {
         .expect("authorize receive-pack");
         assert_eq!(authorized.repo_mode, RepositoryMode::Authoritative);
         assert_eq!(authorized.repo_id, "github.com/example/repo.git");
+    }
+
+    #[test]
+    fn authorize_upload_pack_allows_valid_cache_only_repo() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = base_config(&temp);
+        let repo = temp.path().join("repos").join("cache.git");
+        std::fs::create_dir_all(temp.path().join("repos")).expect("repo root");
+        init_bare_repo(&repo);
+
+        let resolved = resolve_ssh_command(&config.paths.repo_root, "git-upload-pack cache.git")
+            .expect("resolve");
+        let git = SystemGitExecutor;
+        let platform = FakePlatformProbe {
+            filesystem: "apfs".to_owned(),
+        };
+        let authorized = authorize_ssh_command(
+            &config,
+            &[cache_only_descriptor(&repo)],
+            resolved,
+            &git,
+            &platform,
+        )
+        .expect("authorize upload-pack");
+        assert_eq!(authorized.repo_mode, RepositoryMode::CacheOnly);
+        assert_eq!(authorized.repo_id, "github.com/example/cache.git");
     }
 }

@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod git;
 pub mod hooks;
 pub mod platform;
+pub mod read_path;
 pub mod reconcile;
 pub mod ssh_wrapper;
 pub mod upstream;
