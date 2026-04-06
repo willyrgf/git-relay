@@ -443,6 +443,323 @@ fn write_fake_ssh_command(temp: &TempDir, config_path: &Path) -> PathBuf {
     script
 }
 
+fn write_flake_project_fixture(temp: &TempDir, dir_name: &str, flake: &str, lock: &str) -> PathBuf {
+    let project = temp.path().join(dir_name);
+    init_work_repo(&project);
+    fs::write(project.join("flake.nix"), flake).expect("write flake.nix");
+    fs::write(project.join("flake.lock"), lock).expect("write flake.lock");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            project.to_str().expect("project"),
+            "add",
+            "flake.nix",
+            "flake.lock",
+        ])
+        .status()
+        .expect("git add")
+        .success()
+        .then_some(())
+        .expect("git add success");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            project.to_str().expect("project"),
+            "commit",
+            "-m",
+            "fixture",
+        ])
+        .status()
+        .expect("git commit")
+        .success()
+        .then_some(())
+        .expect("git commit success");
+    project
+}
+
+fn write_fake_nix_command(
+    temp: &TempDir,
+    script_name: &str,
+    version: &str,
+    first_lock: &Path,
+    second_lock: Option<&Path>,
+) -> (PathBuf, PathBuf) {
+    let script = temp.path().join(script_name);
+    let log_path = temp.path().join(format!("{script_name}.log"));
+    let counter_path = temp.path().join(format!("{script_name}.count"));
+    let second_lock = second_lock.unwrap_or(first_lock);
+    let source = format!(
+        "#!/bin/sh\nset -eu\nlog_path={log_path}\ncounter_path={counter_path}\nfirst_lock={first_lock}\nsecond_lock={second_lock}\nprintf '%s\\n' \"$*\" >> \"$log_path\"\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' {version}\n  exit 0\nfi\nif [ \"$#\" -eq 3 ] && [ \"$1\" = \"flake\" ] && [ \"$2\" = \"update\" ]; then\n  count=0\n  if [ -f \"$counter_path\" ]; then\n    count=$(cat \"$counter_path\")\n  fi\n  count=$((count + 1))\n  printf '%s' \"$count\" > \"$counter_path\"\n  if [ \"$count\" -eq 1 ]; then\n    cp \"$first_lock\" \"$PWD/flake.lock\"\n  else\n    cp \"$second_lock\" \"$PWD/flake.lock\"\n  fi\n  exit 0\nfi\necho \"unexpected fake nix invocation: $*\" >&2\nexit 1\n",
+        log_path = shell_quote(&log_path),
+        counter_path = shell_quote(&counter_path),
+        first_lock = shell_quote(first_lock),
+        second_lock = shell_quote(second_lock),
+        version = shell_quote(Path::new(version)),
+    );
+    fs::write(&script, source).expect("write fake nix");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&script)
+            .expect("fake nix metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("fake nix chmod");
+    }
+    (script, log_path)
+}
+
+fn migration_flake_source() -> &'static str {
+    r#"
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.overlay.url = "git+https://example.com/overlay";
+
+  outputs = { self, nixpkgs, overlay }: { };
+}
+"#
+}
+
+fn migration_lock_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "github",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "oldrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "ref": "nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
+fn migration_lock_after_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
+        "rev": "newrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
+fn migration_lock_scope_violation_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
+        "rev": "newrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev-violated"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
+fn migration_lock_non_idempotent_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
+        "rev": "newrev-second"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
 fn package_example_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("packaging")
@@ -2041,5 +2358,334 @@ fn hooked_bare_repo_accepts_branch_create_and_rejects_delete_hidden_ref_and_forc
     assert!(
         !force_status.success(),
         "non-fast-forward force push should fail closed"
+    );
+}
+
+#[test]
+fn migration_inspect_reports_rewrite_plan_and_unresolved_transitive_shorthand() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-inspect",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "migration",
+            "inspect",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("migration inspect json");
+
+    let planned = report["planned_rewrites"]
+        .as_array()
+        .expect("planned rewrites");
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0]["input_name"], "nixpkgs");
+    assert_eq!(
+        planned[0]["after_url"],
+        "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+    );
+    assert!(report["preview_diff"]
+        .as_str()
+        .expect("preview diff")
+        .contains("git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"));
+    assert!(report["unresolved_transitive_shorthand"]
+        .as_array()
+        .expect("transitive shorthand")
+        .iter()
+        .any(|item| {
+            item["node_id"] == "indirect"
+                && item["shorthand_type"] == "github"
+                && item["repo"] == "transitive"
+        }));
+}
+
+#[test]
+fn migrate_flake_inputs_rewrites_direct_inputs_and_runs_scoped_relock() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-apply-success",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+    let after_lock = temp.path().join("flake.lock.after");
+    fs::write(&after_lock, migration_lock_after_source()).expect("after lock");
+    let (fake_nix, fake_nix_log) = write_fake_nix_command(
+        &temp,
+        "fake-nix-success",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &after_lock,
+        None,
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "migrate-flake-inputs",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("migration apply json");
+    assert_eq!(report["nix_version"], "nix (Determinate Nix 3.0.0) 2.26.3");
+    assert_eq!(report["relocked_inputs"][0], "nixpkgs");
+    assert!(report["diff"]
+        .as_str()
+        .expect("diff")
+        .contains("flake.lock.after"));
+
+    let flake_source = fs::read_to_string(project.join("flake.nix")).expect("flake.nix");
+    assert!(flake_source.contains("git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"));
+    assert_eq!(
+        fs::read_to_string(project.join("flake.lock")).expect("flake.lock"),
+        migration_lock_after_source()
+    );
+
+    let log = fs::read_to_string(fake_nix_log).expect("fake nix log");
+    let update_calls = log
+        .lines()
+        .filter(|line| *line == "flake update nixpkgs")
+        .count();
+    assert_eq!(update_calls, 2, "targeted relock should run twice");
+}
+
+#[test]
+fn migrate_flake_inputs_refuses_dirty_worktree_by_default() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-dirty",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+    fs::write(project.join("README.md"), "dirty\n").expect("dirty file");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "migrate-flake-inputs",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dirty"));
+}
+
+#[test]
+fn migration_inspect_fails_closed_for_direct_inputs_outside_supported_literal_grammar() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-unsupported-grammar",
+        r#"
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs = { self, nixpkgs }: { };
+}
+"#,
+        migration_lock_source(),
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "migration",
+            "inspect",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("supported literal grammar"));
+}
+
+#[test]
+fn migrate_flake_inputs_restores_original_files_on_scope_violation() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-scope-violation",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+    let bad_lock = temp.path().join("flake.lock.scope-violation");
+    fs::write(&bad_lock, migration_lock_scope_violation_source()).expect("bad lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-scope-violation",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &bad_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "migrate-flake-inputs",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "changed nodes outside the selected input closure",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(project.join("flake.nix")).expect("flake.nix"),
+        migration_flake_source()
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("flake.lock")).expect("flake.lock"),
+        migration_lock_source()
+    );
+}
+
+#[test]
+fn migrate_flake_inputs_restores_original_files_on_non_idempotent_relock() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-non-idempotent",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+    let first_lock = temp.path().join("flake.lock.first");
+    let second_lock = temp.path().join("flake.lock.second");
+    fs::write(&first_lock, migration_lock_after_source()).expect("first lock");
+    fs::write(&second_lock, migration_lock_non_idempotent_source()).expect("second lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-non-idempotent",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &first_lock,
+        Some(&second_lock),
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "migrate-flake-inputs",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not idempotent"));
+
+    assert_eq!(
+        fs::read_to_string(project.join("flake.nix")).expect("flake.nix"),
+        migration_flake_source()
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("flake.lock")).expect("flake.lock"),
+        migration_lock_source()
+    );
+}
+
+#[test]
+fn migrate_flake_inputs_fails_outside_the_validated_nix_version_matrix() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let project = write_flake_project_fixture(
+        &temp,
+        "flake-unsupported-nix",
+        migration_flake_source(),
+        migration_lock_source(),
+    );
+    let after_lock = temp.path().join("flake.lock.after");
+    fs::write(&after_lock, migration_lock_after_source()).expect("after lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-unsupported-version",
+        "nix (Nix) 2.32.0",
+        &after_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "migrate-flake-inputs",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--flake",
+            project.to_str().expect("project"),
+            "--input-target",
+            "nixpkgs=git+https",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "outside the validated targeted relock matrix",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(project.join("flake.nix")).expect("flake.nix"),
+        migration_flake_source()
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("flake.lock")).expect("flake.lock"),
+        migration_lock_source()
     );
 }

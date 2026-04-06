@@ -5,6 +5,7 @@ pub mod crash;
 pub mod deploy;
 pub mod git;
 pub mod hooks;
+pub mod migration;
 pub mod platform;
 pub mod read_path;
 pub mod reconcile;

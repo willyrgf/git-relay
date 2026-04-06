@@ -12,6 +12,10 @@ use crate::deploy::{
 };
 use crate::git::SystemGitExecutor;
 use crate::hooks::dispatch_hook_action;
+use crate::migration::{
+    inspect_migration, migrate_flake_inputs, parse_policy_overrides, MigrationError,
+    MigrationRequest,
+};
 use crate::platform::RealPlatformProbe;
 use crate::read_path::{operator_prepare_repository_for_read, ReadPathError};
 use crate::reconcile::{
@@ -37,6 +41,8 @@ enum TopLevelCommand {
     Doctor(TargetOptions),
     #[command(hide = true)]
     HookDispatch(HookDispatchCommand),
+    Migration(MigrationCommand),
+    MigrateFlakeInputs(MigrationApplyOptions),
     Read(ReadCommand),
     Replication(ReplicationCommand),
     Repo(RepoCommand),
@@ -49,10 +55,21 @@ struct DeployCommand {
     command: DeploySubcommand,
 }
 
+#[derive(Debug, Args)]
+struct MigrationCommand {
+    #[command(subcommand)]
+    command: MigrationSubcommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum DeploySubcommand {
     ValidateRuntime(TargetOptions),
     RenderService(RenderServiceOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrationSubcommand {
+    Inspect(MigrationInspectOptions),
 }
 
 #[derive(Debug, Args)]
@@ -125,6 +142,38 @@ struct RenderServiceOptions {
 }
 
 #[derive(Debug, Clone, Args)]
+struct MigrationPolicyOptions {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long, default_value = ".")]
+    flake: std::path::PathBuf,
+    #[arg(long = "input-target")]
+    input_targets: Vec<String>,
+    #[arg(long = "host-target")]
+    host_targets: Vec<String>,
+    #[arg(long = "class-target")]
+    class_targets: Vec<String>,
+    #[arg(long = "input-class")]
+    input_classes: Vec<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct MigrationInspectOptions {
+    #[command(flatten)]
+    policy: MigrationPolicyOptions,
+}
+
+#[derive(Debug, Clone, Args)]
+struct MigrationApplyOptions {
+    #[command(flatten)]
+    policy: MigrationPolicyOptions,
+    #[arg(long)]
+    allow_dirty: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 struct MatrixTargetOptions {
     #[arg(long)]
     config: std::path::PathBuf,
@@ -154,6 +203,8 @@ struct HookDispatchCommand {
 pub enum CliError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Migration(#[from] MigrationError),
     #[error(transparent)]
     Reconcile(#[from] ReconcileError),
     #[error(transparent)]
@@ -196,6 +247,10 @@ where
         },
         TopLevelCommand::Doctor(options) => run_doctor(options),
         TopLevelCommand::HookDispatch(command) => run_hook_dispatch(command),
+        TopLevelCommand::Migration(command) => match command.command {
+            MigrationSubcommand::Inspect(options) => run_migration_inspect(options),
+        },
+        TopLevelCommand::MigrateFlakeInputs(options) => run_migrate_flake_inputs(options),
         TopLevelCommand::Read(command) => match command.command {
             ReadSubcommand::Prepare(options) => run_read_prepare(options),
         },
@@ -218,6 +273,22 @@ where
             StartupSubcommand::Classify(options) => run_startup_classify(options),
         },
     }
+}
+
+fn run_migration_inspect(options: MigrationInspectOptions) -> Result<ExitCode, CliError> {
+    let config = AppConfig::load(&options.policy.config)?;
+    let request = build_migration_request(&options.policy, false)?;
+    let report = inspect_migration(&config, &request)?;
+    emit_output(&report, options.policy.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_migrate_flake_inputs(options: MigrationApplyOptions) -> Result<ExitCode, CliError> {
+    let config = AppConfig::load(&options.policy.config)?;
+    let request = build_migration_request(&options.policy, options.allow_dirty)?;
+    let report = migrate_flake_inputs(&config, &request)?;
+    emit_output(&report, options.policy.json)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_hook_dispatch(options: HookDispatchCommand) -> Result<ExitCode, CliError> {
@@ -489,6 +560,23 @@ where
         startup,
         replication,
         divergence_markers,
+    })
+}
+
+fn build_migration_request(
+    options: &MigrationPolicyOptions,
+    allow_dirty: bool,
+) -> Result<MigrationRequest, CliError> {
+    let policy = parse_policy_overrides(
+        &options.input_targets,
+        &options.host_targets,
+        &options.class_targets,
+        &options.input_classes,
+    )?;
+    Ok(MigrationRequest {
+        flake_path: options.flake.clone(),
+        allow_dirty,
+        policy,
     })
 }
 
