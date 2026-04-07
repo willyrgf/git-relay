@@ -1111,6 +1111,48 @@ fn startup_classify_succeeds_for_healthy_cache_only_repo() {
 }
 
 #[test]
+fn startup_classify_reports_unknown_upstreams_before_observation() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream = temp.path().join("startup-upstream.git");
+    init_bare_repo(&upstream);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream.to_str().expect("path"), false)],
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "startup",
+            "classify",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report = parse_single_report(&output);
+    assert_eq!(report["safety"], "degraded");
+    assert_eq!(report["write_acceptance_allowed"], true);
+    assert!(report["upstreams"]
+        .as_array()
+        .expect("upstreams")
+        .iter()
+        .any(|entry| entry["upstream_id"] == "alpha" && entry["state"] == "unknown"));
+}
+
+#[test]
 fn deploy_validate_runtime_reports_environment_and_contract_health() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
