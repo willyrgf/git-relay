@@ -274,6 +274,7 @@ pub fn probe_repository_upstreams(
         source_oid,
         results,
     };
+
     persist_run_record(config, &run)?;
     Ok(run)
 }
@@ -586,6 +587,8 @@ fn probe_matrix_target(
         require_atomic: target.require_atomic,
     };
     let probe_refs = disposable_probe_refs(run_id, &target.target_id);
+    let probe_branch_ref = probe_refs.branch_ref.clone();
+    let probe_tag_ref = probe_refs.tag_ref.clone();
     let multi_refspecs = vec![
         format!("{source_oid}:{}", probe_refs.branch_ref),
         format!("{source_oid}:{}", probe_refs.tag_ref),
@@ -614,8 +617,8 @@ fn probe_matrix_target(
             },
             DisposableNamespaceProbe {
                 verdict: DisposableNamespaceVerdict::NotAttempted,
-                branch_ref: probe_refs.branch_ref,
-                tag_ref: probe_refs.tag_ref,
+                branch_ref: probe_branch_ref,
+                tag_ref: probe_tag_ref,
                 error_classification: access.error_classification,
                 detail: access.detail.clone(),
             },
@@ -642,13 +645,16 @@ fn probe_matrix_target(
         ));
     }
 
-    let same_repo_hidden_refs_supported = !target.same_repo_hidden_refs;
-    if target.same_repo_hidden_refs {
-        admission_reasons.push(
-            "same-repo hidden refs are not admitted until matrix probing adds an explicit hidden-ref leakage check"
-                .to_owned(),
-        );
-    }
+    let same_repo_hidden_refs_supported = if target.same_repo_hidden_refs {
+        let (hidden_supported, hidden_reasons) =
+            evaluate_same_repo_hidden_refs(repo_path, target, source_oid, run_id, &probe_refs)?;
+        if !hidden_supported {
+            admission_reasons.extend(hidden_reasons);
+        }
+        hidden_supported
+    } else {
+        true
+    };
 
     let supported_for_policy = admission_reasons.is_empty();
     Ok(MatrixProbeResult {
@@ -660,6 +666,165 @@ fn probe_matrix_target(
         same_repo_hidden_refs_supported,
         admission_reasons,
     })
+}
+
+fn evaluate_same_repo_hidden_refs(
+    repo_path: &Path,
+    target: &MatrixTargetEntry,
+    source_oid: &str,
+    run_id: &str,
+    probe_refs: &DisposableProbeRefs,
+) -> Result<(bool, Vec<String>), UpstreamProbeError> {
+    if !target.same_repo_hidden_refs {
+        return Ok((true, Vec::new()));
+    }
+
+    let mut reasons = Vec::new();
+
+    // Hidden refs must not be advertized.
+    let advertised = run_git(
+        Some(repo_path),
+        &[
+            "ls-remote".to_owned(),
+            target.url.clone(),
+            "refs/git-relay/*".to_owned(),
+        ],
+    )?;
+    if !advertised.success {
+        reasons.push(format!(
+            "hidden-ref advertisement check failed: {}",
+            format_git_failure(&advertised)
+        ));
+        return Ok((false, reasons));
+    }
+    if !advertised.stdout.trim().is_empty() {
+        reasons.push(
+            "hidden-ref advertisement check failed: refs/git-relay/* was visible from ls-remote"
+                .to_owned(),
+        );
+        return Ok((false, reasons));
+    }
+
+    let Some(target_repo_path) = local_repo_path_for_same_repo_probe(&target.url) else {
+        reasons.push(
+            "hidden-ref leakage check requires a local-path target repository for same-repo admission"
+                .to_owned(),
+        );
+        return Ok((false, reasons));
+    };
+
+    let required_exact = [
+        ("uploadpack.allowReachableSHA1InWant", "false"),
+        ("uploadpack.allowAnySHA1InWant", "false"),
+        ("uploadpack.allowTipSHA1InWant", "false"),
+    ];
+    for (key, expected) in required_exact {
+        let actual = read_git_config_value(&target_repo_path, key)?;
+        if actual.as_deref() != Some(expected) {
+            reasons.push(format!(
+                "hidden-ref leakage check: {key} must be {expected}, found {}",
+                actual.unwrap_or_else(|| "<unset>".to_owned())
+            ));
+        }
+    }
+
+    let required_prefix = [
+        ("transfer.hideRefs", "refs/git-relay"),
+        ("uploadpack.hideRefs", "refs/git-relay"),
+        ("receive.hideRefs", "refs/git-relay"),
+    ];
+    for (key, expected_prefix) in required_prefix {
+        let values = read_git_config_values(&target_repo_path, key)?;
+        if !values.iter().any(|value| value.trim() == expected_prefix) {
+            reasons.push(format!(
+                "hidden-ref leakage check: {key} must include {expected_prefix}"
+            ));
+        }
+    }
+
+    let _ = (repo_path, source_oid, run_id, probe_refs);
+    Ok((reasons.is_empty(), reasons))
+}
+
+fn local_repo_path_for_same_repo_probe(url: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(url);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let stripped = url.strip_prefix("ssh://")?;
+    let (authority, path_part) = stripped.split_once('/')?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, right)| right)
+        .unwrap_or(authority);
+    let host = host_port
+        .split_once(':')
+        .map(|(left, _)| left)
+        .unwrap_or(host_port);
+    if host != "127.0.0.1" && host != "localhost" {
+        return None;
+    }
+
+    let normalized_path = if path_part.starts_with('/') {
+        path_part.to_owned()
+    } else {
+        format!("/{path_part}")
+    };
+    let path = PathBuf::from(normalized_path);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn read_git_config_value(
+    repo_path: &Path,
+    key: &str,
+) -> Result<Option<String>, UpstreamProbeError> {
+    let output = run_git(
+        None,
+        &[
+            format!("--git-dir={}", repo_path.display()),
+            "config".to_owned(),
+            "--get".to_owned(),
+            key.to_owned(),
+        ],
+    )?;
+    if output.success {
+        let value = output.stdout.trim().to_owned();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_git_config_values(repo_path: &Path, key: &str) -> Result<Vec<String>, UpstreamProbeError> {
+    let output = run_git(
+        None,
+        &[
+            format!("--git-dir={}", repo_path.display()),
+            "config".to_owned(),
+            "--get-all".to_owned(),
+            key.to_owned(),
+        ],
+    )?;
+    if output.success {
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn probe_access(
