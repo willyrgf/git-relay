@@ -671,9 +671,9 @@ fn probe_matrix_target(
 fn evaluate_same_repo_hidden_refs(
     repo_path: &Path,
     target: &MatrixTargetEntry,
-    source_oid: &str,
+    _source_oid: &str,
     run_id: &str,
-    probe_refs: &DisposableProbeRefs,
+    _probe_refs: &DisposableProbeRefs,
 ) -> Result<(bool, Vec<String>), UpstreamProbeError> {
     if !target.same_repo_hidden_refs {
         return Ok((true, Vec::new()));
@@ -742,8 +742,121 @@ fn evaluate_same_repo_hidden_refs(
         }
     }
 
-    let _ = (repo_path, source_oid, run_id, probe_refs);
+    if hidden_object_oid_probe_applicable(target) {
+        match verify_hidden_object_oid_fetch_denied(
+            repo_path,
+            &target.url,
+            &target_repo_path,
+            run_id,
+            &target.target_id,
+        ) {
+            Ok(()) => {}
+            Err(detail) => {
+                reasons.push(format!("hidden-object leakage check failed: {detail}"));
+            }
+        }
+    }
+
     Ok((reasons.is_empty(), reasons))
+}
+
+fn hidden_object_oid_probe_applicable(target: &MatrixTargetEntry) -> bool {
+    match target.transport {
+        MatrixTargetTransport::Ssh => target.url.starts_with("ssh://"),
+        MatrixTargetTransport::SmartHttp => {
+            target.url.starts_with("http://") || target.url.starts_with("https://")
+        }
+    }
+}
+
+fn verify_hidden_object_oid_fetch_denied(
+    repo_path: &Path,
+    target_url: &str,
+    target_repo_path: &Path,
+    run_id: &str,
+    target_id: &str,
+) -> Result<(), String> {
+    const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let suffix = sanitize_component(&format!("{run_id}-{target_id}"));
+    let hidden_ref = format!("refs/git-relay/probe-hidden/{suffix}");
+    let local_probe_ref = format!("refs/git-relay/probe-fetch/{suffix}");
+
+    let commit = run_git_expect_success(
+        None,
+        &[
+            format!("--git-dir={}", target_repo_path.display()),
+            "-c".to_owned(),
+            "user.name=Git Relay Probe".to_owned(),
+            "-c".to_owned(),
+            "user.email=git-relay-probe@example.invalid".to_owned(),
+            "commit-tree".to_owned(),
+            EMPTY_TREE_OID.to_owned(),
+            "-m".to_owned(),
+            format!("git-relay hidden object probe {suffix}"),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let hidden_oid = commit.stdout.trim().to_owned();
+    if hidden_oid.is_empty() {
+        return Err("probe commit-tree returned an empty object id".to_owned());
+    }
+
+    let set_hidden_ref = run_git(
+        None,
+        &[
+            format!("--git-dir={}", target_repo_path.display()),
+            "update-ref".to_owned(),
+            hidden_ref.clone(),
+            hidden_oid.clone(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    if !set_hidden_ref.success {
+        return Err(format!(
+            "failed to set temporary hidden probe ref {}: {}",
+            hidden_ref,
+            format_git_failure(&set_hidden_ref)
+        ));
+    }
+
+    let fetch = run_git(
+        Some(repo_path),
+        &[
+            "fetch".to_owned(),
+            "--no-tags".to_owned(),
+            target_url.to_owned(),
+            format!("{hidden_oid}:{local_probe_ref}"),
+        ],
+    )
+    .map_err(|error| error.to_string());
+
+    let _ = run_git(
+        Some(repo_path),
+        &[
+            "update-ref".to_owned(),
+            "-d".to_owned(),
+            local_probe_ref.clone(),
+        ],
+    );
+    let _ = run_git(
+        None,
+        &[
+            format!("--git-dir={}", target_repo_path.display()),
+            "update-ref".to_owned(),
+            "-d".to_owned(),
+            hidden_ref.clone(),
+        ],
+    );
+
+    let fetch = fetch?;
+    if fetch.success {
+        return Err(format!(
+            "guessed object id {} remained fetchable via {}",
+            hidden_oid, target_url
+        ));
+    }
+
+    Ok(())
 }
 
 fn local_repo_path_for_same_repo_probe(url: &str) -> Option<PathBuf> {

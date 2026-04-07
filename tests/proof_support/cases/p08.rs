@@ -11,6 +11,7 @@ pub fn definition() -> CaseDefinition {
         action: "Run probe-matrix before and after authoritative hardening and verify hidden-ref leakage gate behavior.",
         pass_criteria: &[
             "same-repo hidden refs are rejected when leakage is possible",
+            "when transport probing is remote, guessed hidden object ids are blocked by admission checks",
             "same-repo hidden refs are admitted only after hardening checks pass",
         ],
         fail_criteria: &[
@@ -107,6 +108,8 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         .map_err(|error| error.to_string())?;
 
     let mut rejected_when_leaky = false;
+    let mut hidden_object_leakage_rejected = false;
+    let hidden_object_probe_expected = ssh_required;
     let mut first_reasons: Vec<String> = Vec::new();
     if first.success() {
         let parsed: serde_json::Value =
@@ -122,6 +125,21 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                                 reason
                                     .as_str()
                                     .map(|value| value.contains("hidden-ref"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+            });
+            hidden_object_leakage_rejected = results.iter().any(|entry| {
+                entry["target"]["target_id"] == "self-managed-alpha"
+                    && entry["same_repo_hidden_refs_supported"] == false
+                    && entry["admission_reasons"]
+                        .as_array()
+                        .map(|reasons| {
+                            reasons.iter().any(|reason| {
+                                reason
+                                    .as_str()
+                                    .map(|value| value.contains("hidden-object leakage check"))
                                     .unwrap_or(false)
                             })
                         })
@@ -251,6 +269,30 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "hardened target did not reach admitted status",
         )
     });
+    report.assertions.push(if hidden_object_probe_expected {
+        if hidden_object_leakage_rejected {
+            ProofAssertion::pass(
+                "p08.rejects_hidden_object_leakage",
+                Some(
+                    "target was rejected when a hidden object remained fetchable by guessed oid"
+                        .to_owned(),
+                ),
+            )
+        } else {
+            ProofAssertion::fail(
+                "p08.rejects_hidden_object_leakage",
+                "target did not report hidden-object leakage rejection while same_repo_hidden_refs admission was leaky",
+            )
+        }
+    } else {
+        ProofAssertion::pass(
+            "p08.rejects_hidden_object_leakage",
+            Some(
+                "hidden-object leakage probe is not applicable when target URL falls back to local-path transport"
+                    .to_owned(),
+            ),
+        )
+    });
     report.assertions.push(if hidden_refs_not_advertised {
         ProofAssertion::pass(
             "p08.hidden_refs_not_advertised",
@@ -267,7 +309,9 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "ssh_url": ssh_url,
         "target_url": target_url,
         "ssh_required": ssh_required,
+        "hidden_object_probe_expected": hidden_object_probe_expected,
         "rejected_when_leaky": rejected_when_leaky,
+        "hidden_object_leakage_rejected": hidden_object_leakage_rejected,
         "admitted_after_hardening": admitted_after_hardening,
         "hidden_refs_not_advertised": hidden_refs_not_advertised,
         "first_reasons": first_reasons,
