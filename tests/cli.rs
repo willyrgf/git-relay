@@ -933,6 +933,58 @@ fn repo_validate_returns_json_for_valid_authoritative_repo() {
 }
 
 #[test]
+fn repo_validate_fails_closed_for_unknown_config_field() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+
+    let mut source = fs::read_to_string(&config_path).expect("config source");
+    source.push_str("\n[unexpected]\nmode = \"invalid\"\n");
+    fs::write(&config_path, source).expect("updated config");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "validate",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown field"))
+        .stderr(predicate::str::contains("unexpected"));
+}
+
+#[test]
+fn repo_validate_fails_closed_for_unknown_descriptor_field() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    let descriptor_path = write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let mut descriptor = fs::read_to_string(&descriptor_path).expect("descriptor source");
+    descriptor.push_str("\nunknown_descriptor_key = true\n");
+    fs::write(&descriptor_path, descriptor).expect("updated descriptor");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "repo",
+            "validate",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown field"))
+        .stderr(predicate::str::contains("unknown_descriptor_key"));
+}
+
+#[test]
 fn repo_inspect_reports_descriptor_validation_and_replication_state() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
