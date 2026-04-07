@@ -449,6 +449,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parent_directory_repo_escape() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("repos");
+        let outside = temp.path().join("outside.git");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        std::fs::create_dir_all(&outside).expect("outside repo");
+
+        let error = resolve_ssh_command(&repo_root, "git-upload-pack ../outside.git")
+            .expect_err("reject escape");
+        assert!(matches!(
+            error,
+            super::SshWrapperError::RepoOutsideRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_absolute_repo_path_outside_repo_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("repos");
+        let outside = temp.path().join("outside.git");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        std::fs::create_dir_all(&outside).expect("outside repo");
+
+        let command = format!("git-upload-pack {}", outside.display());
+        let error = resolve_ssh_command(&repo_root, &command).expect_err("reject absolute path");
+        assert!(matches!(
+            error,
+            super::SshWrapperError::RepoOutsideRoot { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_repo_escape_outside_repo_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("repos");
+        let outside = temp.path().join("outside.git");
+        let linked = repo_root.join("linked.git");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        std::fs::create_dir_all(&outside).expect("outside repo");
+        symlink(&outside, &linked).expect("symlink");
+
+        let error = resolve_ssh_command(&repo_root, "git-upload-pack linked.git")
+            .expect_err("reject symlink escape");
+        assert!(matches!(
+            error,
+            super::SshWrapperError::RepoOutsideRoot { .. }
+        ));
+    }
+
+    #[test]
     fn rejects_non_git_services() {
         let temp = TempDir::new().expect("tempdir");
         let repo_root = temp.path().join("repos");
