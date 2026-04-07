@@ -116,12 +116,14 @@ pub enum HostKeyPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixTargetManifest {
     pub schema_version: u32,
     pub targets: Vec<MatrixTargetEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixTargetEntry {
     pub target_id: String,
     pub product: String,

@@ -2008,6 +2008,77 @@ fn replication_probe_upstreams_classifies_supported_unsupported_and_missing_targ
 }
 
 #[test]
+fn replication_probe_matrix_fails_closed_for_unknown_target_fields() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let work_repo = temp.path().join("work-probe-matrix-invalid");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let matrix_supported = temp.path().join("matrix-supported.git");
+    init_bare_repo(&matrix_supported);
+    let targets_path = temp.path().join("targets-unknown.json");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "targets": [
+            {
+                "target_id": "alpha",
+                "product": "local-git",
+                "class": "self-managed",
+                "transport": "ssh",
+                "url": matrix_supported,
+                "credential_source": "test-credential",
+                "host_key_policy": "accept-new",
+                "require_atomic": true,
+                "same_repo_hidden_refs": false,
+                "unexpected_target_field": true
+            }
+        ]
+    });
+    fs::write(
+        &targets_path,
+        serde_json::to_string_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("targets file");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "probe-matrix",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--targets",
+            targets_path.to_str().expect("targets"),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown field"))
+        .stderr(predicate::str::contains("unexpected_target_field"));
+}
+
+#[test]
 fn replication_probe_matrix_records_target_metadata_and_policy_support() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
