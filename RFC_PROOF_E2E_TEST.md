@@ -54,6 +54,7 @@ All mandatory proof runs must satisfy:
 - `git-relay-install-hooks`
 - `git-relay-ssh-force-command`
 - pinned `git`, `openssh`, and shell tools from Nix inputs
+- transport test daemons (`sshd`, smart-HTTP wrapper) launched from Nix-pinned binaries
 3. Fixed environment normalization for every subprocess:
 - `TZ=UTC`
 - `LC_ALL=C`
@@ -82,6 +83,12 @@ All mandatory proof runs must satisfy:
 9. Artifact secret hygiene:
 - redact sensitive values before persisting raw failure captures
 - fail the case if redaction cannot safely sanitize a capture
+10. Transport auth material for tests is ephemeral only:
+- per-run generated SSH host keys and client keys
+- per-run generated HTTP auth material
+- loopback-only bindings (`127.0.0.1`)
+- never use personal host credentials for proof tests
+- never persist private key/auth secrets in repo files, Nix store paths, or raw artifacts
 
 Determinism target:
 
@@ -112,10 +119,18 @@ Ingress surfaces:
 1. SSH forced-command path (mandatory)
 2. Local smart HTTP path via `git-http-backend` (mandatory)
 
+Transport test servers (mandatory in proof lab):
+
+1. Ephemeral localhost `sshd` process with generated per-run host key and test client key
+2. Ephemeral localhost smart-HTTP process serving `git-http-backend`
+3. Both servers wired to disposable local bare repositories under the suite temp root
+4. Both servers configured without dependence on developer machine credentials
+
 Note:
 
 - smart HTTP ingress remains an explicit deployment feature toggle in product config
 - proof gating still requires it in the test lab to validate Git boundary parity across SSH and smart HTTP
+- containerized remotes are not required for mandatory gates; local disposable directories plus localhost daemons are the baseline
 
 ## 5. Harness Architecture
 
@@ -127,10 +142,11 @@ Support modules (under `tests/proof_support/`):
 
 1. `lab.rs`: deterministic topology creation and fixture ownership
 2. `cmd.rs`: subprocess wrapper, env normalization, capture, redaction
-3. `cases/`: one module per proof case (`p01.rs` ... `p11.rs`)
-4. `artifact.rs`: typed artifact model and persistence helpers
-5. `normalize.rs`: normalization + canonical JSON encoding
-6. `schema.rs`: artifact schema and compatibility checks
+3. `transport.rs`: lifecycle management for ephemeral localhost `sshd` and smart-HTTP daemons
+4. `cases/`: one module per proof case (`p01.rs` ... `p11.rs`)
+5. `artifact.rs`: typed artifact model and persistence helpers
+6. `normalize.rs`: normalization + canonical JSON encoding
+7. `schema.rs`: artifact schema and compatibility checks
 
 Ownership boundary:
 
@@ -504,6 +520,7 @@ Execution contract:
 1. checks run in Nix derivations, not ad-hoc host scripts
 2. proof harness invokes only Nix-built relay binaries (no cargo-bin fallback in gate mode)
 3. SSH and smart HTTP ingress validation are mandatory in both modes
+4. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials
 
 Mode contract:
 
@@ -605,13 +622,16 @@ Acceptance:
 Mandatory release-gate scenarios:
 
 1. P01-P11 on supported platform hosts
-2. ingress-sensitive cases must cover SSH and smart HTTP
-3. machine-readable conformance artifacts must be present and admitted
+2. multi-upstream fan-out semantics are mandatory:
+- one local accepted push must drive one reconcile execution unit over a captured upstream set with mixed per-upstream outcomes allowed
+3. ingress-sensitive cases must cover SSH and smart HTTP
+4. machine-readable conformance artifacts must be present and admitted
+5. for every upstream/provider target declared as supported in release policy, conformance evidence is mandatory before admission
 
 Optional extended scenarios:
 
-1. hosted-provider matrix expansion beyond local/local-self-managed fixtures
-2. stress/soak runs beyond deterministic release gate criteria
+1. exploratory probes for providers/targets not yet declared supported
+2. stress/soak runs beyond deterministic correctness gate criteria
 
 Optional scenarios must not weaken mandatory gate outcomes.
 
