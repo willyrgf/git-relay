@@ -24,6 +24,7 @@ pub fn definition() -> CaseDefinition {
             "RFC_PROOF_E2E_TEST.md#P11",
             "RFC_PROOF_E2E_TEST.md#9-machine-readable-git-conformance-evidence",
             "git-relay-rfc.md release admission fail-closed contract",
+            "verification-plan release floor evidence constraints",
         ],
         runner: run,
     }
@@ -100,31 +101,40 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         .map_err(|error| error.to_string())?;
 
     let missing_target = case_root.join("missing-provider-target.git");
-    let targets_manifest = lab
-        .write_matrix_targets_fixture(
-            "p11-targets.json",
-            &[
-                (
-                    "supported-alpha",
-                    "local-git",
-                    "self-managed",
-                    "ssh",
-                    &lab.upstream_alpha.display().to_string(),
-                    true,
-                    true,
-                ),
-                (
-                    "missing-beta",
-                    "local-git",
-                    "managed",
-                    "ssh",
-                    &missing_target.display().to_string(),
-                    false,
-                    false,
-                ),
-            ],
+    let (targets_manifest, provider_manifest_used) = if mode == ProofMode::ProviderAdmission {
+        let Some(inputs) = lab.provider_inputs.as_ref() else {
+            return Err("provider-admission mode missing provider input files".to_owned());
+        };
+        (inputs.target_manifest.clone(), true)
+    } else {
+        (
+            lab.write_matrix_targets_fixture(
+                "p11-targets.json",
+                &[
+                    (
+                        "supported-alpha",
+                        "local-git",
+                        "self-managed",
+                        "ssh",
+                        &lab.upstream_alpha.display().to_string(),
+                        true,
+                        true,
+                    ),
+                    (
+                        "missing-beta",
+                        "local-git",
+                        "managed",
+                        "ssh",
+                        &missing_target.display().to_string(),
+                        false,
+                        false,
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+            false,
         )
-        .map_err(|error| error.to_string())?;
+    };
 
     let manifest_build = lab
         .run_git_relay(
@@ -142,7 +152,8 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             &[],
         )
         .map_err(|error| error.to_string())?;
-    let (manifest_open, missing_target_unadmitted) = parse_manifest_open(&manifest_build.stdout)?;
+    let (manifest_open, missing_target_unadmitted, supported_target_admitted) =
+        parse_manifest_open(&manifest_build.stdout)?;
 
     let manifest_latest = lab
         .state_root
@@ -249,6 +260,17 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             ProofAssertion::fail("p11.release_manifest.fail_closed", manifest_build.summary())
         },
     );
+    report.assertions.push(if supported_target_admitted {
+        ProofAssertion::pass(
+            "p11.release_manifest.supported_target_admitted",
+            Some("release manifest contains admitted evidence for supported target".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p11.release_manifest.supported_target_admitted",
+            "release manifest did not admit supported-alpha target evidence",
+        )
+    });
     report.assertions.push(if manifest_persisted {
         ProofAssertion::pass(
             "p11.release_manifest.persisted",
@@ -306,11 +328,26 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             "provider-admission mode did not keep explicit input validation fail-closed",
         )
     });
+    report.assertions.push(
+        if mode != ProofMode::ProviderAdmission || provider_manifest_used {
+            ProofAssertion::pass(
+                "p11.provider_manifest.used",
+                Some("provider-admission mode consumed explicit target manifest".to_owned()),
+            )
+        } else {
+            ProofAssertion::fail(
+                "p11.provider_manifest.used",
+                "provider-admission mode did not use explicit target manifest inputs",
+            )
+        },
+    );
 
     report.details = json!({
         "manifest_build": manifest_build.summary(),
         "manifest_open": manifest_open,
         "missing_target_unadmitted": missing_target_unadmitted,
+        "supported_target_admitted": supported_target_admitted,
+        "provider_manifest_used": provider_manifest_used,
         "manifest_persisted": manifest_persisted,
         "manifest_latest": manifest_latest,
         "release_report": release_report.summary(),
@@ -324,7 +361,7 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
     Ok(report)
 }
 
-fn parse_manifest_open(source: &str) -> Result<(bool, bool), String> {
+fn parse_manifest_open(source: &str) -> Result<(bool, bool, bool), String> {
     let parsed = parse_json(source)?;
     let manifest_open = parsed["all_entries_admitted"] == false;
     let missing_target_unadmitted = parsed["entries"]
@@ -335,7 +372,19 @@ fn parse_manifest_open(source: &str) -> Result<(bool, bool), String> {
                 .any(|entry| entry["target_id"] == "missing-beta" && entry["admitted"] == false)
         })
         .unwrap_or(false);
-    Ok((manifest_open, missing_target_unadmitted))
+    let supported_target_admitted = parsed["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["target_id"] == "supported-alpha" && entry["admitted"] == true)
+        })
+        .unwrap_or(false);
+    Ok((
+        manifest_open,
+        missing_target_unadmitted,
+        supported_target_admitted,
+    ))
 }
 
 fn write_fake_nix_version_command(
