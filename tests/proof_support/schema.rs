@@ -249,7 +249,8 @@ pub struct ProofEvidencePaths {
 
 impl ProofEvidencePaths {
     pub fn case_artifact_path(&self, case_id: &str, file_name: &str) -> std::path::PathBuf {
-        self.case_dir.join(case_id).join(file_name)
+        let _ = case_id;
+        self.case_dir.join(file_name)
     }
 }
 

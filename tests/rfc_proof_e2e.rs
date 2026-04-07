@@ -1,6 +1,7 @@
 mod proof_support;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use proof_support::{
     artifact,
@@ -243,6 +244,45 @@ fn assert_conformance_manifest_exists(
     Ok(())
 }
 
+fn init_provider_target_repo(path: &Path) -> Result<(), String> {
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "init",
+            "--bare",
+            path.to_str().ok_or("target path")?,
+        ])
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err("failed to init provider target repo".to_owned());
+    }
+
+    let entries = [
+        ("receive.fsckObjects", "true"),
+        ("transfer.hideRefs", "refs/git-relay"),
+        ("uploadpack.hideRefs", "refs/git-relay"),
+        ("receive.hideRefs", "refs/git-relay"),
+        ("uploadpack.allowReachableSHA1InWant", "false"),
+        ("uploadpack.allowAnySHA1InWant", "false"),
+        ("uploadpack.allowTipSHA1InWant", "false"),
+        ("core.fsync", "all"),
+        ("core.fsyncMethod", "fsync"),
+    ];
+    for (key, value) in entries {
+        let git_dir_arg = format!("--git-dir={}", path.display());
+        let status = Command::new("git")
+            .args([git_dir_arg.as_str(), "config", key, value])
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("failed to set {} on provider target repo", key));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn proof_e2e_fast_profile_runs_required_cases() {
     if should_skip_proof_tests() {
@@ -305,17 +345,31 @@ fn proof_e2e_provider_admission_profile_runs_required_evidence_checks() {
         return;
     }
     let provider_inputs_root = TempDir::new().expect("provider inputs tempdir");
+    let provider_target = provider_inputs_root
+        .path()
+        .join("provider-supported-alpha.git");
+    init_provider_target_repo(&provider_target).expect("provider target repo");
+    let missing_target = provider_inputs_root
+        .path()
+        .join("provider-missing-beta.git");
     let targets = provider_inputs_root.path().join("targets.json");
     let credentials = provider_inputs_root.path().join("credentials.env");
     std::fs::write(
         &targets,
-        "{\n  \"schema_version\": 1,\n  \"targets\": []\n}\n",
+        format!(
+            "{{\n  \"schema_version\": 1,\n  \"targets\": [\n    {{\n      \"target_id\": \"supported-alpha\",\n      \"product\": \"local-git\",\n      \"class\": \"self-managed\",\n      \"transport\": \"ssh\",\n      \"url\": \"{}\",\n      \"credential_source\": \"env:SUPPORTED_ALPHA_CREDENTIAL\",\n      \"host_key_policy\": \"pinned-known-hosts\",\n      \"require_atomic\": true,\n      \"same_repo_hidden_refs\": true\n    }},\n    {{\n      \"target_id\": \"missing-beta\",\n      \"product\": \"local-git\",\n      \"class\": \"managed\",\n      \"transport\": \"ssh\",\n      \"url\": \"{}\",\n      \"credential_source\": \"env:MISSING_BETA_CREDENTIAL\",\n      \"host_key_policy\": \"pinned-known-hosts\",\n      \"require_atomic\": false,\n      \"same_repo_hidden_refs\": false\n    }}\n  ]\n}}\n",
+            provider_target.display(),
+            missing_target.display(),
+        ),
     )
     .expect("write provider targets");
-    std::fs::write(&credentials, "PROVIDER_TOKEN=provider-proof-token\n")
+    std::fs::write(
+        &credentials,
+        "SUPPORTED_ALPHA_CREDENTIAL=provider-proof-alpha\nMISSING_BETA_CREDENTIAL=provider-proof-beta\n",
+    )
         .expect("write provider credentials");
 
-    let (_, summary) = run_suite(
+    let (suite_root, summary) = run_suite(
         ProofMode::ProviderAdmission,
         &LabProfile::ProviderAdmission,
         "proof-provider",
@@ -327,6 +381,8 @@ fn proof_e2e_provider_admission_profile_runs_required_evidence_checks() {
     .expect("run provider suite");
     assert_eq!(summary.mode, ProofMode::ProviderAdmission);
     assert_eq!(summary.overall_status, CaseStatus::Pass);
+    assert_conformance_manifest_exists(&suite_root, summary.mode, &summary)
+        .expect("conformance manifest for provider-admission");
 }
 
 #[test]

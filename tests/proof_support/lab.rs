@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use git_relay::platform::{PlatformProbe, RealPlatformProbe};
+use git_relay::upstream::{
+    HostKeyPolicy, MatrixTargetClass, MatrixTargetManifest, MatrixTargetTransport,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -58,6 +61,7 @@ impl ProviderAdmissionInputs {
                 self.credentials_file.display()
             )));
         }
+        validate_provider_inputs_manifest(self)?;
         Ok(())
     }
 }
@@ -189,6 +193,7 @@ pub struct ProofLab {
     pub toolchain: ProofToolchain,
     pub runner: ProofCommandRunner,
     pub provider_inputs: Option<ProviderAdmissionInputs>,
+    provider_env: Vec<(String, String)>,
     structured_events: Vec<Value>,
 }
 
@@ -235,6 +240,15 @@ impl ProofLab {
 
         let mut runner = ProofCommandRunner::new(&home, &xdg);
 
+        let provider_env = if *profile == LabProfile::ProviderAdmission {
+            let inputs = provider_inputs
+                .as_ref()
+                .expect("provider inputs are validated above for provider mode");
+            parse_credentials_file(&inputs.credentials_file)?
+        } else {
+            Vec::new()
+        };
+
         let state_root = temp_root.join("state");
         let repo_root = temp_root.join("repos");
         let repo_config_root = temp_root.join("repos.d");
@@ -258,6 +272,9 @@ impl ProofLab {
 
         runner.register_secret("API_TOKEN", format!("proof-token-{suite_id}"));
         runner.register_secret("HTTP_AUTH_PASSWORD", format!("proof-password-{suite_id}"));
+        for (key, value) in &provider_env {
+            runner.register_secret(key.clone(), value.clone());
+        }
 
         let authoritative_repo = repo_root.join("relay-authoritative.git");
         let cache_repo = repo_root.join("relay-cache.git");
@@ -301,6 +318,7 @@ impl ProofLab {
             toolchain,
             runner,
             provider_inputs,
+            provider_env,
             structured_events: Vec::new(),
         };
 
@@ -376,7 +394,8 @@ impl ProofLab {
         extra_env: &[(String, String)],
     ) -> Result<CommandCapture, LabError> {
         let program = self.binaries.git_relay.display().to_string();
-        let capture = self.runner.run(program, args, None, extra_env)?;
+        let merged_env = self.merge_profile_env(extra_env);
+        let capture = self.runner.run(program, args, None, &merged_env)?;
         Ok(capture)
     }
 
@@ -386,7 +405,8 @@ impl ProofLab {
         extra_env: &[(String, String)],
     ) -> Result<CommandCapture, LabError> {
         let program = self.binaries.git_relayd.display().to_string();
-        let capture = self.runner.run(program, args, None, extra_env)?;
+        let merged_env = self.merge_profile_env(extra_env);
+        let capture = self.runner.run(program, args, None, &merged_env)?;
         Ok(capture)
     }
 
@@ -396,8 +416,25 @@ impl ProofLab {
         extra_env: &[(String, String)],
     ) -> Result<CommandCapture, LabError> {
         let program = self.binaries.git_relay_install_hooks.display().to_string();
-        let capture = self.runner.run(program, args, None, extra_env)?;
+        let merged_env = self.merge_profile_env(extra_env);
+        let capture = self.runner.run(program, args, None, &merged_env)?;
         Ok(capture)
+    }
+
+    fn merge_profile_env(&self, extra_env: &[(String, String)]) -> Vec<(String, String)> {
+        if self.profile != LabProfile::ProviderAdmission || self.provider_env.is_empty() {
+            return extra_env.to_vec();
+        }
+
+        let mut merged = self.provider_env.clone();
+        for (key, value) in extra_env {
+            if let Some(existing) = merged.iter_mut().find(|(entry_key, _)| entry_key == key) {
+                existing.1 = value.clone();
+            } else {
+                merged.push((key.clone(), value.clone()));
+            }
+        }
+        merged
     }
 
     pub fn read_git_ref(&self, repo_path: &Path, ref_name: &str) -> Result<String, LabError> {
@@ -794,6 +831,7 @@ url = "{read_url}"
 
         self.persist_structured_events()?;
         self.persist_ref_snapshots()?;
+        self.persist_release_manifest_snapshot()?;
         self.persist_git_conformance_manifest(summary, &normalized_hash)?;
 
         Ok(self.suite_root.clone())
@@ -867,6 +905,22 @@ url = "{read_url}"
         }
 
         Ok(())
+    }
+
+    fn persist_release_manifest_snapshot(&self) -> Result<(), LabError> {
+        let source = self
+            .state_root
+            .join("upstream-probes")
+            .join("release-manifests");
+        let target = self.suite_root.join("manifests").join("release");
+        fs::create_dir_all(&target).map_err(|source| LabError::CreateDir {
+            path: target.clone(),
+            source,
+        })?;
+        if !source.exists() {
+            return Ok(());
+        }
+        copy_dir_recursive(&source, &target)
     }
 
     fn persist_git_conformance_manifest(
@@ -1227,4 +1281,183 @@ fn sanitize_component(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), LabError> {
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| LabError::Read {
+            path: source.to_path_buf(),
+            source: error,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LabError::Read {
+            path: source.to_path_buf(),
+            source: error,
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let entry_path = entry.path();
+        let name = entry.file_name();
+        let target_path = target.join(name);
+        let file_type = entry.file_type().map_err(|error| LabError::Read {
+            path: entry_path.clone(),
+            source: error,
+        })?;
+        if file_type.is_dir() {
+            fs::create_dir_all(&target_path).map_err(|error| LabError::CreateDir {
+                path: target_path.clone(),
+                source: error,
+            })?;
+            copy_dir_recursive(&entry_path, &target_path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            let content = fs::read(&entry_path).map_err(|error| LabError::Read {
+                path: entry_path.clone(),
+                source: error,
+            })?;
+            fs::write(&target_path, content).map_err(|error| LabError::Write {
+                path: target_path,
+                source: error,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_credentials_file(path: &Path) -> Result<Vec<(String, String)>, LabError> {
+    let source = fs::read_to_string(path).map_err(|error| LabError::Read {
+        path: path.to_path_buf(),
+        source: error,
+    })?;
+    let mut map = BTreeMap::new();
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission credentials line {} is not KEY=VALUE",
+                index + 1
+            )));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission credentials line {} has empty key or value",
+                index + 1
+            )));
+        }
+        if map.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission credentials duplicated key {}",
+                key
+            )));
+        }
+    }
+
+    if map.is_empty() {
+        return Err(LabError::ProviderInputs(
+            "provider-admission credentials file must declare at least one KEY=VALUE".to_owned(),
+        ));
+    }
+
+    Ok(map.into_iter().collect())
+}
+
+fn validate_provider_inputs_manifest(inputs: &ProviderAdmissionInputs) -> Result<(), LabError> {
+    let source = fs::read_to_string(&inputs.target_manifest).map_err(|error| LabError::Read {
+        path: inputs.target_manifest.clone(),
+        source: error,
+    })?;
+    let manifest = serde_json::from_str::<MatrixTargetManifest>(&source).map_err(|error| {
+        LabError::ProviderInputs(format!(
+            "provider-admission target manifest {} is invalid json: {}",
+            inputs.target_manifest.display(),
+            error
+        ))
+    })?;
+    if manifest.schema_version != 1 {
+        return Err(LabError::ProviderInputs(format!(
+            "provider-admission target manifest schema_version {} is unsupported",
+            manifest.schema_version
+        )));
+    }
+    if manifest.targets.is_empty() {
+        return Err(LabError::ProviderInputs(
+            "provider-admission target manifest must contain at least one target".to_owned(),
+        ));
+    }
+
+    let credentials = parse_credentials_file(&inputs.credentials_file)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for target in &manifest.targets {
+        if target.target_id.trim().is_empty() {
+            return Err(LabError::ProviderInputs(
+                "provider-admission target_id must not be empty".to_owned(),
+            ));
+        }
+        if !seen.insert(target.target_id.clone()) {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission target_id {} is duplicated",
+                target.target_id
+            )));
+        }
+        if target.product.trim().is_empty() || target.url.trim().is_empty() {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission target {} must define product and url",
+                target.target_id
+            )));
+        }
+        if target.same_repo_hidden_refs && target.class != MatrixTargetClass::SelfManaged {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission target {} cannot set same_repo_hidden_refs unless class=self-managed",
+                target.target_id
+            )));
+        }
+        match (target.transport, target.host_key_policy) {
+            (MatrixTargetTransport::SmartHttp, HostKeyPolicy::NotApplicable)
+            | (MatrixTargetTransport::Ssh, HostKeyPolicy::PinnedKnownHosts)
+            | (MatrixTargetTransport::Ssh, HostKeyPolicy::AcceptNew) => {}
+            (MatrixTargetTransport::SmartHttp, _) => {
+                return Err(LabError::ProviderInputs(format!(
+                    "provider-admission target {} uses smart-http and must set host_key_policy=not-applicable",
+                    target.target_id
+                )));
+            }
+            (MatrixTargetTransport::Ssh, HostKeyPolicy::NotApplicable) => {
+                return Err(LabError::ProviderInputs(format!(
+                    "provider-admission target {} uses ssh and must set an SSH host-key policy",
+                    target.target_id
+                )));
+            }
+        }
+
+        let Some(var_name) = target.credential_source.strip_prefix("env:") else {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission target {} credential_source must use env:VAR form",
+                target.target_id
+            )));
+        };
+        if var_name.trim().is_empty() {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission target {} credential_source env variable is empty",
+                target.target_id
+            )));
+        }
+        if !credentials.contains_key(var_name) {
+            return Err(LabError::ProviderInputs(format!(
+                "provider-admission credentials file is missing required key {} for target {}",
+                var_name, target.target_id
+            )));
+        }
+    }
+
+    Ok(())
 }
