@@ -11,6 +11,7 @@ pub fn definition() -> CaseDefinition {
         action: "Execute ordinary multi-ref pushes over SSH and smart HTTP and assert local-commit scoped evidence.",
         pass_criteria: &[
             "multi-ref updates are observed on both transports",
+            "invalid transmitted updates are rejected without widening ordinary push guarantees",
             "proof output explicitly keeps local-commit scoped wording",
         ],
         fail_criteria: &[
@@ -118,6 +119,63 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         && http_tag_exists
         && (!ssh_required || (ssh_branch_exists && ssh_tag_exists));
 
+    let ssh_internal_ref_attempt = if ssh_required {
+        Some(
+            lab.run_git(
+                &[
+                    "-C".to_owned(),
+                    work.display().to_string(),
+                    "push".to_owned(),
+                    ssh_url.clone(),
+                    "HEAD:refs/git-relay/p02-ssh-internal".to_owned(),
+                ],
+                None,
+                &ssh_env,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let http_internal_ref_attempt = lab
+        .run_git(
+            &[
+                "-C".to_owned(),
+                work.display().to_string(),
+                "push".to_owned(),
+                transport
+                    .smart_http
+                    .remote_url_for_repo("relay-authoritative.git"),
+                "HEAD:refs/git-relay/p02-http-internal".to_owned(),
+            ],
+            None,
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    let ssh_internal_ref_blocked = ssh_internal_ref_attempt
+        .as_ref()
+        .map(|output| !output.success())
+        .unwrap_or(true);
+    let http_internal_ref_blocked = !http_internal_ref_attempt.success();
+    let ssh_internal_ref_exists = if ssh_required {
+        lab.git_ref_exists(&lab.authoritative_repo, "refs/git-relay/p02-ssh-internal")
+            .map_err(|error| error.to_string())?
+    } else {
+        false
+    };
+    let http_internal_ref_exists = lab
+        .git_ref_exists(&lab.authoritative_repo, "refs/git-relay/p02-http-internal")
+        .map_err(|error| error.to_string())?;
+    let ssh_branch_still_exists = if ssh_required {
+        lab.git_ref_exists(&lab.authoritative_repo, "refs/heads/p02-ssh")
+            .map_err(|error| error.to_string())?
+    } else {
+        true
+    };
+    let http_branch_still_exists = lab
+        .git_ref_exists(&lab.authoritative_repo, "refs/heads/p02-http")
+        .map_err(|error| error.to_string())?;
+
     report.assertions.push(if ssh_push.success() {
         ProofAssertion::pass(
             "p02.ssh.multi_ref",
@@ -150,6 +208,42 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "expected branch/tag refs were missing after multi-ref pushes",
         )
     });
+    report
+        .assertions
+        .push(if ssh_internal_ref_blocked && http_internal_ref_blocked {
+            ProofAssertion::pass(
+                "p02.invalid_updates.rejected",
+                Some("invalid hidden-ref updates were rejected on ingress transports".to_owned()),
+            )
+        } else {
+            ProofAssertion::fail(
+                "p02.invalid_updates.rejected",
+                format!(
+                    "hidden-ref attempts were not both rejected (ssh_blocked={}, http_blocked={})",
+                    ssh_internal_ref_blocked, http_internal_ref_blocked
+                ),
+            )
+        });
+    report.assertions.push(
+        if !ssh_internal_ref_exists
+            && !http_internal_ref_exists
+            && ssh_branch_still_exists
+            && http_branch_still_exists
+        {
+        ProofAssertion::pass(
+            "p02.invalid_updates.no_partial_delete",
+                Some("rejected hidden-ref attempts did not mutate internal or committed branch refs".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p02.invalid_updates.no_partial_delete",
+            format!(
+                    "post-rejection state was unexpected (ssh_hidden_exists={}, http_hidden_exists={}, ssh_branch_exists={}, http_branch_exists={})",
+                    ssh_internal_ref_exists, http_internal_ref_exists, ssh_branch_still_exists, http_branch_still_exists
+            ),
+        )
+        },
+    );
     report.assertions.push(ProofAssertion::pass(
         "p02.contract.local_commit_only",
         Some("verdict text remains scoped to refs Git actually committed".to_owned()),
@@ -166,6 +260,14 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "http_branch_exists": http_branch_exists,
         "http_tag_exists": http_tag_exists,
         "refs_ok": refs_ok,
+        "ssh_internal_ref_attempt": ssh_internal_ref_attempt.as_ref().map(|output| output.summary()),
+        "http_internal_ref_attempt": http_internal_ref_attempt.summary(),
+        "ssh_internal_ref_blocked": ssh_internal_ref_blocked,
+        "http_internal_ref_blocked": http_internal_ref_blocked,
+        "ssh_internal_ref_exists": ssh_internal_ref_exists,
+        "http_internal_ref_exists": http_internal_ref_exists,
+        "ssh_branch_still_exists": ssh_branch_still_exists,
+        "http_branch_still_exists": http_branch_still_exists,
         "verdict": "local-commit does not claim whole-push semantics for ordinary pushes",
     });
 
