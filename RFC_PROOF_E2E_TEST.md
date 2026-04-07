@@ -43,19 +43,32 @@ A proof run is complete only if it produces machine-checkable evidence for all m
 Proof gates must use real Git processes, real bare repositories, and real relay binaries.
 Mocked Git protocol behavior is not accepted for release gates.
 
+Proof is executed in two mandatory profiles:
+
+1. `deterministic-core`
+- local-only disposable topology
+- no non-local network dependency
+- byte-identical normalized evidence target
+2. `provider-admission`
+- probes provider/remote targets declared as supported for release policy
+- may require non-local network connectivity
+- still uses strict schema and fail-closed admission rules
+- required for release admission whenever supported provider targets are declared or changed
+
 ## 3. Determinism And Security Rules
 
 All mandatory proof runs must satisfy:
 
-1. No non-local network dependency for gate-critical scenarios.
-2. Nix-built binaries only for gate runs:
+1. Deterministic-core profile has no non-local network dependency.
+2. Provider-admission profile may use non-local network only for declared release-policy targets.
+3. Nix-built binaries only for gate runs:
 - `git-relay`
 - `git-relayd`
 - `git-relay-install-hooks`
 - `git-relay-ssh-force-command`
 - pinned `git`, `openssh`, and shell tools from Nix inputs
 - transport test daemons (`sshd`, smart-HTTP wrapper) launched from Nix-pinned binaries
-3. Fixed environment normalization for every subprocess:
+4. Fixed environment normalization for every subprocess:
 - `TZ=UTC`
 - `LC_ALL=C`
 - `LANG=C`
@@ -63,37 +76,49 @@ All mandatory proof runs must satisfy:
 - deterministic XDG dirs inside the suite temp root
 - `GIT_CONFIG_GLOBAL=/dev/null`
 - `GIT_CONFIG_SYSTEM=/dev/null`
-4. Fixed commit metadata for synthetic commits:
+5. Fixed commit metadata for synthetic commits:
 - `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`
 - `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`
 - fixed `GIT_AUTHOR_DATE`, `GIT_COMMITTER_DATE`
-5. Stable ordering for multi-target work:
+6. Stable ordering for multi-target work:
 - sort by `repo_id`, `upstream_id`, `target_id`, and `case_id`
-6. Disable opportunistic repo mutations that create nondeterministic timing effects:
+7. Disable opportunistic repo mutations that create nondeterministic timing effects:
 - disable auto GC in harness-driven Git mutations
-7. Dynamic run data normalization for comparison artifacts:
+8. Dynamic run data normalization for comparison artifacts:
 - run IDs
 - timestamps
 - PIDs
+- transport port numbers
+- SSH key fingerprints
 - temp absolute paths
 - process-dependent transient file names
-8. Canonical normalized JSON encoding:
+9. Canonical normalized JSON encoding:
 - deterministic key order
 - deterministic array order where semantic set ordering applies
-9. Artifact secret hygiene:
+10. Artifact secret hygiene:
 - redact sensitive values before persisting raw failure captures
 - fail the case if redaction cannot safely sanitize a capture
-10. Transport auth material for tests is ephemeral only:
+11. Transport auth material for tests is ephemeral only:
 - per-run generated SSH host keys and client keys
 - per-run generated HTTP auth material
 - loopback-only bindings (`127.0.0.1`)
 - never use personal host credentials for proof tests
 - never persist private key/auth secrets in repo files, Nix store paths, or raw artifacts
+12. Runner isolation:
+- proof harness executes cases serially under one orchestrator target
+- no parallel case execution for deterministic-core profile
+- one daemon set (`sshd` and smart HTTP) per case lifecycle
+- dynamic port assignment is allowed; ports are normalized in comparison artifacts
+- proof suite target runs with deterministic test threading (single-threaded execution)
 
 Determinism target:
 
+1. deterministic-core profile:
 - two consecutive suite executions on the same host and commit produce byte-identical `summary.normalized.json`
 - the suite records and compares `summary.normalized.sha256`
+2. provider-admission profile:
+- schema-valid evidence and deterministic policy verdicts are required
+- byte-identical cross-run output is not required because remote provider state may evolve
 
 ## 4. Proof Lab Topology
 
@@ -131,6 +156,16 @@ Note:
 - smart HTTP ingress remains an explicit deployment feature toggle in product config
 - proof gating still requires it in the test lab to validate Git boundary parity across SSH and smart HTTP
 - containerized remotes are not required for mandatory gates; local disposable directories plus localhost daemons are the baseline
+
+Transport scope contract:
+
+1. SSH coverage is mandatory for all ingress-sensitive cases.
+2. Smart HTTP coverage is mandatory for:
+- read-path parity checks (P07 and any read-sensitive checks in P01-P06/P10)
+- local write-boundary parity checks for P01/P02 in the proof lab
+3. Mandatory smart HTTP proof coverage does not change deployment defaults.
+- production enablement remains explicit policy
+- proof coverage exists to validate boundary invariants, not to silently widen product scope
 
 ## 5. Harness Architecture
 
@@ -434,7 +469,7 @@ Top-level normalized summary schema:
 {
   "schema_version": 1,
   "suite": "rfc-proof-e2e",
-  "mode": "fast|full",
+  "mode": "fast|full|provider-admission",
   "toolchain": {
     "git_version": "...",
     "nix_version": "...",
@@ -469,25 +504,55 @@ Normalization policy:
 Secret-safety policy:
 
 1. Never persist runtime env values verbatim
-2. Redact common secret-bearing patterns in captures before write
-3. If redaction fails or sensitive material remains detectable, fail the case
+2. Required redaction classes before persisting captures:
+- values from runtime env file entries
+- environment variables with names containing: `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `KEY`, `AUTH`
+- HTTP `Authorization` header values
+- URL credentials in authority segments (`scheme://user:pass@host/...`)
+- PEM private key blocks (`-----BEGIN ... PRIVATE KEY-----`)
+3. Redaction output uses deterministic placeholder tokens (`<redacted:class>`)
+4. If redaction fails or sensitive material remains detectable, fail the case
+
+Proof artifact retention defaults (mandatory):
+
+1. raw suite runs: `ttl=720h`, `keep_count=20`
+2. redacted failure captures: `ttl=720h`, `keep_count=20`
+3. non-admitted conformance artifacts: `ttl=720h`, `keep_count=20`
+4. admitted release evidence remains pinned until superseded by a newer admitted release
+5. P10 must verify retention behavior against these defaults unless explicitly overridden by a deterministic test fixture
 
 ## 9. Machine-Readable Git Conformance Evidence
 
 Required file:
 
-- `manifests/git-conformance/<platform>/<git_version>.json`
+- `manifests/git-conformance/<platform>/<git_version_key>.json`
+
+Path key contract:
+
+1. `git_version_key` is a sanitized deterministic key derived from raw `git_version`
+2. raw `git_version` remains preserved in JSON payload
 
 Required schema:
 
 ```json
 {
   "schema_version": 1,
+  "profile": "deterministic-core|provider-admission",
+  "git_version_key": "...",
   "platform": "macos|linux",
+  "nix_system": "...",
   "service_manager": "launchd|systemd",
   "git_version": "...",
   "openssh_version": "...",
   "filesystem_profile": "...",
+  "git_relay_commit": "...",
+  "flake_lock_sha256": "...",
+  "binary_digests": {
+    "git-relay": "...",
+    "git-relayd": "...",
+    "git-relay-install-hooks": "...",
+    "git-relay-ssh-force-command": "..."
+  },
   "cases": [
     {
       "case_id": "P01",
@@ -505,6 +570,7 @@ Usage contract:
 1. release reporting ingests only this schema for Git floor closure
 2. exact Git floor remains open if required evidence is missing on any supported platform
 3. evidence without mandatory-case pass status is non-admitting
+4. provider-admission evidence is required for every target declared as supported in release policy
 
 ## 10. Nix Integration And Check Topology
 
@@ -514,13 +580,15 @@ Required checks:
 
 1. `checks.<system>.rfc-proof-e2e-fast`
 2. `checks.<system>.rfc-proof-e2e-full`
+3. `checks.<system>.rfc-proof-provider-admission`
 
 Execution contract:
 
 1. checks run in Nix derivations, not ad-hoc host scripts
 2. proof harness invokes only Nix-built relay binaries (no cargo-bin fallback in gate mode)
-3. SSH and smart HTTP ingress validation are mandatory in both modes
+3. SSH and smart HTTP ingress validation are mandatory in deterministic-core modes (`fast` and `full`)
 4. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials
+5. `provider-admission` requires explicit target manifest and credentials; if invoked without required inputs it must fail closed with actionable diagnostics
 
 Mode contract:
 
@@ -533,12 +601,18 @@ Mode contract:
 - repeated determinism check (rerun + hash compare)
 - extended crash and retention variants
 - full release-evidence aggregation flow
+3. `provider-admission`:
+- runs conformance probes for all targets declared supported in release policy
+- may use non-local network
+- emits machine-readable provider-admission evidence
+- fails closed for any target without admitting evidence
 
 Cross-platform release gate:
 
 1. `full` must pass on at least one supported Linux host
 2. `full` must pass on at least one supported macOS host
-3. release floor closure requires both platform evidence sets admitted
+3. `provider-admission` must pass for all declared supported provider targets
+4. release floor closure requires both platform evidence sets admitted plus admitted provider-target evidence
 
 ## 11. Failure Injection And Multi-Upstream Simulation
 
@@ -611,11 +685,13 @@ Acceptance:
 Deliver:
 
 1. flake checks wired for `rfc-proof-e2e-fast` and `rfc-proof-e2e-full`
-2. CI policy enforcing platform gate matrix
+2. flake check wired for `rfc-proof-provider-admission`
+3. CI policy enforcing platform gate matrix and provider-admission policy
 
 Acceptance:
 
 1. Linux + macOS `full` pass required for release admission
+2. declared supported provider targets cannot be admitted without passing `provider-admission`
 
 ## 13. Validation Matrix (Release Gate vs Extended)
 
