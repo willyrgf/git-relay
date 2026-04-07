@@ -1909,6 +1909,89 @@ fn replication_reconcile_records_mixed_results_and_updates_internal_observed_ref
 }
 
 #[test]
+fn replication_reconcile_fail_closed_when_atomic_is_required_but_unsupported() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_non_atomic = temp.path().join("upstream-non-atomic.git");
+    init_bare_repo(&upstream_non_atomic);
+    StdCommand::new("git")
+        .arg(format!("--git-dir={}", upstream_non_atomic.display()))
+        .args(["config", "receive.advertiseAtomic", "false"])
+        .status()
+        .expect("git config")
+        .success()
+        .then_some(())
+        .expect("git config success");
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_non_atomic.to_str().expect("path"), true)],
+    );
+
+    let work_repo = temp.path().join("work-reconcile-atomic-required");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "reconcile",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            "github.com/example/repo.git",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("reconcile json");
+    let runs = report.as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run["repo_safety"], "degraded");
+    assert!(run["upstream_results"]
+        .as_array()
+        .expect("upstream results")
+        .iter()
+        .any(|item| {
+            item["upstream_id"] == "alpha"
+                && item["require_atomic"] == true
+                && item["state"] == "unsupported"
+                && item["atomic_capability"] == "unsupported"
+                && item["apply_attempted"] == false
+                && item["detail"]
+                    .as_str()
+                    .map(|value| value.contains("required atomic multi-ref apply"))
+                    .unwrap_or(false)
+        }));
+    assert!(
+        !git_ref_exists(&upstream_non_atomic, "refs/heads/main"),
+        "unsupported atomic upstream must not receive best-effort apply updates"
+    );
+}
+
+#[test]
 fn replication_reconcile_fails_closed_for_invalid_authoritative_repo() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
