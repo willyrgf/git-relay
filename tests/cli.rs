@@ -1135,6 +1135,42 @@ fn deploy_validate_runtime_reports_environment_and_contract_health() {
 }
 
 #[test]
+fn deploy_validate_runtime_fails_closed_for_nix_store_env_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let bad_config = temp.path().join("config-nix-store.toml");
+    let source = fs::read_to_string(&config_path).expect("config source");
+    let runtime_line = format!(
+        "runtime_env_file = \"{}\"",
+        temp.path().join("git-relay.env").display()
+    );
+    let bad_source = source.replace(
+        &runtime_line,
+        "runtime_env_file = \"/nix/store/fake-runtime.env\"",
+    );
+    fs::write(&bad_config, bad_source).expect("bad config");
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "deploy",
+            "validate-runtime",
+            "--config",
+            bad_config.to_str().expect("bad config"),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"status\": \"failed\""))
+        .stdout(predicate::str::contains("outside /nix/store"));
+}
+
+#[test]
 fn git_relayd_serve_once_fails_closed_when_runtime_env_file_is_missing() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
