@@ -18,13 +18,15 @@ pub fn definition() -> CaseDefinition {
             "p09.deterministic_and_idempotent",
             "p09.unsupported_grammar.fail_closed",
             "p09.out_of_matrix_nix.fail_closed",
-            "p09.failed_relock_restores_files",
+            "p09.scope_violation_restores_files",
+            "p09.non_idempotent_relock_restores_files",
         ],
         required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "supported literal rewrite is deterministic",
             "second rewrite is a no-op",
             "unsupported grammar and out-of-matrix versions fail closed",
+            "scope-violation and non-idempotent relock failures restore original files",
         ],
         fail_criteria: &[
             "targeted relock proceeds outside validated matrix",
@@ -203,6 +205,109 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     let unsupported_nix_restored =
         flake_before_bad_nix == flake_after_bad_nix && lock_before_bad_nix == lock_after_bad_nix;
 
+    let project_scope_violation = case_root.join("flake-scope-violation");
+    init_flake_project(
+        lab,
+        &project_scope_violation,
+        migration_flake_source(),
+        migration_lock_source(),
+    )?;
+    let flake_before_scope = fs::read_to_string(project_scope_violation.join("flake.nix"))
+        .map_err(|error| error.to_string())?;
+    let lock_before_scope = fs::read_to_string(project_scope_violation.join("flake.lock"))
+        .map_err(|error| error.to_string())?;
+    let scope_violation_lock = case_root.join("flake.lock.scope-violation");
+    fs::write(
+        &scope_violation_lock,
+        migration_lock_scope_violation_source(),
+    )
+    .map_err(|error| error.to_string())?;
+    let fake_nix_scope_violation = write_fake_nix_command(
+        &case_root,
+        "fake-nix-scope-violation",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &scope_violation_lock,
+        None,
+    )?;
+    let migrate_scope_violation = lab
+        .run_git_relay(
+            &[
+                "migrate-flake-inputs".to_owned(),
+                "--config".to_owned(),
+                lab.config_path.display().to_string(),
+                "--flake".to_owned(),
+                project_scope_violation.display().to_string(),
+                "--input-target".to_owned(),
+                "nixpkgs=git+https".to_owned(),
+                "--json".to_owned(),
+            ],
+            &[(
+                "GIT_RELAY_NIX_BIN".to_owned(),
+                fake_nix_scope_violation.display().to_string(),
+            )],
+        )
+        .map_err(|error| error.to_string())?;
+    let flake_after_scope = fs::read_to_string(project_scope_violation.join("flake.nix"))
+        .map_err(|error| error.to_string())?;
+    let lock_after_scope = fs::read_to_string(project_scope_violation.join("flake.lock"))
+        .map_err(|error| error.to_string())?;
+    let scope_violation_restored = !migrate_scope_violation.success()
+        && flake_before_scope == flake_after_scope
+        && lock_before_scope == lock_after_scope;
+
+    let project_non_idempotent = case_root.join("flake-non-idempotent");
+    init_flake_project(
+        lab,
+        &project_non_idempotent,
+        migration_flake_source(),
+        migration_lock_source(),
+    )?;
+    let flake_before_non_idempotent = fs::read_to_string(project_non_idempotent.join("flake.nix"))
+        .map_err(|error| error.to_string())?;
+    let lock_before_non_idempotent = fs::read_to_string(project_non_idempotent.join("flake.lock"))
+        .map_err(|error| error.to_string())?;
+    let non_idempotent_first_lock = case_root.join("flake.lock.non-idempotent.first");
+    let non_idempotent_second_lock = case_root.join("flake.lock.non-idempotent.second");
+    fs::write(&non_idempotent_first_lock, migration_lock_after_source())
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        &non_idempotent_second_lock,
+        migration_lock_non_idempotent_source(),
+    )
+    .map_err(|error| error.to_string())?;
+    let fake_nix_non_idempotent = write_fake_nix_command(
+        &case_root,
+        "fake-nix-non-idempotent",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &non_idempotent_first_lock,
+        Some(&non_idempotent_second_lock),
+    )?;
+    let migrate_non_idempotent = lab
+        .run_git_relay(
+            &[
+                "migrate-flake-inputs".to_owned(),
+                "--config".to_owned(),
+                lab.config_path.display().to_string(),
+                "--flake".to_owned(),
+                project_non_idempotent.display().to_string(),
+                "--input-target".to_owned(),
+                "nixpkgs=git+https".to_owned(),
+                "--json".to_owned(),
+            ],
+            &[(
+                "GIT_RELAY_NIX_BIN".to_owned(),
+                fake_nix_non_idempotent.display().to_string(),
+            )],
+        )
+        .map_err(|error| error.to_string())?;
+    let flake_after_non_idempotent = fs::read_to_string(project_non_idempotent.join("flake.nix"))
+        .map_err(|error| error.to_string())?;
+    let lock_after_non_idempotent = fs::read_to_string(project_non_idempotent.join("flake.lock"))
+        .map_err(|error| error.to_string())?;
+    let non_idempotent_restored = !migrate_non_idempotent.success()
+        && flake_before_non_idempotent == flake_after_non_idempotent
+        && lock_before_non_idempotent == lock_after_non_idempotent;
+
     report.assertions.push(if first.success() {
         ProofAssertion::pass(
             "p09.first_rewrite.success",
@@ -255,15 +360,26 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "targeted relock unexpectedly ran outside validated matrix",
         )
     });
-    report.assertions.push(if unsupported_nix_restored {
+    report.assertions.push(if scope_violation_restored {
         ProofAssertion::pass(
-            "p09.failed_relock_restores_files",
-            Some("unsupported relock attempt left flake files unchanged".to_owned()),
+            "p09.scope_violation_restores_files",
+            Some("scope-violation relock failure restored the original flake files".to_owned()),
         )
     } else {
         ProofAssertion::fail(
-            "p09.failed_relock_restores_files",
-            "unsupported relock attempt mutated flake sources",
+            "p09.scope_violation_restores_files",
+            "scope-violation relock failure left mutated flake sources behind",
+        )
+    });
+    report.assertions.push(if non_idempotent_restored {
+        ProofAssertion::pass(
+            "p09.non_idempotent_relock_restores_files",
+            Some("non-idempotent relock failure restored the original flake files".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p09.non_idempotent_relock_restores_files",
+            "non-idempotent relock failure left mutated flake sources behind",
         )
     });
 
@@ -274,6 +390,10 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "unsupported_grammar_rejected": unsupported_grammar_rejected,
         "unsupported_nix_rejected": !migrate_bad_nix.success(),
         "unsupported_nix_restored": unsupported_nix_restored,
+        "scope_violation": migrate_scope_violation.summary(),
+        "scope_violation_restored": scope_violation_restored,
+        "non_idempotent": migrate_non_idempotent.summary(),
+        "non_idempotent_restored": non_idempotent_restored,
     });
 
     Ok(report)
@@ -359,8 +479,10 @@ fn shell_quote(path: &Path) -> String {
 fn migration_flake_source() -> &'static str {
     r#"
 {
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs";
-  outputs = { self, nixpkgs }: { };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.overlay.url = "git+https://example.com/overlay";
+
+  outputs = { self, nixpkgs, overlay }: { };
 }
 "#
 }
@@ -380,11 +502,14 @@ fn migration_lock_source() -> &'static str {
   "nodes": {
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
       }
     },
     "nixpkgs": {
-      "inputs": {},
+      "inputs": {
+        "indirect": "indirect"
+      },
       "locked": {
         "type": "github",
         "owner": "NixOS",
@@ -394,7 +519,36 @@ fn migration_lock_source() -> &'static str {
       "original": {
         "type": "github",
         "owner": "NixOS",
-        "repo": "nixpkgs"
+        "repo": "nixpkgs",
+        "ref": "nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
       }
     }
   },
@@ -410,11 +564,14 @@ fn migration_lock_after_source() -> &'static str {
   "nodes": {
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
       }
     },
     "nixpkgs": {
-      "inputs": {},
+      "inputs": {
+        "indirect": "indirect"
+      },
       "locked": {
         "type": "git",
         "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
@@ -423,6 +580,152 @@ fn migration_lock_after_source() -> &'static str {
       "original": {
         "type": "git",
         "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
+fn migration_lock_scope_violation_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
+        "rev": "newrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev-violated"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+"#
+}
+
+fn migration_lock_non_idempotent_source() -> &'static str {
+    r#"
+{
+  "nodes": {
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "overlay": "overlay"
+      }
+    },
+    "nixpkgs": {
+      "inputs": {
+        "indirect": "indirect"
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable",
+        "rev": "newrev-second"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable"
+      }
+    },
+    "overlay": {
+      "inputs": {
+        "nixpkgs": ["nixpkgs"]
+      },
+      "locked": {
+        "type": "git",
+        "url": "git+https://example.com/overlay",
+        "rev": "overlayrev"
+      },
+      "original": {
+        "type": "git",
+        "url": "git+https://example.com/overlay"
+      }
+    },
+    "indirect": {
+      "inputs": {},
+      "locked": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive",
+        "rev": "indirectrev"
+      },
+      "original": {
+        "type": "github",
+        "owner": "example",
+        "repo": "transitive"
       }
     }
   },

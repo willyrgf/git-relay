@@ -712,7 +712,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Tighten P05 to prove recovery and later convergence do not depend on replayed push history.
 - [x] Tighten P06 to assert divergence-marker persistence before repair clears it.
 - [x] Tighten P08 so hidden-object leakage proof is mandatory whenever same-repo hidden-ref admission relies on SSH transport probing.
-- [ ] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
+- [x] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
 - [ ] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.
 - [ ] Implement release-report ingestion of machine-readable Git conformance evidence and add the positive P11 floor-closure path once that ingestion exists.
 - [ ] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
