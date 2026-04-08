@@ -152,23 +152,18 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "GIT_SSH_COMMAND".to_owned(),
         transport.ssh.git_ssh_command(),
     )];
-    let ssh_required = transport.ssh.shell_allows_remote_commands;
-    let ssh_parity = if ssh_required {
-        let capture = lab
-            .run_git(
-                &[
-                    "ls-remote".to_owned(),
-                    ssh_url.clone(),
-                    "refs/heads/main".to_owned(),
-                ],
-                None,
-                &ssh_env,
-            )
-            .map_err(|error| error.to_string())?;
-        capture.success() && capture.stdout.contains(&cache_main)
-    } else {
-        true
-    };
+    let ssh_capture = lab
+        .run_git(
+            &[
+                "ls-remote".to_owned(),
+                ssh_url.clone(),
+                "refs/heads/main".to_owned(),
+            ],
+            None,
+            &ssh_env,
+        )
+        .map_err(|error| error.to_string())?;
+    let ssh_parity = ssh_capture.success() && ssh_capture.stdout.contains(&cache_main);
     let http_url = transport.smart_http.remote_url_for_repo("relay-cache.git");
     let http_capture = lab
         .run_git(
@@ -318,7 +313,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "cache_command_fail_closed": cache_command_fail_closed,
         "pin_authoritative": pin_authoritative.summary(),
         "ssh_url": ssh_url,
-        "ssh_required": ssh_required,
+        "ssh_capture": ssh_capture.summary(),
         "ssh_parity": ssh_parity,
         "http_url": http_url,
         "http_parity": http_parity,

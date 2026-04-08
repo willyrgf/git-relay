@@ -69,7 +69,6 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "GIT_SSH_COMMAND".to_owned(),
         transport.ssh.git_ssh_command(),
     )];
-    let ssh_required = transport.ssh.shell_allows_remote_commands;
     let ssh_push = lab
         .run_git(
             &[
@@ -115,28 +114,21 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     let http_tag_exists = lab
         .git_ref_exists(&lab.authoritative_repo, "refs/tags/p02-http-tag")
         .map_err(|error| error.to_string())?;
-    let refs_ok = http_branch_exists
-        && http_tag_exists
-        && (!ssh_required || (ssh_branch_exists && ssh_tag_exists));
+    let refs_ok = http_branch_exists && http_tag_exists && ssh_branch_exists && ssh_tag_exists;
 
-    let ssh_internal_ref_attempt = if ssh_required {
-        Some(
-            lab.run_git(
-                &[
-                    "-C".to_owned(),
-                    work.display().to_string(),
-                    "push".to_owned(),
-                    ssh_url.clone(),
-                    "HEAD:refs/git-relay/p02-ssh-internal".to_owned(),
-                ],
-                None,
-                &ssh_env,
-            )
-            .map_err(|error| error.to_string())?,
+    let ssh_internal_ref_attempt = lab
+        .run_git(
+            &[
+                "-C".to_owned(),
+                work.display().to_string(),
+                "push".to_owned(),
+                ssh_url.clone(),
+                "HEAD:refs/git-relay/p02-ssh-internal".to_owned(),
+            ],
+            None,
+            &ssh_env,
         )
-    } else {
-        None
-    };
+        .map_err(|error| error.to_string())?;
     let http_internal_ref_attempt = lab
         .run_git(
             &[
@@ -152,26 +144,17 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             &[],
         )
         .map_err(|error| error.to_string())?;
-    let ssh_internal_ref_blocked = ssh_internal_ref_attempt
-        .as_ref()
-        .map(|output| !output.success())
-        .unwrap_or(true);
+    let ssh_internal_ref_blocked = !ssh_internal_ref_attempt.success();
     let http_internal_ref_blocked = !http_internal_ref_attempt.success();
-    let ssh_internal_ref_exists = if ssh_required {
-        lab.git_ref_exists(&lab.authoritative_repo, "refs/git-relay/p02-ssh-internal")
-            .map_err(|error| error.to_string())?
-    } else {
-        false
-    };
+    let ssh_internal_ref_exists = lab
+        .git_ref_exists(&lab.authoritative_repo, "refs/git-relay/p02-ssh-internal")
+        .map_err(|error| error.to_string())?;
     let http_internal_ref_exists = lab
         .git_ref_exists(&lab.authoritative_repo, "refs/git-relay/p02-http-internal")
         .map_err(|error| error.to_string())?;
-    let ssh_branch_still_exists = if ssh_required {
-        lab.git_ref_exists(&lab.authoritative_repo, "refs/heads/p02-ssh")
-            .map_err(|error| error.to_string())?
-    } else {
-        true
-    };
+    let ssh_branch_still_exists = lab
+        .git_ref_exists(&lab.authoritative_repo, "refs/heads/p02-ssh")
+        .map_err(|error| error.to_string())?;
     let http_branch_still_exists = lab
         .git_ref_exists(&lab.authoritative_repo, "refs/heads/p02-http")
         .map_err(|error| error.to_string())?;
@@ -180,11 +163,6 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         ProofAssertion::pass(
             "p02.ssh.multi_ref",
             Some("ssh multi-ref push accepted".to_owned()),
-        )
-    } else if !ssh_required {
-        ProofAssertion::pass(
-            "p02.ssh.multi_ref",
-            Some("ssh multi-ref command-path checks skipped because current user shell is non-interactive".to_owned()),
         )
     } else {
         ProofAssertion::fail("p02.ssh.multi_ref", ssh_push.summary())
@@ -254,13 +232,12 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "ssh_url": ssh_url,
         "ssh_push": ssh_push.summary(),
         "http_push": http_push.summary(),
-        "ssh_required": ssh_required,
         "ssh_branch_exists": ssh_branch_exists,
         "ssh_tag_exists": ssh_tag_exists,
         "http_branch_exists": http_branch_exists,
         "http_tag_exists": http_tag_exists,
         "refs_ok": refs_ok,
-        "ssh_internal_ref_attempt": ssh_internal_ref_attempt.as_ref().map(|output| output.summary()),
+        "ssh_internal_ref_attempt": ssh_internal_ref_attempt.summary(),
         "http_internal_ref_attempt": http_internal_ref_attempt.summary(),
         "ssh_internal_ref_blocked": ssh_internal_ref_blocked,
         "http_internal_ref_blocked": http_internal_ref_blocked,

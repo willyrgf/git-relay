@@ -54,7 +54,6 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         "GIT_SSH_COMMAND".to_owned(),
         transport.ssh.git_ssh_command(),
     )];
-    let ssh_required = transport.ssh.shell_allows_remote_commands;
     let ssh_push = lab
         .run_git(
             &[
@@ -109,14 +108,6 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             "p01.ssh.push",
             Some("ssh push committed local ref".to_owned()),
         )
-    } else if !ssh_required {
-        ProofAssertion::pass(
-            "p01.ssh.push",
-            Some(
-                "ssh command-path checks skipped because current user shell is non-interactive"
-                    .to_owned(),
-            ),
-        )
     } else {
         ProofAssertion::fail("p01.ssh.push", ssh_push.summary())
     });
@@ -128,10 +119,13 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
     } else {
         ProofAssertion::fail("p01.smart_http.push", http_push.summary())
     });
-    report.assertions.push(if http_ref && (ssh_ref || !ssh_required) {
+    report.assertions.push(if http_ref && ssh_ref {
         ProofAssertion::pass(
             "p01.refs.present",
-            Some("ingress refs expected for this host profile are present in authoritative repository".to_owned()),
+            Some(
+                "ssh and smart-http ingress refs are present in the authoritative repository"
+                    .to_owned(),
+            ),
         )
     } else {
         ProofAssertion::fail(
@@ -175,7 +169,6 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         "ssh_url": ssh_url,
         "ssh_push": ssh_push.summary(),
         "http_push": http_push.summary(),
-        "ssh_required": ssh_required,
         "ssh_ref_present": ssh_ref,
         "http_ref_present": http_ref,
         "fsck_clean": fsck_ok,

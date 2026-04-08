@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -47,7 +46,6 @@ pub struct SshTransport {
     pub client_key: PathBuf,
     pub known_hosts: PathBuf,
     pub ssh_bin: PathBuf,
-    pub shell_allows_remote_commands: bool,
     child: Child,
 }
 
@@ -123,6 +121,7 @@ impl TransportHarness {
             &ssh_keygen_bin,
             current_user(),
         )?;
+        probe_git_ssh_ready(repo_root, &ssh)?;
 
         let smart_http =
             start_smart_http(case_root, repo_root, &python_bin, &git_http_backend_bin)?;
@@ -238,17 +237,12 @@ fn start_sshd(
         });
     }
 
-    let shell_allows_remote_commands = current_user_shell()
-        .map(|shell| !shell_is_noninteractive(&shell))
-        .unwrap_or(true);
-
     Ok(SshTransport {
         port,
         user,
         client_key,
         known_hosts,
         ssh_bin: ssh_bin.to_path_buf(),
-        shell_allows_remote_commands,
         child,
     })
 }
@@ -380,6 +374,43 @@ fn run_command(program: &Path, args: &[String]) -> Result<(), TransportError> {
     })
 }
 
+fn probe_git_ssh_ready(repo_root: &Path, ssh: &SshTransport) -> Result<(), TransportError> {
+    let probe_repo = repo_root.join("relay-authoritative.git");
+    let output = Command::new("git")
+        .env("GIT_SSH_COMMAND", ssh.git_ssh_command())
+        .arg("ls-remote")
+        .arg(ssh.remote_url_for_repo(&probe_repo))
+        .arg("HEAD")
+        .output()
+        .map_err(|source| TransportError::Spawn {
+            program: "git".to_owned(),
+            source,
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if stderr.is_empty() && stdout.is_empty() {
+        "git ls-remote over SSH failed without output".to_owned()
+    } else if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stderr} | {stdout}")
+    };
+
+    Err(TransportError::Readiness {
+        detail: format!(
+            "git-over-ssh readiness probe against {} failed: {detail}",
+            probe_repo.display()
+        ),
+    })
+}
+
 fn pick_free_port() -> Result<u16, TransportError> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|source| TransportError::Spawn {
         program: "bind".to_owned(),
@@ -431,39 +462,6 @@ fn current_user() -> String {
     }
 
     "unknown".to_owned()
-}
-
-fn current_user_shell() -> Option<String> {
-    // SAFETY: libc calls are used read-only to resolve current uid shell metadata.
-    let uid = unsafe { libc::geteuid() };
-    // SAFETY: getpwuid returns either null or a valid pointer managed by libc.
-    let pwd = unsafe { libc::getpwuid(uid) };
-    if pwd.is_null() {
-        return None;
-    }
-    // SAFETY: when pwd is non-null, pw_shell is either null or points to a C string.
-    let shell_ptr = unsafe { (*pwd).pw_shell };
-    if shell_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: shell_ptr points to a valid NUL-terminated string owned by libc.
-    let shell = unsafe { CStr::from_ptr(shell_ptr) }
-        .to_string_lossy()
-        .trim()
-        .to_owned();
-    if shell.is_empty() {
-        None
-    } else {
-        Some(shell)
-    }
-}
-
-fn shell_is_noninteractive(shell: &str) -> bool {
-    Path::new(shell)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| matches!(name, "nologin" | "false"))
-        .unwrap_or(false)
 }
 
 fn current_time_ms() -> u128 {

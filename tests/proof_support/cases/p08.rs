@@ -37,12 +37,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "GIT_SSH_COMMAND".to_owned(),
         transport.ssh.git_ssh_command(),
     )];
-    let ssh_required = transport.ssh.shell_allows_remote_commands;
-    let target_url = if ssh_required {
-        ssh_url.clone()
-    } else {
-        lab.upstream_alpha.display().to_string()
-    };
+    let target_url = ssh_url.clone();
 
     lab.write_authoritative_descriptor_with_write_upstreams(&[(
         "alpha",
@@ -99,17 +94,12 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 manifest.display().to_string(),
                 "--json".to_owned(),
             ],
-            if ssh_required {
-                &ssh_env
-            } else {
-                &[] as &[(String, String)]
-            },
+            &ssh_env,
         )
         .map_err(|error| error.to_string())?;
 
     let mut rejected_when_leaky = false;
     let mut hidden_object_leakage_rejected = false;
-    let hidden_object_probe_expected = ssh_required;
     let mut first_reasons: Vec<String> = Vec::new();
     if first.success() {
         let parsed: serde_json::Value =
@@ -187,11 +177,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 manifest.display().to_string(),
                 "--json".to_owned(),
             ],
-            if ssh_required {
-                &ssh_env
-            } else {
-                &[] as &[(String, String)]
-            },
+            &ssh_env,
         )
         .map_err(|error| error.to_string())?;
 
@@ -229,11 +215,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                     "refs/git-relay/*".to_owned(),
                 ],
                 None,
-                if ssh_required {
-                    &ssh_env
-                } else {
-                    &[] as &[(String, String)]
-                },
+                &ssh_env,
             )
             .map_err(|error| error.to_string())?;
         capture.success() && capture.stdout.trim().is_empty()
@@ -269,28 +251,18 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "hardened target did not reach admitted status",
         )
     });
-    report.assertions.push(if hidden_object_probe_expected {
-        if hidden_object_leakage_rejected {
-            ProofAssertion::pass(
-                "p08.rejects_hidden_object_leakage",
-                Some(
-                    "target was rejected when a hidden object remained fetchable by guessed oid"
-                        .to_owned(),
-                ),
-            )
-        } else {
-            ProofAssertion::fail(
-                "p08.rejects_hidden_object_leakage",
-                "target did not report hidden-object leakage rejection while same_repo_hidden_refs admission was leaky",
-            )
-        }
-    } else {
+    report.assertions.push(if hidden_object_leakage_rejected {
         ProofAssertion::pass(
             "p08.rejects_hidden_object_leakage",
             Some(
-                "hidden-object leakage probe is not applicable when target URL falls back to local-path transport"
+                "target was rejected when a hidden object remained fetchable by guessed oid"
                     .to_owned(),
             ),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p08.rejects_hidden_object_leakage",
+            "target did not report hidden-object leakage rejection while same_repo_hidden_refs admission was leaky",
         )
     });
     report.assertions.push(if hidden_refs_not_advertised {
@@ -308,8 +280,6 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     report.details = json!({
         "ssh_url": ssh_url,
         "target_url": target_url,
-        "ssh_required": ssh_required,
-        "hidden_object_probe_expected": hidden_object_probe_expected,
         "rejected_when_leaky": rejected_when_leaky,
         "hidden_object_leakage_rejected": hidden_object_leakage_rejected,
         "admitted_after_hardening": admitted_after_hardening,

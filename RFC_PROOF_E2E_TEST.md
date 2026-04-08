@@ -1,6 +1,6 @@
 # RFC Proof E2E Test Plan (Deterministic Rust + Nix)
 
-Status: implementation-driving (decisions fixed)  
+Status: implementation-driving (partially implemented; remaining-work checklist updated 2026-04-08)  
 Audience: maintainers implementing release-gating proof for `git-relay`
 
 ## 1. Purpose
@@ -692,6 +692,32 @@ Acceptance:
 
 1. Linux + macOS `full` pass required for release admission
 2. declared supported provider targets cannot be admitted without passing `provider-admission`
+
+### Current repository status checklist (updated 2026-04-08)
+
+Completed in the current repository state:
+
+- [x] M0 contract freeze content is present in this document.
+- [x] M1 harness foundation exists: `tests/rfc_proof_e2e.rs`, `tests/proof_support/*`, raw + normalized artifacts, redaction, and canonical normalization are implemented.
+- [x] P01-P11 case modules exist and run in the proof harness on the current host.
+- [x] `flake.nix` wires `rfc-proof-e2e-fast`, `rfc-proof-e2e-full`, and `rfc-proof-provider-admission`.
+
+Still required before this RFC proof contract is fully satisfied:
+
+- [x] Remove SSH skip-to-pass behavior and require SSH evidence in deterministic-core proof runs.
+- [ ] Align `fast` mode with the mandatory-scenarios contract for P01 crash-boundary coverage, or narrow the mode contract if crash-boundary coverage remains `full`-only.
+- [ ] Add explicit P02 client-side pruning evidence.
+- [ ] Tighten P03 to assert mixed terminal per-upstream outcomes explicitly, not only upstream count and ordering.
+- [ ] Tighten P04 to assert repository safety degradation explicitly when `require_atomic = true` cannot be admitted.
+- [ ] Tighten P05 to prove recovery and later convergence do not depend on replayed push history.
+- [ ] Tighten P06 to assert divergence-marker persistence before repair clears it.
+- [ ] Tighten P08 so hidden-object leakage proof is mandatory whenever same-repo hidden-ref admission relies on SSH transport probing.
+- [ ] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
+- [ ] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.
+- [ ] Implement release-report ingestion of machine-readable Git conformance evidence and add the positive P11 floor-closure path once that ingestion exists.
+- [ ] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
+- [ ] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
+- [ ] Align normalization and failure-capture outputs with the documented contract, including `repo_id` semantic ordering, per-step failure capture naming, and deterministic git-conformance timestamps or an explicitly narrowed determinism claim.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
 
