@@ -706,7 +706,7 @@ Still required before this RFC proof contract is fully satisfied:
 
 - [x] Remove SSH skip-to-pass behavior and require SSH evidence in deterministic-core proof runs.
 - [x] Align `fast` mode with the mandatory-scenarios contract for P01 crash-boundary coverage, or narrow the mode contract if crash-boundary coverage remains `full`-only.
-- [ ] Add explicit P02 client-side pruning evidence.
+- [x] Add explicit P02 client-side pruning evidence.
 - [ ] Tighten P03 to assert mixed terminal per-upstream outcomes explicitly, not only upstream count and ordering.
 - [ ] Tighten P04 to assert repository safety degradation explicitly when `require_atomic = true` cannot be admitted.
 - [ ] Tighten P05 to prove recovery and later convergence do not depend on replayed push history.
