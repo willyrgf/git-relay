@@ -14,6 +14,7 @@ pub fn definition() -> CaseDefinition {
             "p04.alpha.supported",
             "p04.beta.unsupported",
             "p04.require_atomic.fail_closed",
+            "p04.require_atomic.degraded_safety",
             "p04.probe.cleanup",
         ],
         required_artifacts: STANDARD_CASE_ARTIFACTS,
@@ -21,6 +22,7 @@ pub fn definition() -> CaseDefinition {
             "alpha classified supported",
             "beta classified unsupported when atomic missing",
             "require_atomic targets are never silently downgraded",
+            "repository safety degrades explicitly when require_atomic upstreams remain unsupported",
         ],
         fail_criteria: &[
             "unsupported atomic capability treated as supported",
@@ -53,7 +55,6 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     lab.write_authoritative_descriptor_with_write_upstreams(&[
         ("alpha", &lab.upstream_alpha, true),
         ("beta", &lab.upstream_beta, true),
-        ("gamma", &lab.upstream_gamma_missing, false),
     ])
     .map_err(|error| error.to_string())?;
 
@@ -75,6 +76,8 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     let mut alpha_supported = false;
     let mut beta_unsupported = false;
     let mut require_atomic_fail_closed = false;
+    let mut degraded_safety = false;
+    let mut reconcile_details = json!(null);
 
     if capture.success() {
         let parsed: serde_json::Value =
@@ -100,6 +103,43 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                     })
                     .all(|entry| entry["supported_for_policy"] == false);
             }
+        }
+    }
+
+    let reconcile = lab
+        .run_git_relay(
+            &[
+                "replication".to_owned(),
+                "reconcile".to_owned(),
+                "--config".to_owned(),
+                lab.config_path.display().to_string(),
+                "--repo".to_owned(),
+                AUTHORITATIVE_REPO_ID.to_owned(),
+                "--json".to_owned(),
+            ],
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    if reconcile.success() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reconcile.stdout).map_err(|error| error.to_string())?;
+        if let Some(run) = parsed.as_array().and_then(|runs| runs.first()) {
+            degraded_safety = run["repo_safety"] == "degraded"
+                && run["upstream_results"]
+                    .as_array()
+                    .map(|results| {
+                        results.iter().any(|entry| {
+                            entry["upstream_id"] == "beta"
+                                && entry["state"] == "unsupported"
+                                && entry["apply_attempted"] == false
+                                && entry["atomic_capability"] == "unsupported"
+                        })
+                    })
+                    .unwrap_or(false);
+            reconcile_details = json!({
+                "repo_safety": run["repo_safety"],
+                "upstream_results": run["upstream_results"],
+            });
         }
     }
 
@@ -145,6 +185,17 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "require_atomic target was silently downgraded",
         )
     });
+    report.assertions.push(if degraded_safety {
+        ProofAssertion::pass(
+            "p04.require_atomic.degraded_safety",
+            Some(
+                "reconcile kept beta unsupported and surfaced degraded repository safety"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        ProofAssertion::fail("p04.require_atomic.degraded_safety", reconcile.summary())
+    });
     report.assertions.push(if probe_refs_clean {
         ProofAssertion::pass(
             "p04.probe.cleanup",
@@ -161,6 +212,9 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "alpha_supported": alpha_supported,
         "beta_unsupported": beta_unsupported,
         "require_atomic_fail_closed": require_atomic_fail_closed,
+        "degraded_safety": degraded_safety,
+        "reconcile": reconcile.summary(),
+        "reconcile_details": reconcile_details,
         "probe_refs_clean": probe_refs_clean,
     });
 
