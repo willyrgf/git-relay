@@ -156,6 +156,11 @@ fn normalize_ssh_fingerprint(source: &str) -> String {
 fn sort_semantic_array(values: &mut [Value]) {
     let key = if values
         .iter()
+        .all(|entry| entry.get("repo_id").and_then(Value::as_str).is_some())
+    {
+        Some("repo_id")
+    } else if values
+        .iter()
         .all(|entry| entry.get("case_id").and_then(Value::as_str).is_some())
     {
         Some("case_id")
@@ -221,5 +226,21 @@ mod tests {
             .as_str()
             .expect("fingerprint")
             .contains("SHA256:<fingerprint>"));
+    }
+
+    #[test]
+    fn sorts_repo_arrays_semantically() {
+        let raw = serde_json::json!([
+            {"repo_id": "zeta", "value": 1},
+            {"repo_id": "alpha", "value": 2}
+        ]);
+        let normalized = normalize_value(&raw, &NormalizeContext { temp_roots: vec![] });
+        let repos = normalized
+            .as_array()
+            .expect("repo array")
+            .iter()
+            .map(|entry| entry["repo_id"].as_str().expect("repo_id"))
+            .collect::<Vec<_>>();
+        assert_eq!(repos, vec!["alpha", "zeta"]);
     }
 }

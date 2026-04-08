@@ -186,7 +186,7 @@ pub fn git_conformance_evidence_value(input: GitConformanceEvidenceInput<'_>) ->
         "cases": case_values,
         "all_mandatory_cases_passed": input.required_cases_passed,
         "normalized_summary_sha256": input.normalized_summary_sha256,
-        "recorded_at_ms": current_time_ms(),
+        "recorded_at_ms": 0,
     })
 }
 
@@ -386,17 +386,14 @@ fn sanitize_key(value: &str) -> String {
         .collect()
 }
 
-fn current_time_ms() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{contains_secret_patterns, redact_secrets};
+    use std::collections::BTreeMap;
+
+    use super::{
+        contains_secret_patterns, git_conformance_evidence_value, redact_secrets,
+        GitConformanceEvidenceInput,
+    };
 
     #[test]
     fn redacts_known_secret_classes() {
@@ -410,5 +407,25 @@ mod tests {
             &redacted,
             &[("TOKEN".to_owned(), "abc".to_owned())]
         ));
+    }
+
+    #[test]
+    fn git_conformance_evidence_uses_deterministic_timestamp() {
+        let evidence = git_conformance_evidence_value(GitConformanceEvidenceInput {
+            profile: "deterministic-core",
+            platform: "linux",
+            git_version: "git version 2.53.0",
+            openssh_version: "OpenSSH_10.2p1",
+            nix_system: "x86_64-linux",
+            service_manager: "systemd",
+            filesystem_profile: "ext4",
+            git_relay_commit: "abc123",
+            flake_lock_sha256: "deadbeef",
+            binary_digests: BTreeMap::new(),
+            case_summaries: vec![("P01".to_owned(), true)],
+            required_cases_passed: true,
+            normalized_summary_sha256: "cafebabe",
+        });
+        assert_eq!(evidence["recorded_at_ms"], 0);
     }
 }

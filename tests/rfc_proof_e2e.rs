@@ -172,7 +172,13 @@ fn run_case(
     let _ = lab.persist_case_artifacts(case.case_id, &redacted_case_json)?;
 
     if result.status == CaseStatus::Fail {
-        persist_failure_capture(lab, case.case_id, &redacted_case_json, &result.assertions)?;
+        persist_failure_capture(
+            lab,
+            case.case_id,
+            &redacted_case_json,
+            &result.assertions,
+            &result.contract_validation.errors,
+        )?;
     }
 
     Ok(result.finish())
@@ -263,6 +269,7 @@ fn persist_failure_capture(
     case_id: &str,
     redacted_case_json: &serde_json::Value,
     assertions: &[ProofAssertion],
+    contract_validation_errors: &[String],
 ) -> Result<(), LabError> {
     let failure_root = lab.suite_root.join("failures").join(case_id);
     std::fs::create_dir_all(&failure_root).map_err(|source| LabError::CreateDir {
@@ -270,28 +277,35 @@ fn persist_failure_capture(
         source,
     })?;
 
-    let stdout_path = failure_root.join("case.stdout.txt");
-    let stderr_path = failure_root.join("case.stderr.txt");
     let pretty =
         serde_json::to_string_pretty(redacted_case_json).map_err(|source| LabError::ParseJson {
-            path: stdout_path.clone(),
+            path: failure_root.join("case.stdout.txt"),
             source,
         })?;
-    let failures = assertions
+
+    let mut failure_steps = assertions
         .iter()
         .filter(|assertion| assertion.status == CaseStatus::Fail)
         .map(|assertion| {
-            format!(
-                "{}: {}",
-                assertion.id,
-                assertion.detail.clone().unwrap_or_default()
+            (
+                failure_step_name(case_id, &assertion.id),
+                assertion.detail.clone().unwrap_or_default(),
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    if !contract_validation_errors.is_empty() {
+        failure_steps.push((
+            "contract_validation".to_owned(),
+            contract_validation_errors.join("\n"),
+        ));
+    }
 
-    artifact::redact_and_persist_failures(&stdout_path, &pretty, lab.runner.secret_pairs())?;
-    artifact::redact_and_persist_failures(&stderr_path, &failures, lab.runner.secret_pairs())?;
+    for (step, detail) in failure_steps {
+        let stdout_path = failure_root.join(format!("{step}.stdout.txt"));
+        let stderr_path = failure_root.join(format!("{step}.stderr.txt"));
+        artifact::redact_and_persist_failures(&stdout_path, &pretty, lab.runner.secret_pairs())?;
+        artifact::redact_and_persist_failures(&stderr_path, &detail, lab.runner.secret_pairs())?;
+    }
     Ok(())
 }
 
@@ -299,6 +313,20 @@ fn read_summary_hash(suite_root: &Path) -> Result<String, String> {
     std::fs::read_to_string(suite_root.join("summary.normalized.sha256"))
         .map(|value| value.trim().to_owned())
         .map_err(|error| error.to_string())
+}
+
+fn failure_step_name(case_id: &str, assertion_id: &str) -> String {
+    let prefix = format!("{}.", case_id.to_ascii_lowercase());
+    let step = assertion_id
+        .strip_prefix(&prefix)
+        .unwrap_or(assertion_id)
+        .trim();
+    let sanitized = sanitize_key(step);
+    if sanitized.is_empty() {
+        "case".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 fn sanitize_key(value: &str) -> String {
@@ -314,22 +342,29 @@ fn sanitize_key(value: &str) -> String {
         .collect()
 }
 
-fn assert_conformance_manifest_exists(
+fn git_conformance_manifest_path(
     suite_root: &Path,
-    mode: ProofMode,
     summary: &ProofSuiteSummaryRaw,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let platform = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
         other => return Err(format!("unsupported platform {other}")),
     };
     let git_key = sanitize_key(&summary.toolchain.git_version);
-    let path = suite_root
+    Ok(suite_root
         .join("manifests")
         .join("git-conformance")
         .join(platform)
-        .join(format!("{git_key}.json"));
+        .join(format!("{git_key}.json")))
+}
+
+fn assert_conformance_manifest_exists(
+    suite_root: &Path,
+    mode: ProofMode,
+    summary: &ProofSuiteSummaryRaw,
+) -> Result<(), String> {
+    let path = git_conformance_manifest_path(suite_root, summary)?;
     if !path.exists() {
         return Err(format!(
             "missing git conformance manifest {}",
@@ -350,6 +385,14 @@ fn assert_conformance_manifest_exists(
         return Err("all_mandatory_cases_passed did not align with suite status".to_owned());
     }
     Ok(())
+}
+
+fn read_conformance_manifest_hash(
+    suite_root: &Path,
+    summary: &ProofSuiteSummaryRaw,
+) -> Result<String, String> {
+    let path = git_conformance_manifest_path(suite_root, summary)?;
+    artifact::hash_file_sha256(&path).map_err(|error| error.to_string())
 }
 
 fn init_provider_target_repo(path: &Path) -> Result<(), String> {
@@ -443,6 +486,8 @@ fn proof_e2e_full_profile_reruns_and_hashes() {
     )
     .expect("run first full suite");
     let first_hash = read_summary_hash(&first_root).expect("first hash");
+    let first_conformance_hash =
+        read_conformance_manifest_hash(&first_root, &first).expect("first conformance hash");
 
     let (second_root, second) = run_suite(
         ProofMode::Full,
@@ -452,10 +497,16 @@ fn proof_e2e_full_profile_reruns_and_hashes() {
     )
     .expect("run second full suite");
     let second_hash = read_summary_hash(&second_root).expect("second hash");
+    let second_conformance_hash =
+        read_conformance_manifest_hash(&second_root, &second).expect("second conformance hash");
 
     assert_eq!(
         first_hash, second_hash,
         "full profile requires deterministic rerun hash equality"
+    );
+    assert_eq!(
+        first_conformance_hash, second_conformance_hash,
+        "full profile requires deterministic git conformance evidence"
     );
     assert_eq!(first.overall_status, CaseStatus::Pass);
     assert_eq!(second.overall_status, CaseStatus::Pass);
