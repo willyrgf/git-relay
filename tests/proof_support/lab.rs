@@ -197,6 +197,17 @@ pub struct ProofLab {
     structured_events: Vec<Value>,
 }
 
+struct GitConformanceBuild<'a> {
+    profile: &'a str,
+    platform: &'a str,
+    git_version: &'a str,
+    service_manager: &'a str,
+    filesystem_profile: &'a str,
+    case_summaries: Vec<(String, bool)>,
+    required_cases_passed: bool,
+    normalized_summary_sha256: &'a str,
+}
+
 impl ProofLab {
     pub fn new(
         profile: &LabProfile,
@@ -772,16 +783,16 @@ url = "{read_url}"
         let case_summaries = (1..=11)
             .map(|index| (format!("P{index:02}"), required_cases_passed))
             .collect::<Vec<_>>();
-        let evidence = self.build_git_conformance_evidence(
-            "deterministic-core",
+        let evidence = self.build_git_conformance_evidence(GitConformanceBuild {
+            profile: "deterministic-core",
             platform,
             git_version,
             service_manager,
-            &filesystem_profile,
+            filesystem_profile: &filesystem_profile,
             case_summaries,
             required_cases_passed,
-            "synthetic-p11-summary",
-        )?;
+            normalized_summary_sha256: "synthetic-p11-summary",
+        })?;
         let root = self.state_root.join("release").join("git-conformance");
         let path = artifact::git_conformance_manifest_path(&root, platform, git_version);
         artifact::persist_json(&path, &evidence)?;
@@ -971,16 +982,16 @@ url = "{read_url}"
             .iter()
             .map(|case| (case.case_id.clone(), case.status.to_bool()))
             .collect::<Vec<_>>();
-        let evidence = self.build_git_conformance_evidence(
-            summary.mode.profile_label(),
+        let evidence = self.build_git_conformance_evidence(GitConformanceBuild {
+            profile: summary.mode.profile_label(),
             platform,
-            &summary.toolchain.git_version,
+            git_version: &summary.toolchain.git_version,
             service_manager,
-            &filesystem_profile,
+            filesystem_profile: &filesystem_profile,
             case_summaries,
-            summary.overall_status == CaseStatus::Pass,
-            normalized_hash,
-        )?;
+            required_cases_passed: summary.overall_status == CaseStatus::Pass,
+            normalized_summary_sha256: normalized_hash,
+        })?;
 
         let suite_root = self.suite_root.join("manifests").join("git-conformance");
         let suite_path = artifact::git_conformance_manifest_path(
@@ -1003,14 +1014,7 @@ url = "{read_url}"
 
     fn build_git_conformance_evidence(
         &self,
-        profile: &str,
-        platform: &str,
-        git_version: &str,
-        service_manager: &str,
-        filesystem_profile: &str,
-        case_summaries: Vec<(String, bool)>,
-        required_cases_passed: bool,
-        normalized_summary_sha256: &str,
+        input: GitConformanceBuild<'_>,
     ) -> Result<Value, LabError> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let flake_lock = repo_root.join("flake.lock");
@@ -1049,21 +1053,21 @@ url = "{read_url}"
 
         Ok(git_conformance_evidence_value(
             GitConformanceEvidenceInput {
-                profile,
-                platform,
-                git_version,
+                profile: input.profile,
+                platform: input.platform,
+                git_version: input.git_version,
                 openssh_version: &self.toolchain.openssh_version,
                 nix_system: &std::env::var("NIX_SYSTEM").unwrap_or_else(|_| {
                     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
                 }),
-                service_manager,
-                filesystem_profile,
+                service_manager: input.service_manager,
+                filesystem_profile: input.filesystem_profile,
                 git_relay_commit: &git_commit,
                 flake_lock_sha256: &flake_lock_sha256,
                 binary_digests,
-                case_summaries,
-                required_cases_passed,
-                normalized_summary_sha256,
+                case_summaries: input.case_summaries,
+                required_cases_passed: input.required_cases_passed,
+                normalized_summary_sha256: input.normalized_summary_sha256,
             },
         ))
     }

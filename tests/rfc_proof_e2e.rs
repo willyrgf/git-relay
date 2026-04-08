@@ -467,6 +467,208 @@ fn proof_case_definitions_declare_required_assertions_and_artifacts() {
     }
 }
 
+fn case_definition(case_id: &str) -> proof_support::cases::CaseDefinition {
+    proof_support::cases::all_cases()
+        .into_iter()
+        .find(|case| case.case_id == case_id)
+        .unwrap_or_else(|| panic!("missing proof case definition for {case_id}"))
+}
+
+fn assert_required_assertions(case_id: &str, expected_subset: &[&str]) {
+    let case = case_definition(case_id);
+    let actual = case
+        .required_assertions
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for expected in expected_subset {
+        assert!(
+            actual.contains(expected),
+            "{case_id} required assertions drifted: missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn proof_e2e_fast_profile_contract_declared() {
+    let cases = proof_support::cases::all_cases();
+    let case_ids = cases.iter().map(|case| case.case_id).collect::<Vec<_>>();
+    assert_eq!(
+        case_ids,
+        vec!["P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10", "P11"],
+        "fast deterministic-core contract must cover the mandatory P01-P11 matrix"
+    );
+
+    assert_required_assertions(
+        "P01",
+        &[
+            "p01.ssh.push",
+            "p01.smart_http.push",
+            "p01.refs.present",
+            "p01.fsck",
+            "p01.crash_boundary",
+            "p01.post_receive.non_critical",
+        ],
+    );
+    assert_required_assertions(
+        "P02",
+        &[
+            "p02.ssh.multi_ref",
+            "p02.http.multi_ref",
+            "p02.refs.committed",
+            "p02.client_side_pruning.evidence",
+            "p02.invalid_updates.rejected",
+            "p02.invalid_updates.no_partial_delete",
+            "p02.contract.local_commit_only",
+        ],
+    );
+    assert_required_assertions(
+        "P03",
+        &[
+            "p03.reconcile.completed",
+            "p03.mixed_terminal_outcomes",
+            "p03.single_run_contains_upstreams",
+            "p03.stale_run_superseded",
+            "p03.transient_markers_cleaned",
+        ],
+    );
+    assert_required_assertions(
+        "P04",
+        &[
+            "p04.probe.completed",
+            "p04.alpha.supported",
+            "p04.beta.unsupported",
+            "p04.require_atomic.fail_closed",
+            "p04.require_atomic.degraded_safety",
+        ],
+    );
+    assert_required_assertions(
+        "P05",
+        &[
+            "p05.first_run.executed",
+            "p05.no_optimistic_observed_ref",
+            "p05.recomputed_from_current_local_refs",
+            "p05.second_run.converged",
+            "p05.observed_matches_local",
+        ],
+    );
+    assert_required_assertions(
+        "P06",
+        &[
+            "p06.divergence.detected",
+            "p06.divergence_marker.persisted",
+            "p06.push.blocked",
+            "p06.repair.reconciled",
+        ],
+    );
+    assert_required_assertions(
+        "P07",
+        &[
+            "p07.read_prepare.success",
+            "p07.cache_ref_matches_upstream",
+            "p07.cache_fail_closed_on_authoritative",
+            "p07.ssh.read_path.parity",
+            "p07.http.read_path.parity",
+            "p07.stale_if_error.serves_stale",
+            "p07.negative_cache.hit",
+        ],
+    );
+    assert_required_assertions(
+        "P08",
+        &[
+            "p08.first_probe.executed",
+            "p08.rejects_hidden_ref_leakage",
+            "p08.admits_hardened_target",
+            "p08.rejects_hidden_object_leakage",
+            "p08.blocks_hidden_object_fetch_after_hardening",
+            "p08.hidden_refs_not_advertised",
+        ],
+    );
+    assert_required_assertions(
+        "P09",
+        &[
+            "p09.first_rewrite.success",
+            "p09.second_rewrite.success",
+            "p09.deterministic_and_idempotent",
+            "p09.unsupported_grammar.fail_closed",
+            "p09.out_of_matrix_nix.fail_closed",
+            "p09.scope_violation_restores_files",
+            "p09.non_idempotent_relock_restores_files",
+        ],
+    );
+    assert_required_assertions(
+        "P10",
+        &[
+            "p10.runtime_validation.passed",
+            "p10.runtime_validation.fail_closed",
+            "p10.runtime_validation.rejects_nix_store",
+            "p10.serve_once.drains_pending",
+            "p10.retention.pruning",
+        ],
+    );
+    assert_required_assertions(
+        "P11",
+        &[
+            "p11.seed.push",
+            "p11.release_manifest.fail_closed",
+            "p11.release_manifest.supported_target_admitted",
+            "p11.release_manifest.persisted",
+            "p11.release_floor.open_without_full_evidence",
+            "p11.release_floor.closed_with_full_evidence",
+            "p11.release_blocking_reason.machine_readable",
+            "p11.host_evidence.persisted",
+            "p11.provider_inputs.validated",
+            "p11.provider_manifest.used",
+        ],
+    );
+}
+
+#[test]
+fn proof_e2e_full_profile_contract_declared() {
+    let expected_artifacts = proof_support::cases::STANDARD_CASE_ARTIFACTS
+        .iter()
+        .map(|artifact| (artifact.label, artifact.kind))
+        .collect::<Vec<_>>();
+
+    for case in proof_support::cases::all_cases() {
+        let artifacts = case
+            .required_artifacts
+            .iter()
+            .map(|artifact| (artifact.label, artifact.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            artifacts, expected_artifacts,
+            "{} must declare the standard raw + normalized case artifacts",
+            case.case_id
+        );
+        assert!(
+            !case.contract_refs.is_empty(),
+            "{} must declare covered RFC and verification-plan clauses",
+            case.case_id
+        );
+        assert!(
+            !case.setup.trim().is_empty(),
+            "{} must declare setup prerequisites",
+            case.case_id
+        );
+        assert!(
+            !case.action.trim().is_empty(),
+            "{} must declare case actions",
+            case.case_id
+        );
+        assert!(
+            !case.pass_criteria.is_empty(),
+            "{} must declare pass criteria",
+            case.case_id
+        );
+        assert!(
+            !case.fail_criteria.is_empty(),
+            "{} must declare fail-closed criteria",
+            case.case_id
+        );
+    }
+}
+
 #[test]
 fn proof_e2e_fast_profile_runs_required_cases() {
     if should_skip_proof_tests() {

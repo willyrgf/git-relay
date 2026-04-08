@@ -584,11 +584,12 @@ Required checks:
 
 Execution contract:
 
-1. checks run in Nix derivations, not ad-hoc host scripts
-2. proof harness invokes only Nix-built relay binaries (no cargo-bin fallback in gate mode)
-3. SSH and smart HTTP ingress validation are mandatory in deterministic-core modes (`fast` and `full`)
-4. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials
-5. `provider-admission` requires explicit target manifest and credentials; if invoked without required inputs it must fail closed with actionable diagnostics
+1. `checks.<system>.rfc-proof-e2e-fast` and `checks.<system>.rfc-proof-e2e-full` run in pure Nix derivations and validate the deterministic-core proof contract statically.
+2. live deterministic-core gate runs execute host-side in CI or release automation through a flake app entrypoint (`nix run .#test`) with Nix-built relay binaries and pinned Git/OpenSSH/Python/Cargo/Rustc tool paths, not cargo-bin fallbacks in gate mode.
+3. this split is required because mandatory SSH transport proof may fail under sandbox builder accounts that cannot execute the Git command path over SSH, while the release gate still requires the live SSH + smart-HTTP evidence on supported hosts.
+4. SSH and smart HTTP ingress validation are mandatory in deterministic-core modes (`fast` and `full`) for those live host-side gate runs.
+5. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials.
+6. `provider-admission` runs through the same flake app entrypoint (`nix run .#test -- provider-admission ...`) and requires explicit target manifest and credentials; if invoked without required inputs it must fail closed with actionable diagnostics.
 
 Mode contract:
 
@@ -690,7 +691,7 @@ Deliver:
 
 Acceptance:
 
-1. Linux + macOS `full` pass required for release admission
+1. Linux + macOS host-side `full` pass required for release admission
 2. declared supported provider targets cannot be admitted without passing `provider-admission`
 
 ### Current repository status checklist (updated 2026-04-08)
@@ -700,7 +701,7 @@ Completed in the current repository state:
 - [x] M0 contract freeze content is present in this document.
 - [x] M1 harness foundation exists: `tests/rfc_proof_e2e.rs`, `tests/proof_support/*`, raw + normalized artifacts, redaction, and canonical normalization are implemented.
 - [x] P01-P11 case modules exist and run in the proof harness on the current host.
-- [x] `flake.nix` wires `rfc-proof-e2e-fast`, `rfc-proof-e2e-full`, and `rfc-proof-provider-admission`.
+- [x] `flake.nix` wires `rfc-proof-e2e-fast`, `rfc-proof-e2e-full`, and `rfc-proof-provider-admission`, with deterministic-core flake checks validating the pure contract subset and live host-side proof gates exposed through `nix run .#test` and enforced separately in CI.
 
 Still required before this RFC proof contract is fully satisfied:
 

@@ -33,8 +33,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          system="$(nix eval --impure --expr builtins.currentSystem --raw)"
-          nix build ".#checks.${system}.rfc-proof-e2e-full"
+          nix run .#test
 
   provider-admission-policy:
     name: provider-admission-policy
@@ -66,4 +65,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scripts/ci/provider-admission-gate.sh fixtures/hosted/targets.json
+          nix run .#test -- provider-admission fixtures/hosted/targets.json

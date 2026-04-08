@@ -141,17 +141,169 @@
 
           rfcProofFast = mkRfcProofCheck {
             checkName = "rfc-proof-e2e-fast";
-            testFilter = "proof_e2e_fast_profile_runs_required_cases";
+            testFilter = "proof_e2e_fast_profile_contract_declared";
           };
 
           rfcProofFull = mkRfcProofCheck {
             checkName = "rfc-proof-e2e-full";
-            testFilter = "proof_e2e_full_profile_reruns_and_hashes";
+            testFilter = "proof_e2e_full_profile_contract_declared";
           };
 
           rfcProofProviderAdmission = mkRfcProofCheck {
             checkName = "rfc-proof-provider-admission";
-            testFilter = "proof_e2e_provider_admission";
+            testFilter = "proof_e2e_provider_admission_requires_explicit_inputs";
+          };
+
+          proofTestApp = pkgs.writeShellApplication {
+            name = "git-relay-proof-test";
+            runtimeInputs = [
+              pkgs.cargo
+              pkgs.git
+              pkgs.nix
+              pkgs.openssh
+              pkgs.python3
+              pkgs.rustc
+            ];
+            text = ''
+              set -euo pipefail
+
+              repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+              if [[ -z "$repo_root" ]]; then
+                echo "git-relay proof app must run from inside the repository checkout" >&2
+                exit 1
+              fi
+              cd "$repo_root"
+
+              set_proof_env() {
+                export GIT_RELAY_PROOF_ENABLE=1
+                export GIT_RELAY_PROOF_GATE_MODE=1
+                export GIT_RELAY_PROOF_BIN_GIT_RELAY="${gitRelay}/bin/git-relay"
+                export GIT_RELAY_PROOF_BIN_GIT_RELAYD="${gitRelay}/bin/git-relayd"
+                export GIT_RELAY_PROOF_BIN_GIT_RELAY_INSTALL_HOOKS="${gitRelay}/bin/git-relay-install-hooks"
+                export GIT_RELAY_PROOF_BIN_GIT_RELAY_SSH_FORCE_COMMAND="${gitRelay}/bin/git-relay-ssh-force-command"
+                export GIT_RELAY_PROOF_SSHD_BIN="${pkgs.openssh}/bin/sshd"
+                export GIT_RELAY_PROOF_SSH_BIN="${pkgs.openssh}/bin/ssh"
+                export GIT_RELAY_PROOF_SSH_KEYGEN_BIN="${pkgs.openssh}/bin/ssh-keygen"
+                export GIT_RELAY_PROOF_PYTHON_BIN="${pkgs.python3}/bin/python3"
+                export GIT_RELAY_PROOF_GIT_HTTP_BACKEND_BIN="${pkgs.git}/libexec/git-core/git-http-backend"
+              }
+
+              run_full_gate() {
+                set_proof_env
+
+                echo "full proof gate: validating pure flake contract check"
+                nix build ".#checks.${system}.rfc-proof-e2e-full"
+
+                echo "full proof gate: running host deterministic-core suite with locked flake toolchain"
+                cargo test --locked --test rfc_proof_e2e proof_e2e_full_profile_reruns_and_hashes -- --exact --test-threads=1
+              }
+
+              run_provider_admission_gate() {
+                local manifest_path="''${1:-fixtures/hosted/targets.json}"
+                if [[ ! -f "$manifest_path" ]]; then
+                  echo "provider-admission manifest $manifest_path does not exist" >&2
+                  exit 1
+                fi
+
+                local placeholder_only
+                placeholder_only="$(
+                  python3 - "$manifest_path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+targets = data.get("targets")
+if not isinstance(targets, list) or not targets:
+    print("invalid")
+    raise SystemExit(0)
+
+def is_placeholder(target):
+    target_id = str(target.get("target_id", ""))
+    product = str(target.get("product", ""))
+    url = str(target.get("url", ""))
+    credential_source = str(target.get("credential_source", ""))
+    return (
+        target_id.startswith("replace-me")
+        and product.startswith("replace-me")
+        and "example.invalid" in url
+        and credential_source.startswith("env:REPLACE_ME")
+    )
+
+print("placeholder" if all(is_placeholder(target) for target in targets) else "declared")
+PY
+                )"
+
+                if [[ "$placeholder_only" == "placeholder" ]]; then
+                  echo "provider-admission policy: placeholder-only manifest, running flake provider-admission check"
+                  nix build ".#checks.${system}.rfc-proof-provider-admission"
+                  return 0
+                fi
+
+                if [[ "$placeholder_only" == "invalid" ]]; then
+                  echo "provider-admission policy: $manifest_path must contain at least one placeholder or declared target" >&2
+                  exit 1
+                fi
+
+                : "''${GIT_RELAY_PROOF_PROVIDER_TARGETS:?set GIT_RELAY_PROOF_PROVIDER_TARGETS to an absolute target manifest path for declared hosted targets}"
+                : "''${GIT_RELAY_PROOF_PROVIDER_CREDENTIALS:?set GIT_RELAY_PROOF_PROVIDER_CREDENTIALS to an absolute credentials file path for declared hosted targets}"
+
+                if [[ ! -f "$GIT_RELAY_PROOF_PROVIDER_TARGETS" ]]; then
+                  echo "provider-admission target manifest $GIT_RELAY_PROOF_PROVIDER_TARGETS does not exist" >&2
+                  exit 1
+                fi
+
+                if [[ ! -f "$GIT_RELAY_PROOF_PROVIDER_CREDENTIALS" ]]; then
+                  echo "provider-admission credentials file $GIT_RELAY_PROOF_PROVIDER_CREDENTIALS does not exist" >&2
+                  exit 1
+                fi
+
+                set_proof_env
+                export GIT_RELAY_PROOF_PROVIDER_TARGETS
+                export GIT_RELAY_PROOF_PROVIDER_CREDENTIALS
+
+                echo "provider-admission policy: declared hosted targets detected, running explicit-input proof suite with locked flake toolchain"
+                cargo test --locked --test rfc_proof_e2e proof_e2e_provider_admission_profile_runs_required_evidence_checks -- --exact --test-threads=1
+              }
+
+              usage() {
+                cat <<'EOF'
+Usage:
+  nix run .#test
+  nix run .#test -- full
+  nix run .#test -- provider-admission [manifest_path]
+EOF
+              }
+
+              command="''${1:-full}"
+              case "$command" in
+                full)
+                  shift || true
+                  if [[ "$#" -ne 0 ]]; then
+                    usage >&2
+                    exit 1
+                  fi
+                  run_full_gate
+                  ;;
+                provider-admission)
+                  shift || true
+                  if [[ "$#" -gt 1 ]]; then
+                    usage >&2
+                    exit 1
+                  fi
+                  run_provider_admission_gate "$@"
+                  ;;
+                help|-h|--help)
+                  usage
+                  ;;
+                *)
+                  usage >&2
+                  exit 1
+                  ;;
+              esac
+            '';
           };
 
           mkApp = package: binaryName: {
@@ -175,6 +327,7 @@
             git-relayd = mkApp packages.git-relayd "git-relayd";
             git-relay-install-hooks = mkApp packages.git-relay-install-hooks "git-relay-install-hooks";
             git-relay-ssh-force-command = mkApp packages.git-relay-ssh-force-command "git-relay-ssh-force-command";
+            test = mkApp proofTestApp "git-relay-proof-test";
           };
 
           checks = {
