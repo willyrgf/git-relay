@@ -600,8 +600,8 @@ Mode contract:
 2. `full`:
 - includes `fast`
 - repeated determinism check (rerun + hash compare)
-- extended crash and retention variants
-- full release-evidence aggregation flow
+- uses the same mandatory P01-P11 case matrix as `fast` (no additional full-only mandatory cases)
+- full-only extended crash/retention variants are optional extensions and not part of the current mandatory release gate
 3. `provider-admission`:
 - runs conformance probes for all targets declared supported in release policy
 - may use non-local network
@@ -726,7 +726,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Enforce full machine-readable Git conformance schema validation in release-report ingestion (fail closed for missing or invalid required fields), not just the current subset used for floor computation.
 - [x] Implement and gate the full proof-artifact retention contract from section 8: raw suite runs, redacted failure captures, non-admitted conformance artifacts (`ttl=720h`, `keep_count=20`), and admitted release evidence pinned until superseded.
 - [x] Enforce deterministic harness behavior by explicitly disabling opportunistic Git auto-GC in harness-driven repository/worktree mutations.
-- [ ] Align `full` mode contract and implementation by either adding explicit full-only extended crash/retention variants or narrowing the documented `full` mode claims.
+- [x] Align `full` mode contract and implementation by either adding explicit full-only extended crash/retention variants or narrowing the documented `full` mode claims.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
 
@@ -743,6 +743,7 @@ Optional extended scenarios:
 
 1. exploratory probes for providers/targets not yet declared supported
 2. stress/soak runs beyond deterministic correctness gate criteria
+3. additional full-only crash/retention variants beyond the mandatory P01-P11 case matrix
 
 Optional scenarios must not weaken mandatory gate outcomes.
 
