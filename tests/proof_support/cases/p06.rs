@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -11,6 +11,14 @@ pub fn definition() -> CaseDefinition {
         case_id: "P06",
         setup: "Configure one reachable upstream and install hook dispatch for authoritative push guardrails.",
         action: "Mutate upstream out-of-band, detect divergence, verify push block, repair, and reconverge.",
+        required_assertions: &[
+            "p06.baseline.reconcile",
+            "p06.divergence.detected",
+            "p06.hooks.installed",
+            "p06.push.blocked",
+            "p06.repair.reconciled",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "divergence is detected from fresh upstream observation",
             "authoritative writes are blocked while divergent",

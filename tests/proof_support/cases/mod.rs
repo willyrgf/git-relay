@@ -13,15 +13,34 @@ mod p11;
 use serde_json::Value;
 
 use crate::proof_support::lab::{CaseReport, ProofLab};
-use crate::proof_support::schema::ProofMode;
+use crate::proof_support::schema::{ProofArtifactKind, ProofMode};
 
 pub type CaseRunner = fn(&mut ProofLab, ProofMode) -> Result<CaseReport, String>;
+
+#[derive(Clone, Copy)]
+pub struct RequiredArtifact {
+    pub label: &'static str,
+    pub kind: ProofArtifactKind,
+}
+
+impl RequiredArtifact {
+    pub const fn new(label: &'static str, kind: ProofArtifactKind) -> Self {
+        Self { label, kind }
+    }
+}
+
+pub const STANDARD_CASE_ARTIFACTS: &[RequiredArtifact] = &[
+    RequiredArtifact::new("case.raw", ProofArtifactKind::Raw),
+    RequiredArtifact::new("case.normalized", ProofArtifactKind::Normalized),
+];
 
 #[derive(Clone)]
 pub struct CaseDefinition {
     pub case_id: &'static str,
     pub setup: &'static str,
     pub action: &'static str,
+    pub required_assertions: &'static [&'static str],
+    pub required_artifacts: &'static [RequiredArtifact],
     pub pass_criteria: &'static [&'static str],
     pub fail_criteria: &'static [&'static str],
     pub contract_refs: &'static [&'static str],
@@ -38,6 +57,15 @@ impl CaseDefinition {
             "case_id": self.case_id,
             "setup": self.setup,
             "action": self.action,
+            "required_assertions": self.required_assertions,
+            "required_artifacts": self
+                .required_artifacts
+                .iter()
+                .map(|artifact| serde_json::json!({
+                    "label": artifact.label,
+                    "kind": artifact.kind,
+                }))
+                .collect::<Vec<_>>(),
             "pass_criteria": self.pass_criteria,
             "fail_criteria": self.fail_criteria,
             "contract_refs": self.contract_refs,

@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -11,6 +11,14 @@ pub fn definition() -> CaseDefinition {
         case_id: "P03",
         setup: "Seed one stale run marker plus three upstream targets (alpha, beta, gamma-missing).",
         action: "Run replication reconcile once and verify one bounded run carries deterministic per-upstream outcomes.",
+        required_assertions: &[
+            "p03.reconcile.completed",
+            "p03.single_run_contains_upstreams",
+            "p03.deterministic_upstream_order",
+            "p03.stale_run_superseded",
+            "p03.transient_markers_cleaned",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "one run id captures all upstream outcomes",
             "upstream attempt ordering is deterministic",

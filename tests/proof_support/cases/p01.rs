@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use git_relay::hooks::push_trace_file_path;
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -13,6 +13,15 @@ pub fn definition() -> CaseDefinition {
         case_id: "P01",
         setup: "Create an authoritative bare repository with hardened config and a disposable client worktree.",
         action: "Push over SSH and smart HTTP using ephemeral per-run credentials, then run deterministic-core crash checkpoints against forced-command ingress and verify local-commit boundary.",
+        required_assertions: &[
+            "p01.ssh.push",
+            "p01.smart_http.push",
+            "p01.refs.present",
+            "p01.fsck",
+            "p01.crash_boundary",
+            "p01.post_receive.non_critical",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "SSH push succeeds and commits a deterministic ref",
             "smart HTTP push succeeds and commits a deterministic ref",

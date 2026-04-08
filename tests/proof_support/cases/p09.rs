@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -12,6 +12,15 @@ pub fn definition() -> CaseDefinition {
         case_id: "P09",
         setup: "Create flake fixtures with supported literal shorthand and unsupported grammar variants.",
         action: "Run migrate-flake-inputs with fake nix executors to verify deterministic rewrite + validated relock fail-closed behavior.",
+        required_assertions: &[
+            "p09.first_rewrite.success",
+            "p09.second_rewrite.success",
+            "p09.deterministic_and_idempotent",
+            "p09.unsupported_grammar.fail_closed",
+            "p09.out_of_matrix_nix.fail_closed",
+            "p09.failed_relock_restores_files",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "supported literal rewrite is deterministic",
             "second rewrite is a no-op",

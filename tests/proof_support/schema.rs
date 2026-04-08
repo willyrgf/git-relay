@@ -94,15 +94,48 @@ impl ProofCaseArtifact {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofRequiredArtifact {
+    pub label: String,
+    pub kind: ProofArtifactKind,
+}
+
+impl ProofRequiredArtifact {
+    pub fn new(label: impl Into<String>, kind: ProofArtifactKind) -> Self {
+        Self {
+            label: label.into(),
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCaseContractValidation {
+    pub status: CaseStatus,
+    pub errors: Vec<String>,
+}
+
+impl Default for ProofCaseContractValidation {
+    fn default() -> Self {
+        Self {
+            status: CaseStatus::Pass,
+            errors: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofCaseResult {
     pub case_id: String,
     pub status: CaseStatus,
     pub started_at_ms: u128,
     pub completed_at_ms: u128,
+    pub required_assertions: Vec<String>,
+    pub required_artifacts: Vec<ProofRequiredArtifact>,
     pub assertions: Vec<ProofAssertion>,
     pub artifacts: Vec<ProofCaseArtifact>,
     pub contracts: Vec<String>,
+    pub contract_validation: ProofCaseContractValidation,
     pub transport_profiles: Vec<String>,
 }
 
@@ -114,9 +147,12 @@ impl ProofCaseResult {
             status: CaseStatus::Pass,
             started_at_ms: now,
             completed_at_ms: now,
+            required_assertions: Vec::new(),
+            required_artifacts: Vec::new(),
             assertions: Vec::new(),
             artifacts: Vec::new(),
             contracts: Vec::new(),
+            contract_validation: ProofCaseContractValidation::default(),
             transport_profiles: Vec::new(),
         }
     }
@@ -131,6 +167,18 @@ impl ProofCaseResult {
     pub fn add_artifact(&mut self, label: impl Into<String>, path: &Path, kind: ProofArtifactKind) {
         self.artifacts
             .push(ProofCaseArtifact::new(label, path, kind));
+    }
+
+    pub fn set_contract_validation_errors(&mut self, errors: Vec<String>) {
+        self.contract_validation = if errors.is_empty() {
+            ProofCaseContractValidation::default()
+        } else {
+            self.status = CaseStatus::Fail;
+            ProofCaseContractValidation {
+                status: CaseStatus::Fail,
+                errors,
+            }
+        };
     }
 
     pub fn finish(mut self) -> Self {

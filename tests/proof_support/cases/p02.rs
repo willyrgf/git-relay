@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -9,6 +9,15 @@ pub fn definition() -> CaseDefinition {
         case_id: "P02",
         setup: "Prepare multi-ref branch+tag updates from one client worktree over both ingress transports.",
         action: "Execute ordinary multi-ref pushes over SSH and smart HTTP and assert local-commit scoped evidence.",
+        required_assertions: &[
+            "p02.ssh.multi_ref",
+            "p02.http.multi_ref",
+            "p02.refs.committed",
+            "p02.invalid_updates.rejected",
+            "p02.invalid_updates.no_partial_delete",
+            "p02.contract.local_commit_only",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "multi-ref updates are observed on both transports",
             "invalid transmitted updates are rejected without widening ordinary push guarantees",

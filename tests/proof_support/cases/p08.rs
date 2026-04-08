@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -9,6 +9,14 @@ pub fn definition() -> CaseDefinition {
         case_id: "P08",
         setup: "Probe one self-managed target with same_repo_hidden_refs admission checks.",
         action: "Run probe-matrix before and after authoritative hardening and verify hidden-ref leakage gate behavior.",
+        required_assertions: &[
+            "p08.first_probe.executed",
+            "p08.rejects_hidden_ref_leakage",
+            "p08.admits_hardened_target",
+            "p08.rejects_hidden_object_leakage",
+            "p08.hidden_refs_not_advertised",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "same-repo hidden refs are rejected when leakage is possible",
             "when transport probing is remote, guessed hidden object ids are blocked by admission checks",

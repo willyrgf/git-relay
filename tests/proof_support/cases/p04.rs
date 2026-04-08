@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -9,6 +9,14 @@ pub fn definition() -> CaseDefinition {
         case_id: "P04",
         setup: "Configure one atomic-capable upstream and one upstream with receive.advertiseAtomic=false.",
         action: "Probe upstream capabilities and assert require_atomic policy stays fail-closed.",
+        required_assertions: &[
+            "p04.probe.completed",
+            "p04.alpha.supported",
+            "p04.beta.unsupported",
+            "p04.require_atomic.fail_closed",
+            "p04.probe.cleanup",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "alpha classified supported",
             "beta classified unsupported when atomic missing",

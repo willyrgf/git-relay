@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, LabProfile, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -12,6 +12,18 @@ pub fn definition() -> CaseDefinition {
         case_id: "P11",
         setup: "Prepare release matrix targets with one admitted candidate and one unadmitted target.",
         action: "Run release-manifest build + release report and assert floor status remains open without complete admitted evidence.",
+        required_assertions: &[
+            "p11.seed.push",
+            "p11.release_manifest.fail_closed",
+            "p11.release_manifest.supported_target_admitted",
+            "p11.release_manifest.persisted",
+            "p11.release_floor.open_without_full_evidence",
+            "p11.release_blocking_reason.machine_readable",
+            "p11.host_evidence.persisted",
+            "p11.provider_inputs.validated",
+            "p11.provider_manifest.used",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "release manifest evidence is persisted",
             "missing or unadmitted targets keep floor status open",

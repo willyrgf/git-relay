@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -11,6 +11,18 @@ pub fn definition() -> CaseDefinition {
         case_id: "P10",
         setup: "Use deterministic config fixtures with runtime env file, hook installer, and retention defaults.",
         action: "Validate runtime profile, render launchd/systemd units deterministically, verify force-command routing, and run git-relayd serve --once retention behavior.",
+        required_assertions: &[
+            "p10.runtime_validation.passed",
+            "p10.runtime_validation.fail_closed",
+            "p10.service_render.deterministic",
+            "p10.hooks.installed",
+            "p10.force_command.routing",
+            "p10.retention.defaults",
+            "p10.serve_once.pending_detected",
+            "p10.serve_once.drains_pending",
+            "p10.retention.pruning",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "runtime env contract is enforced fail-closed",
             "service render output is deterministic",

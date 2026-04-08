@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -9,6 +9,13 @@ pub fn definition() -> CaseDefinition {
         case_id: "P05",
         setup: "Start with a missing upstream endpoint for a non-atomic target and no replay log state.",
         action: "Run reconcile once (stalled), then repoint to a reachable upstream and run reconcile again.",
+        required_assertions: &[
+            "p05.first_run.executed",
+            "p05.no_optimistic_observed_ref",
+            "p05.second_run.converged",
+            "p05.observed_matches_local",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "observed refs do not mutate optimistically on failed apply",
             "later run recomputes from current local refs and converges",

@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::json;
 
-use crate::proof_support::cases::CaseDefinition;
+use crate::proof_support::cases::{CaseDefinition, STANDARD_CASE_ARTIFACTS};
 use crate::proof_support::lab::{CaseReport, ProofLab, AUTHORITATIVE_REPO_ID, CACHE_REPO_ID};
 use crate::proof_support::schema::{ProofAssertion, ProofMode};
 
@@ -11,6 +11,16 @@ pub fn definition() -> CaseDefinition {
         case_id: "P07",
         setup: "Use a cache-only repo descriptor with explicit read-upstream freshness policy.",
         action: "Mutate read upstream externally, run read prepare, and assert cache-only command boundaries.",
+        required_assertions: &[
+            "p07.read_prepare.success",
+            "p07.cache_ref_matches_upstream",
+            "p07.cache_fail_closed_on_authoritative",
+            "p07.ssh.read_path.parity",
+            "p07.http.read_path.parity",
+            "p07.stale_if_error.serves_stale",
+            "p07.negative_cache.hit",
+        ],
+        required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "cache-only read prepare refreshes from read upstream",
             "stale-if-error serves stale refs and reuses negative-cache entries on repeated failure",

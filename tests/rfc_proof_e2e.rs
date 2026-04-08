@@ -1,5 +1,6 @@
 mod proof_support;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,7 +9,7 @@ use proof_support::{
     lab::{LabError, LabProfile, ProofLab, ProviderAdmissionInputs},
     schema::{
         CaseStatus, ProofArtifactKind, ProofAssertion, ProofCaseResult, ProofMode,
-        ProofSuiteSummaryRaw,
+        ProofRequiredArtifact, ProofSuiteSummaryRaw,
     },
 };
 use tempfile::TempDir;
@@ -62,6 +63,16 @@ fn run_case(
     mode: ProofMode,
 ) -> Result<ProofCaseResult, LabError> {
     let mut result = ProofCaseResult::new(case.case_id);
+    result.required_assertions = case
+        .required_assertions
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect();
+    result.required_artifacts = case
+        .required_artifacts
+        .iter()
+        .map(|artifact| ProofRequiredArtifact::new(artifact.label, artifact.kind))
+        .collect();
     result.contracts = case
         .contract_refs
         .iter()
@@ -71,14 +82,7 @@ fn run_case(
     let mut case_json = case.base_case_json();
     match case.run(lab, mode) {
         Ok(report) => {
-            let mut assertions = report.assertions;
-            if assertions.is_empty() {
-                assertions.push(ProofAssertion::fail(
-                    format!("{}.assertions.present", case.case_id.to_ascii_lowercase()),
-                    "case runner returned no assertions",
-                ));
-            }
-            for assertion in assertions {
+            for assertion in report.assertions {
                 result.add_assertion(assertion);
             }
             result.transport_profiles = report.transport_profiles;
@@ -105,49 +109,153 @@ fn run_case(
         }
     }
 
-    if let serde_json::Value::Object(map) = &mut case_json {
-        map.insert("status".to_owned(), serde_json::json!(result.status));
-        let assertions_path = lab
-            .case_root(case.case_id)?
-            .join(format!("{}.raw.json", case.case_id));
-        map.insert(
-            "assertions".to_owned(),
-            serde_json::to_value(&result.assertions).map_err(|source| LabError::ParseJson {
-                path: assertions_path,
-                source,
-            })?,
-        );
-        let transports_path = lab
-            .case_root(case.case_id)?
-            .join(format!("{}.raw.json", case.case_id));
-        map.insert(
-            "transport_profiles".to_owned(),
-            serde_json::to_value(&result.transport_profiles).map_err(|source| {
-                LabError::ParseJson {
-                    path: transports_path,
-                    source,
-                }
-            })?,
-        );
-        map.insert("contracts".to_owned(), serde_json::json!(result.contracts));
-    }
-
-    let redacted_case_json = artifact::redact_json_value(&case_json, lab.runner.secret_pairs())?;
-    lab.record_case_event(case.case_id, result.status, &redacted_case_json);
-    let (raw_path, normalized_path) =
-        lab.persist_case_artifacts(case.case_id, &redacted_case_json)?;
+    let raw_case_path = lab
+        .case_root(case.case_id)?
+        .join(format!("{}.raw.json", case.case_id));
+    let paths = lab.evidence_paths();
+    let raw_path = paths.case_artifact_path(case.case_id, &format!("{}.raw.json", case.case_id));
+    let normalized_path =
+        paths.case_artifact_path(case.case_id, &format!("{}.normalized.json", case.case_id));
     result.add_artifact("case.raw", &raw_path, ProofArtifactKind::Raw);
     result.add_artifact(
         "case.normalized",
         &normalized_path,
         ProofArtifactKind::Normalized,
     );
+    result.set_contract_validation_errors(validate_case_contract(case, &result));
+
+    if let serde_json::Value::Object(map) = &mut case_json {
+        map.insert("status".to_owned(), serde_json::json!(result.status));
+        map.insert(
+            "assertions".to_owned(),
+            serde_json::to_value(&result.assertions).map_err(|source| LabError::ParseJson {
+                path: raw_case_path.clone(),
+                source,
+            })?,
+        );
+        map.insert(
+            "transport_profiles".to_owned(),
+            serde_json::to_value(&result.transport_profiles).map_err(|source| {
+                LabError::ParseJson {
+                    path: raw_case_path.clone(),
+                    source,
+                }
+            })?,
+        );
+        map.insert(
+            "contracts".to_owned(),
+            serde_json::to_value(&result.contracts).map_err(|source| LabError::ParseJson {
+                path: raw_case_path.clone(),
+                source,
+            })?,
+        );
+        map.insert(
+            "contract_validation".to_owned(),
+            serde_json::to_value(&result.contract_validation).map_err(|source| {
+                LabError::ParseJson {
+                    path: raw_case_path.clone(),
+                    source,
+                }
+            })?,
+        );
+        map.insert(
+            "artifacts".to_owned(),
+            serde_json::to_value(&result.artifacts).map_err(|source| LabError::ParseJson {
+                path: raw_case_path,
+                source,
+            })?,
+        );
+    }
+
+    let redacted_case_json = artifact::redact_json_value(&case_json, lab.runner.secret_pairs())?;
+    lab.record_case_event(case.case_id, result.status, &redacted_case_json);
+    let _ = lab.persist_case_artifacts(case.case_id, &redacted_case_json)?;
 
     if result.status == CaseStatus::Fail {
         persist_failure_capture(lab, case.case_id, &redacted_case_json, &result.assertions)?;
     }
 
     Ok(result.finish())
+}
+
+fn validate_case_contract(
+    case: &proof_support::cases::CaseDefinition,
+    result: &ProofCaseResult,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let declared_assertions = case
+        .required_assertions
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut seen_assertions = BTreeSet::new();
+    for assertion in &result.assertions {
+        if !seen_assertions.insert(assertion.id.clone()) {
+            errors.push(format!(
+                "duplicate assertion id emitted for {}: {}",
+                case.case_id, assertion.id
+            ));
+        }
+        if assertion.id.ends_with(".runner.error") {
+            continue;
+        }
+        if !declared_assertions.contains(assertion.id.as_str()) {
+            errors.push(format!(
+                "undeclared assertion id emitted for {}: {}",
+                case.case_id, assertion.id
+            ));
+        }
+    }
+    for required in case.required_assertions {
+        if !seen_assertions.contains(*required) {
+            errors.push(format!(
+                "missing required assertion for {}: {}",
+                case.case_id, required
+            ));
+        }
+    }
+
+    let declared_artifacts = case
+        .required_artifacts
+        .iter()
+        .map(|artifact| (artifact.label, artifact.kind))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen_artifacts = BTreeMap::new();
+    for artifact in &result.artifacts {
+        if let Some(previous) = seen_artifacts.insert(artifact.label.clone(), artifact.kind) {
+            errors.push(format!(
+                "duplicate artifact label emitted for {}: {} ({previous:?} and {:?})",
+                case.case_id, artifact.label, artifact.kind
+            ));
+        }
+        match declared_artifacts.get(artifact.label.as_str()) {
+            Some(kind) if *kind == artifact.kind => {}
+            Some(kind) => errors.push(format!(
+                "artifact kind mismatch for {}: {} expected {:?} got {:?}",
+                case.case_id, artifact.label, kind, artifact.kind
+            )),
+            None => errors.push(format!(
+                "undeclared artifact emitted for {}: {}",
+                case.case_id, artifact.label
+            )),
+        }
+    }
+    for required in case.required_artifacts {
+        match seen_artifacts.get(required.label) {
+            Some(kind) if *kind == required.kind => {}
+            Some(kind) => errors.push(format!(
+                "required artifact kind mismatch for {}: {} expected {:?} got {:?}",
+                case.case_id, required.label, required.kind, kind
+            )),
+            None => errors.push(format!(
+                "missing required artifact for {}: {}",
+                case.case_id, required.label
+            )),
+        }
+    }
+
+    errors
 }
 
 fn persist_failure_capture(
@@ -281,6 +389,22 @@ fn init_provider_target_repo(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn proof_case_definitions_declare_required_assertions_and_artifacts() {
+    for case in proof_support::cases::all_cases() {
+        assert!(
+            !case.required_assertions.is_empty(),
+            "{} must declare required assertions",
+            case.case_id
+        );
+        assert!(
+            !case.required_artifacts.is_empty(),
+            "{} must declare required artifacts",
+            case.case_id
+        );
+    }
 }
 
 #[test]

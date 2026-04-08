@@ -204,10 +204,10 @@ Every case must declare and implement:
 
 1. `setup`: exact topology/config/hook state prerequisites
 2. `action`: exact CLI/Git operations and crash/failure injection points
-3. `assertions`: deterministic expected outputs and state transitions
+3. `assertions`: deterministic expected outputs and state transitions, declared in case metadata as required assertion IDs and validated by the harness
 4. `pass_criteria`: all required assertions that must hold
 5. `fail_criteria`: any condition that must fail closed
-6. `artifacts`: required raw and normalized files for the case
+6. `artifacts`: required raw and normalized files for the case, declared in case metadata as required artifacts and validated by the harness
 7. `contract_refs`: RFC + verification-plan clauses covered
 
 ## 7. Scenario Matrix (Mandatory Cases)
@@ -716,7 +716,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [ ] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.
 - [ ] Implement release-report ingestion of machine-readable Git conformance evidence and add the positive P11 floor-closure path once that ingestion exists.
 - [ ] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
-- [ ] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
+- [x] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
 - [ ] Align normalization and failure-capture outputs with the documented contract, including `repo_id` semantic ordering, per-step failure capture naming, and deterministic git-conformance timestamps or an explicitly narrowed determinism claim.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
