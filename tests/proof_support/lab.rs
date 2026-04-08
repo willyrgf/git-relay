@@ -755,6 +755,39 @@ url = "{read_url}"
             .join(Self::repo_state_component(repo_id))
     }
 
+    pub fn persist_release_git_conformance_evidence(
+        &self,
+        platform: &str,
+        git_version: &str,
+        required_cases_passed: bool,
+    ) -> Result<PathBuf, LabError> {
+        let service_manager = service_manager_for_platform(platform)?;
+        let filesystem_profile = if platform == current_platform_label()? {
+            RealPlatformProbe
+                .filesystem_type(&self.temp_root)
+                .unwrap_or_else(|_| "unknown".to_owned())
+        } else {
+            format!("synthetic-{platform}")
+        };
+        let case_summaries = (1..=11)
+            .map(|index| (format!("P{index:02}"), required_cases_passed))
+            .collect::<Vec<_>>();
+        let evidence = self.build_git_conformance_evidence(
+            "deterministic-core",
+            platform,
+            git_version,
+            service_manager,
+            &filesystem_profile,
+            case_summaries,
+            required_cases_passed,
+            "synthetic-p11-summary",
+        )?;
+        let root = self.state_root.join("release").join("git-conformance");
+        let path = artifact::git_conformance_manifest_path(&root, platform, git_version);
+        artifact::persist_json(&path, &evidence)?;
+        Ok(path)
+    }
+
     pub fn record_case_event(&mut self, case_id: &str, status: CaseStatus, details: &Value) {
         self.structured_events.push(json!({
             "case_id": case_id,
@@ -928,25 +961,57 @@ url = "{read_url}"
         summary: &ProofSuiteSummaryRaw,
         normalized_hash: &str,
     ) -> Result<(), LabError> {
-        let platform = match std::env::consts::OS {
-            "macos" => "macos",
-            "linux" => "linux",
-            other => {
-                return Err(LabError::CommandFailure {
-                    detail: format!("unsupported platform {other}"),
-                })
-            }
-        };
-        let service_manager = match std::env::consts::OS {
-            "macos" => "launchd",
-            "linux" => "systemd",
-            _ => unreachable!(),
-        };
-
+        let platform = current_platform_label()?;
+        let service_manager = service_manager_for_platform(platform)?;
         let filesystem_profile = RealPlatformProbe
             .filesystem_type(&self.temp_root)
             .unwrap_or_else(|_| "unknown".to_owned());
+        let case_summaries = summary
+            .cases
+            .iter()
+            .map(|case| (case.case_id.clone(), case.status.to_bool()))
+            .collect::<Vec<_>>();
+        let evidence = self.build_git_conformance_evidence(
+            summary.mode.profile_label(),
+            platform,
+            &summary.toolchain.git_version,
+            service_manager,
+            &filesystem_profile,
+            case_summaries,
+            summary.overall_status == CaseStatus::Pass,
+            normalized_hash,
+        )?;
 
+        let suite_root = self.suite_root.join("manifests").join("git-conformance");
+        let suite_path = artifact::git_conformance_manifest_path(
+            &suite_root,
+            platform,
+            &summary.toolchain.git_version,
+        );
+        artifact::persist_json(&suite_path, &evidence)?;
+        if summary.mode.profile_label() == "deterministic-core" {
+            let release_root = self.state_root.join("release").join("git-conformance");
+            let release_path = artifact::git_conformance_manifest_path(
+                &release_root,
+                platform,
+                &summary.toolchain.git_version,
+            );
+            artifact::persist_json(&release_path, &evidence)?;
+        }
+        Ok(())
+    }
+
+    fn build_git_conformance_evidence(
+        &self,
+        profile: &str,
+        platform: &str,
+        git_version: &str,
+        service_manager: &str,
+        filesystem_profile: &str,
+        case_summaries: Vec<(String, bool)>,
+        required_cases_passed: bool,
+        normalized_summary_sha256: &str,
+    ) -> Result<Value, LabError> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let flake_lock = repo_root.join("flake.lock");
         let flake_lock_sha256 = artifact::hash_file_sha256(&flake_lock)?;
@@ -982,39 +1047,25 @@ url = "{read_url}"
             artifact::hash_file_sha256(&self.binaries.git_relay_ssh_force_command)?,
         );
 
-        let profile = summary.mode.profile_label();
-        let case_summaries = summary
-            .cases
-            .iter()
-            .map(|case| (case.case_id.clone(), case.status.to_bool()))
-            .collect::<Vec<_>>();
-
-        let evidence = git_conformance_evidence_value(GitConformanceEvidenceInput {
-            profile,
-            platform,
-            git_version: &summary.toolchain.git_version,
-            openssh_version: &summary.toolchain.openssh_version,
-            nix_system: &std::env::var("NIX_SYSTEM")
-                .unwrap_or_else(|_| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)),
-            service_manager,
-            filesystem_profile: &filesystem_profile,
-            git_relay_commit: &git_commit,
-            flake_lock_sha256: &flake_lock_sha256,
-            binary_digests,
-            case_summaries,
-            required_cases_passed: summary.overall_status == CaseStatus::Pass,
-            normalized_summary_sha256: normalized_hash,
-        });
-
-        let git_version_key = sanitize_component(&summary.toolchain.git_version);
-        let path = self
-            .suite_root
-            .join("manifests")
-            .join("git-conformance")
-            .join(platform)
-            .join(format!("{git_version_key}.json"));
-        artifact::persist_json(path, &evidence)?;
-        Ok(())
+        Ok(git_conformance_evidence_value(
+            GitConformanceEvidenceInput {
+                profile,
+                platform,
+                git_version,
+                openssh_version: &self.toolchain.openssh_version,
+                nix_system: &std::env::var("NIX_SYSTEM").unwrap_or_else(|_| {
+                    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+                }),
+                service_manager,
+                filesystem_profile,
+                git_relay_commit: &git_commit,
+                flake_lock_sha256: &flake_lock_sha256,
+                binary_digests,
+                case_summaries,
+                required_cases_passed,
+                normalized_summary_sha256,
+            },
+        ))
     }
 
     fn write_config_fixture(&self) -> Result<PathBuf, LabError> {
@@ -1280,6 +1331,26 @@ fn sanitize_component(value: &str) -> String {
         "unknown".to_owned()
     } else {
         sanitized
+    }
+}
+
+fn current_platform_label() -> Result<&'static str, LabError> {
+    match std::env::consts::OS {
+        "macos" => Ok("macos"),
+        "linux" => Ok("linux"),
+        other => Err(LabError::CommandFailure {
+            detail: format!("unsupported platform {other}"),
+        }),
+    }
+}
+
+fn service_manager_for_platform(platform: &str) -> Result<&'static str, LabError> {
+    match platform {
+        "macos" => Ok("launchd"),
+        "linux" => Ok("systemd"),
+        other => Err(LabError::CommandFailure {
+            detail: format!("unsupported platform {other}"),
+        }),
     }
 }
 

@@ -687,6 +687,7 @@ Proposed solution:
 
 - define a supported filesystem set
 - define required Git fsync-related settings for authoritative repositories
+- close the exact Git floor only from admitted machine-readable git-conformance evidence recorded for both supported platforms
 - do not promise crash durability without a validated config and filesystem matrix
 
 ### Packaging and deployment reproducibility

@@ -259,6 +259,7 @@ Under `state_root`:
 - `upstream-probes/runs/<repo>`: per-repo upstream probe records
 - `upstream-probes/matrix-runs/<repo>`: matrix probe records
 - `upstream-probes/release-manifests/<repo>`: admitted release manifests
+- `release/git-conformance/<platform>`: admitted deterministic-core Git conformance evidence used by `release report`
 - `release/hosts`: host version evidence used by `release report`
 - `retention/maintenance/<repo>.json`: latest maintenance result per repo
 
@@ -351,6 +352,8 @@ Repair and release reporting:
 git-relay repo repair --config /etc/git-relay/git-relay.toml --repo github.com/example/repo.git --json
 git-relay release report --config /etc/git-relay/git-relay.toml --json
 ```
+
+`release report` closes `exact_git_floor` only from admitted machine-readable Git conformance records under `release/git-conformance/<platform>/`.
 
 ## Observability
 

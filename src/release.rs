@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,6 +76,8 @@ pub enum ReleaseError {
         #[source]
         error: serde_json::Error,
     },
+    #[error("invalid git conformance evidence at {path}: {detail}", path = path.display())]
+    InvalidGitConformanceEvidence { path: PathBuf, detail: String },
     #[error("failed to spawn {program} with args {args:?}: {error}")]
     SpawnCommand {
         program: String,
@@ -117,6 +121,8 @@ pub fn build_release_conformance_report(
     let mut platform_evidence = load_host_evidence(&config.paths.state_root)?;
     platform_evidence
         .sort_by(|left, right| platform_label(left.platform).cmp(platform_label(right.platform)));
+    let git_conformance = load_git_conformance_evidence(&config.paths.state_root)?;
+    let exact_git_floor = exact_git_floor_from_evidence(&git_conformance);
 
     let selected = descriptors
         .iter()
@@ -165,18 +171,24 @@ pub fn build_release_conformance_report(
                 .to_owned(),
         );
     }
-    blocking_reasons.push(
-        "exact Git floor evidence remains open until machine-readable Git conformance data is recorded across the supported platforms"
-            .to_owned(),
-    );
+    if exact_git_floor.is_none() {
+        blocking_reasons.push(
+            "exact Git floor evidence remains open until admitted deterministic-core git-conformance records exist for both supported platforms at the same Git version"
+                .to_owned(),
+        );
+    }
 
     Ok(ReleaseConformanceReport {
         generated_at_ms,
         current_host,
         platform_evidence,
         repo_manifests,
-        exact_git_floor: None,
-        exact_git_floor_status: FloorStatus::Open,
+        exact_git_floor: exact_git_floor.clone(),
+        exact_git_floor_status: if exact_git_floor.is_some() {
+            FloorStatus::Closed
+        } else {
+            FloorStatus::Open
+        },
         exact_nix_floor: validated_targeted_relock_nix_versions()
             .first()
             .map(|value| (*value).to_owned()),
@@ -244,6 +256,154 @@ fn load_host_evidence(state_root: &Path) -> Result<Vec<HostVersionEvidence>, Rel
         evidence.push(parsed);
     }
     Ok(evidence)
+}
+
+fn load_git_conformance_evidence(
+    state_root: &Path,
+) -> Result<Vec<StoredGitConformanceEvidenceRecord>, ReleaseError> {
+    let root = state_root.join("release").join("git-conformance");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut evidence = Vec::new();
+    for platform_entry in fs::read_dir(&root).map_err(|error| ReleaseError::Read {
+        path: root.clone(),
+        error,
+    })? {
+        let platform_entry = platform_entry.map_err(|error| ReleaseError::Read {
+            path: root.clone(),
+            error,
+        })?;
+        let platform_path = platform_entry.path();
+        if !platform_path.is_dir() {
+            continue;
+        }
+        let platform_name = platform_entry.file_name().to_string_lossy().to_string();
+        for entry in fs::read_dir(&platform_path).map_err(|error| ReleaseError::Read {
+            path: platform_path.clone(),
+            error,
+        })? {
+            let entry = entry.map_err(|error| ReleaseError::Read {
+                path: platform_path.clone(),
+                error,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).map_err(|error| ReleaseError::Read {
+                path: path.clone(),
+                error,
+            })?;
+            let parsed: StoredGitConformanceEvidence =
+                serde_json::from_str(&source).map_err(|error| ReleaseError::ParseJson {
+                    path: path.clone(),
+                    error,
+                })?;
+            validate_git_conformance_evidence(&path, &platform_name, &parsed)?;
+            evidence.push(StoredGitConformanceEvidenceRecord { evidence: parsed });
+        }
+    }
+
+    Ok(evidence)
+}
+
+fn validate_git_conformance_evidence(
+    path: &Path,
+    platform_name: &str,
+    evidence: &StoredGitConformanceEvidence,
+) -> Result<(), ReleaseError> {
+    if !matches!(platform_name, "macos" | "linux") {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!("unsupported platform directory {}", platform_name),
+        });
+    }
+    if evidence.schema_version != 1 {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!("unsupported schema_version {}", evidence.schema_version),
+        });
+    }
+    if evidence.platform != platform_name {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "payload platform {} did not match directory platform {}",
+                evidence.platform, platform_name
+            ),
+        });
+    }
+    let expected_key = sanitize_path_component(&evidence.git_version);
+    if evidence.git_version_key != expected_key {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "git_version_key {} did not match sanitized git_version {}",
+                evidence.git_version_key, expected_key
+            ),
+        });
+    }
+    let file_key = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if file_key != evidence.git_version_key {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "file key {} did not match payload git_version_key {}",
+                file_key, evidence.git_version_key
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn exact_git_floor_from_evidence(records: &[StoredGitConformanceEvidenceRecord]) -> Option<String> {
+    let mut admitted = BTreeMap::<String, BTreeSet<String>>::new();
+    for record in records {
+        let evidence = &record.evidence;
+        if evidence.profile != "deterministic-core" || !evidence.all_mandatory_cases_passed {
+            continue;
+        }
+        admitted
+            .entry(evidence.git_version.clone())
+            .or_default()
+            .insert(evidence.platform.clone());
+    }
+
+    let mut candidates = admitted
+        .into_iter()
+        .filter(|(_, platforms)| platforms.contains("macos") && platforms.contains("linux"))
+        .map(|(git_version, _)| git_version)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| git_version_cmp(left, right));
+    candidates.into_iter().next()
+}
+
+fn git_version_cmp(left: &str, right: &str) -> Ordering {
+    parse_git_version_components(left)
+        .cmp(&parse_git_version_components(right))
+        .then_with(|| left.cmp(right))
+}
+
+fn parse_git_version_components(value: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            numbers.push(current.parse().unwrap_or(0));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current.parse().unwrap_or(0));
+    }
+    numbers
 }
 
 fn load_repo_manifest_summary(
@@ -378,4 +538,19 @@ struct StoredReleaseManifest {
 #[derive(Debug, Deserialize)]
 struct StoredReleaseManifestEntry {
     admitted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredGitConformanceEvidence {
+    schema_version: u64,
+    profile: String,
+    git_version_key: String,
+    platform: String,
+    git_version: String,
+    all_mandatory_cases_passed: bool,
+}
+
+#[derive(Debug)]
+struct StoredGitConformanceEvidenceRecord {
+    evidence: StoredGitConformanceEvidence,
 }

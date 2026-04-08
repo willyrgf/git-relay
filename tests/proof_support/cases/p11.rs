@@ -11,13 +11,14 @@ pub fn definition() -> CaseDefinition {
     CaseDefinition {
         case_id: "P11",
         setup: "Prepare release matrix targets with one admitted candidate and one unadmitted target.",
-        action: "Run release-manifest build + release report and assert floor status remains open without complete admitted evidence.",
+        action: "Run release-manifest build + release report, assert floor status remains open without complete admitted evidence, then record complete git-conformance evidence and assert exact Git floor closure.",
         required_assertions: &[
             "p11.seed.push",
             "p11.release_manifest.fail_closed",
             "p11.release_manifest.supported_target_admitted",
             "p11.release_manifest.persisted",
             "p11.release_floor.open_without_full_evidence",
+            "p11.release_floor.closed_with_full_evidence",
             "p11.release_blocking_reason.machine_readable",
             "p11.host_evidence.persisted",
             "p11.provider_inputs.validated",
@@ -27,6 +28,7 @@ pub fn definition() -> CaseDefinition {
         pass_criteria: &[
             "release manifest evidence is persisted",
             "missing or unadmitted targets keep floor status open",
+            "exact Git floor closes when admitted machine-readable conformance evidence exists for both supported platforms",
             "host evidence persists per platform",
         ],
         fail_criteria: &[
@@ -239,6 +241,53 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             (false, false, false, false)
         };
 
+    let closed_git_version = lab.toolchain.git_version.clone();
+    let macos_conformance = lab
+        .persist_release_git_conformance_evidence("macos", &closed_git_version, true)
+        .map_err(|error| error.to_string())?;
+    let linux_conformance = lab
+        .persist_release_git_conformance_evidence("linux", &closed_git_version, true)
+        .map_err(|error| error.to_string())?;
+    let release_report_closed = lab
+        .run_git_relay(
+            &[
+                "release".to_owned(),
+                "report".to_owned(),
+                "--config".to_owned(),
+                lab.config_path.display().to_string(),
+                "--repo".to_owned(),
+                AUTHORITATIVE_REPO_ID.to_owned(),
+                "--json".to_owned(),
+            ],
+            &[(
+                "GIT_RELAY_NIX_BIN".to_owned(),
+                fake_nix.display().to_string(),
+            )],
+        )
+        .map_err(|error| error.to_string())?;
+    let (git_floor_closed, exact_git_floor_matches, git_floor_blocking_cleared) =
+        if release_report_closed.success() {
+            let parsed = parse_json(&release_report_closed.stdout)?;
+            let blocking_cleared = !parsed["blocking_reasons"]
+                .as_array()
+                .map(|items| {
+                    items.iter().any(|entry| {
+                        entry
+                            .as_str()
+                            .map(|value| value.contains("Git floor evidence remains open"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            (
+                parsed["exact_git_floor_status"] == "closed",
+                parsed["exact_git_floor"] == json!(closed_git_version),
+                blocking_cleared,
+            )
+        } else {
+            (false, false, false)
+        };
+
     let provider_inputs_checked = if mode == ProofMode::ProviderAdmission {
         if lab.profile != LabProfile::ProviderAdmission {
             false
@@ -307,6 +356,26 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             )
         },
     );
+    report.assertions.push(
+        if release_report_closed.success()
+            && git_floor_closed
+            && exact_git_floor_matches
+            && git_floor_blocking_cleared
+        {
+            ProofAssertion::pass(
+                "p11.release_floor.closed_with_full_evidence",
+                Some(
+                    "exact Git floor closed after admitted machine-readable conformance evidence was recorded for both supported platforms"
+                        .to_owned(),
+                ),
+            )
+        } else {
+            ProofAssertion::fail(
+                "p11.release_floor.closed_with_full_evidence",
+                release_report_closed.summary(),
+            )
+        },
+    );
     report.assertions.push(if blocking_reason_open {
         ProofAssertion::pass(
             "p11.release_blocking_reason.machine_readable",
@@ -363,11 +432,17 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         "manifest_persisted": manifest_persisted,
         "manifest_latest": manifest_latest,
         "release_report": release_report.summary(),
+        "release_report_closed": release_report_closed.summary(),
         "git_floor_open": git_floor_open,
+        "git_floor_closed": git_floor_closed,
+        "exact_git_floor_matches": exact_git_floor_matches,
+        "git_floor_blocking_cleared": git_floor_blocking_cleared,
         "repo_manifest_open": repo_manifest_open,
         "blocking_reason_open": blocking_reason_open,
         "host_evidence_persisted": host_evidence_persisted,
         "provider_inputs_checked": provider_inputs_checked,
+        "macos_conformance": macos_conformance,
+        "linux_conformance": linux_conformance,
     });
 
     Ok(report)

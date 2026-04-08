@@ -8,7 +8,7 @@ use git_relay::hooks::push_trace_file_path;
 use git_relay::platform::{PlatformProbe, RealPlatformProbe};
 use git_relay::reconcile::pending_request_file_path;
 use predicates::prelude::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 fn init_bare_repo(path: &Path) {
@@ -764,6 +764,71 @@ fn migration_lock_non_idempotent_source() -> &'static str {
   "version": 7
 }
 "#
+}
+
+fn sanitize_git_conformance_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_git_conformance_evidence_fixture(
+    temp: &TempDir,
+    platform: &str,
+    git_version: &str,
+    all_mandatory_cases_passed: bool,
+) -> PathBuf {
+    let path = temp
+        .path()
+        .join("release")
+        .join("git-conformance")
+        .join(platform)
+        .join(format!(
+            "{}.json",
+            sanitize_git_conformance_key(git_version)
+        ));
+    fs::create_dir_all(path.parent().expect("git conformance dir")).expect("git conformance dir");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "profile": "deterministic-core",
+            "git_version_key": sanitize_git_conformance_key(git_version),
+            "platform": platform,
+            "nix_system": "x86_64-linux",
+            "service_manager": if platform == "macos" { "launchd" } else { "systemd" },
+            "git_version": git_version,
+            "openssh_version": "OpenSSH_10.0p1",
+            "filesystem_profile": format!("synthetic-{platform}"),
+            "git_relay_commit": "test-commit",
+            "flake_lock_sha256": "test-lock",
+            "binary_digests": {
+                "git-relay": "digest-a",
+                "git-relayd": "digest-b",
+                "git-relay-install-hooks": "digest-c",
+                "git-relay-ssh-force-command": "digest-d"
+            },
+            "cases": [
+                {
+                    "case_id": "P01",
+                    "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
+                }
+            ],
+            "all_mandatory_cases_passed": all_mandatory_cases_passed,
+            "normalized_summary_sha256": "synthetic-summary",
+            "recorded_at_ms": 0
+        }))
+        .expect("git conformance json"),
+    )
+    .expect("git conformance file");
+    path
 }
 
 fn package_example_config_path() -> PathBuf {
@@ -3988,4 +4053,112 @@ fn release_report_records_host_evidence_and_manifest_admission_state() {
         host_evidence_path.exists(),
         "release report should persist current host evidence"
     );
+}
+
+#[test]
+fn release_report_closes_exact_git_floor_from_machine_readable_conformance_evidence() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+
+    let upstream_supported = temp.path().join("release-floor-supported.git");
+    init_bare_repo(&upstream_supported);
+    write_authoritative_descriptor_with_write_upstreams(
+        &temp,
+        &repo_path,
+        &[("alpha", upstream_supported.to_str().expect("path"), true)],
+    );
+
+    let work_repo = temp.path().join("work-release-floor");
+    init_work_repo(&work_repo);
+    commit_file(&work_repo, "README.md", "hello\n", "initial");
+    StdCommand::new("git")
+        .args([
+            "-C",
+            work_repo.to_str().expect("work repo"),
+            "push",
+            repo_path.to_str().expect("repo"),
+            "HEAD:refs/heads/main",
+        ])
+        .status()
+        .expect("git push")
+        .success()
+        .then_some(())
+        .expect("authoritative push success");
+
+    let manifest_path = write_matrix_targets_fixture(
+        &temp,
+        "release-floor-targets.json",
+        &[(
+            "supported-alpha",
+            "local-git",
+            "self-managed",
+            "ssh",
+            upstream_supported.to_str().expect("path"),
+            true,
+            false,
+        )],
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .args([
+            "replication",
+            "build-release-manifest",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--targets",
+            manifest_path.to_str().expect("manifest"),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let exact_git_floor = "git version 2.53.0";
+    write_git_conformance_evidence_fixture(&temp, "macos", exact_git_floor, true);
+    write_git_conformance_evidence_fixture(&temp, "linux", exact_git_floor, true);
+
+    let unused_lock = temp.path().join("release-floor-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-floor",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    let output = Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("release report json");
+    assert_eq!(report["exact_git_floor"], exact_git_floor);
+    assert_eq!(report["exact_git_floor_status"], "closed");
+    assert!(!report["blocking_reasons"]
+        .as_array()
+        .expect("blocking reasons")
+        .iter()
+        .any(|item| item
+            .as_str()
+            .map(|value| value.contains("Git floor evidence remains open"))
+            .unwrap_or(false)));
 }

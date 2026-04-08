@@ -190,6 +190,15 @@ pub fn git_conformance_evidence_value(input: GitConformanceEvidenceInput<'_>) ->
     })
 }
 
+pub fn git_conformance_version_key(git_version: &str) -> String {
+    sanitize_key(git_version)
+}
+
+pub fn git_conformance_manifest_path(root: &Path, platform: &str, git_version: &str) -> PathBuf {
+    root.join(platform)
+        .join(format!("{}.json", git_conformance_version_key(git_version)))
+}
+
 fn key_is_sensitive(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     lower.contains("token")
