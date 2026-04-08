@@ -715,7 +715,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
 - [x] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.
 - [x] Implement release-report ingestion of machine-readable Git conformance evidence and add the positive P11 floor-closure path once that ingestion exists.
-- [ ] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
+- [x] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
 - [x] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
 - [x] Align normalization and failure-capture outputs with the documented contract, including `repo_id` semantic ordering, per-step failure capture naming, and deterministic git-conformance timestamps or an explicitly narrowed determinism claim.
 

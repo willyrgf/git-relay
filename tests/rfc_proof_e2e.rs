@@ -21,6 +21,23 @@ fn proof_tests_enabled() -> bool {
     }
 }
 
+fn provider_admission_inputs_from_env() -> Result<Option<ProviderAdmissionInputs>, String> {
+    let target_manifest = std::env::var_os("GIT_RELAY_PROOF_PROVIDER_TARGETS").map(PathBuf::from);
+    let credentials_file =
+        std::env::var_os("GIT_RELAY_PROOF_PROVIDER_CREDENTIALS").map(PathBuf::from);
+    match (target_manifest, credentials_file) {
+        (None, None) => Ok(None),
+        (Some(target_manifest), Some(credentials_file)) => Ok(Some(ProviderAdmissionInputs {
+            target_manifest,
+            credentials_file,
+        })),
+        _ => Err(
+            "GIT_RELAY_PROOF_PROVIDER_TARGETS and GIT_RELAY_PROOF_PROVIDER_CREDENTIALS must be set together"
+                .to_owned(),
+        ),
+    }
+}
+
 fn should_skip_proof_tests() -> bool {
     if proof_tests_enabled() {
         return false;
@@ -519,6 +536,21 @@ fn proof_e2e_provider_admission_profile_runs_required_evidence_checks() {
     if should_skip_proof_tests() {
         return;
     }
+    if let Some(inputs) = provider_admission_inputs_from_env().expect("provider env inputs") {
+        let (suite_root, summary) = run_suite(
+            ProofMode::ProviderAdmission,
+            &LabProfile::ProviderAdmission,
+            "proof-provider",
+            Some(inputs),
+        )
+        .expect("run provider suite from explicit inputs");
+        assert_eq!(summary.mode, ProofMode::ProviderAdmission);
+        assert_eq!(summary.overall_status, CaseStatus::Pass);
+        assert_conformance_manifest_exists(&suite_root, summary.mode, &summary)
+            .expect("conformance manifest for provider-admission");
+        return;
+    }
+
     let provider_inputs_root = TempDir::new().expect("provider inputs tempdir");
     let provider_target = provider_inputs_root
         .path()

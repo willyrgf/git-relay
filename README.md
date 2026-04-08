@@ -397,6 +397,8 @@ nix build .#git-relay-ssh-force-command
 nix build .#git-relay-service-templates
 ```
 
+GitHub Actions enforces the release-gate matrix in [`.github/workflows/proof-gates.yml`](./.github/workflows/proof-gates.yml): Linux `full`, macOS `full`, and a provider-admission policy job. The provider job runs the flake `rfc-proof-provider-admission` check while `fixtures/hosted/targets.json` is still placeholder-only, and it fails closed if real hosted targets are declared without explicit `GIT_RELAY_PROVIDER_TARGETS_JSON` and `GIT_RELAY_PROVIDER_CREDENTIALS_ENV` secrets.
+
 ## Current Source-Truth Notes
 
 If the README, RFC, and code diverge, treat the code and this README as the current repository truth, and treat the RFC plus verification plan as design and evidence history that may still contain open release gates. The repository intentionally fails closed rather than widening support by implication.
