@@ -12,12 +12,12 @@ pub fn definition() -> CaseDefinition {
     CaseDefinition {
         case_id: "P01",
         setup: "Create an authoritative bare repository with hardened config and a disposable client worktree.",
-        action: "Push over SSH and smart HTTP using ephemeral per-run credentials, then in full mode run crash checkpoints against forced-command ingress and verify local-commit boundary.",
+        action: "Push over SSH and smart HTTP using ephemeral per-run credentials, then run deterministic-core crash checkpoints against forced-command ingress and verify local-commit boundary.",
         pass_criteria: &[
             "SSH push succeeds and commits a deterministic ref",
             "smart HTTP push succeeds and commits a deterministic ref",
             "authoritative repository remains fsck --strict clean",
-            "full mode crash checkpoints preserve local-commit boundary",
+            "deterministic-core crash checkpoints preserve local-commit boundary",
         ],
         fail_criteria: &[
             "any ingress path fails to commit refs",
@@ -97,11 +97,12 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         .map_err(|error| error.to_string())?;
     let fsck_ok = lab.git_fsck_strict(&lab.authoritative_repo).is_ok();
 
-    let (crash_boundary_ok, post_receive_non_critical, crash_details) = if mode == ProofMode::Full {
-        run_full_crash_boundary_checks(lab, &case_root)?
-    } else {
-        (true, true, json!({"skipped": true}))
-    };
+    let (crash_boundary_ok, post_receive_non_critical, crash_details) =
+        if matches!(mode, ProofMode::Fast | ProofMode::Full) {
+            run_deterministic_core_crash_boundary_checks(lab, &case_root)?
+        } else {
+            (true, true, json!({"skipped": true, "mode": mode}))
+        };
 
     report.assertions.push(if ssh_ok {
         ProofAssertion::pass(
@@ -140,18 +141,18 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
     });
     report.assertions.push(if crash_boundary_ok {
         ProofAssertion::pass(
-            "p01.full.crash_boundary",
-            Some("full profile checkpoints preserved local-commit boundary".to_owned()),
+            "p01.crash_boundary",
+            Some("deterministic-core checkpoints preserved local-commit boundary".to_owned()),
         )
     } else {
         ProofAssertion::fail(
-            "p01.full.crash_boundary",
-            "full profile crash checkpoints did not match local-commit boundary",
+            "p01.crash_boundary",
+            "deterministic-core crash checkpoints did not match local-commit boundary",
         )
     });
     report.assertions.push(if post_receive_non_critical {
         ProofAssertion::pass(
-            "p01.full.post_receive.non_critical",
+            "p01.post_receive.non_critical",
             Some(
                 "post-receive side effects remained non-critical for committed local refs"
                     .to_owned(),
@@ -159,7 +160,7 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         )
     } else {
         ProofAssertion::fail(
-            "p01.full.post_receive.non_critical",
+            "p01.post_receive.non_critical",
             "post-receive side effects became correctness-critical for committed refs",
         )
     });
@@ -178,7 +179,7 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
     Ok(report)
 }
 
-fn run_full_crash_boundary_checks(
+fn run_deterministic_core_crash_boundary_checks(
     lab: &ProofLab,
     case_root: &Path,
 ) -> Result<(bool, bool, serde_json::Value), String> {
