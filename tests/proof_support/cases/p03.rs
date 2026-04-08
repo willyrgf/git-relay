@@ -14,6 +14,7 @@ pub fn definition() -> CaseDefinition {
         required_assertions: &[
             "p03.reconcile.completed",
             "p03.single_run_contains_upstreams",
+            "p03.mixed_terminal_outcomes",
             "p03.deterministic_upstream_order",
             "p03.stale_run_superseded",
             "p03.transient_markers_cleaned",
@@ -21,6 +22,7 @@ pub fn definition() -> CaseDefinition {
         required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "one run id captures all upstream outcomes",
+            "mixed terminal upstream outcomes are recorded explicitly under one run",
             "upstream attempt ordering is deterministic",
             "stale run is marked superseded and transient markers are cleaned",
         ],
@@ -45,6 +47,67 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         ("beta", &lab.upstream_beta, false),
         ("gamma", &lab.upstream_gamma_missing, false),
     ])
+    .map_err(|error| error.to_string())?;
+
+    let external = lab
+        .case_root("P03")
+        .map_err(|error| error.to_string())?
+        .join("external-beta");
+    if external.exists() {
+        fs::remove_dir_all(&external).map_err(|error| error.to_string())?;
+    }
+    lab.run_git_expect_success(
+        &[
+            "clone".to_owned(),
+            lab.upstream_beta.display().to_string(),
+            external.display().to_string(),
+        ],
+        None,
+        &[],
+    )
+    .map_err(|error| error.to_string())?;
+    lab.run_git_expect_success(
+        &[
+            "-C".to_owned(),
+            external.display().to_string(),
+            "config".to_owned(),
+            "user.name".to_owned(),
+            "Git Relay Proof".to_owned(),
+        ],
+        None,
+        &[],
+    )
+    .map_err(|error| error.to_string())?;
+    lab.run_git_expect_success(
+        &[
+            "-C".to_owned(),
+            external.display().to_string(),
+            "config".to_owned(),
+            "user.email".to_owned(),
+            "git-relay-proof@example.com".to_owned(),
+        ],
+        None,
+        &[],
+    )
+    .map_err(|error| error.to_string())?;
+    lab.commit_file(
+        &external,
+        "README.md",
+        "p03 external beta drift\n",
+        "p03 external beta drift",
+    )
+    .map_err(|error| error.to_string())?;
+    lab.run_git_expect_success(
+        &[
+            "-C".to_owned(),
+            external.display().to_string(),
+            "push".to_owned(),
+            "origin".to_owned(),
+            "HEAD:refs/heads/main".to_owned(),
+        ],
+        None,
+        &[],
+    )
     .map_err(|error| error.to_string())?;
 
     let repo_component = ProofLab::repo_state_component(AUTHORITATIVE_REPO_ID);
@@ -128,6 +191,9 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     let mut run_id = String::new();
     let mut ordered = false;
     let mut upstream_count = 0usize;
+    let mut mixed_terminal_outcomes = false;
+    let mut repo_safety = String::new();
+    let mut upstream_states = Vec::new();
     if capture.success() {
         let parsed: serde_json::Value =
             serde_json::from_str(&capture.stdout).map_err(|error| error.to_string())?;
@@ -136,6 +202,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             .ok_or("reconcile output was not an array")?;
         if let Some(run) = runs.first() {
             run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
+            repo_safety = run["repo_safety"].as_str().unwrap_or_default().to_owned();
             if let Some(upstream_results) = run["upstream_results"].as_array() {
                 upstream_count = upstream_results.len();
                 let ids = upstream_results
@@ -145,6 +212,25 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 let mut sorted = ids.clone();
                 sorted.sort();
                 ordered = ids == sorted;
+                upstream_states = upstream_results
+                    .iter()
+                    .filter_map(|entry| {
+                        Some(json!({
+                            "upstream_id": entry["upstream_id"].as_str()?,
+                            "state": entry["state"].as_str()?,
+                            "divergent": entry["divergent"].as_bool().unwrap_or(false),
+                            "detail": entry["detail"].as_str(),
+                        }))
+                    })
+                    .collect();
+                mixed_terminal_outcomes =
+                    upstream_results.iter().any(|entry| {
+                        entry["upstream_id"] == "alpha" && entry["state"] == "in_sync"
+                    }) && upstream_results.iter().any(|entry| {
+                        entry["upstream_id"] == "beta" && entry["state"] == "out_of_sync"
+                    }) && upstream_results.iter().any(|entry| {
+                        entry["upstream_id"] == "gamma" && entry["state"] == "stalled"
+                    });
             }
         }
     }
@@ -192,6 +278,20 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "upstream ordering was not deterministic",
         )
     });
+    report.assertions.push(if mixed_terminal_outcomes {
+        ProofAssertion::pass(
+            "p03.mixed_terminal_outcomes",
+            Some(
+                "single reconcile run recorded alpha=in_sync, beta=out_of_sync, and gamma=stalled"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p03.mixed_terminal_outcomes",
+            format!("repo_safety={repo_safety} upstream_states={upstream_states:?}"),
+        )
+    });
     report.assertions.push(if stale_superseded {
         ProofAssertion::pass(
             "p03.stale_run_superseded",
@@ -222,6 +322,9 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     report.details = json!({
         "run_id": run_id,
         "upstream_count": upstream_count,
+        "repo_safety": repo_safety,
+        "upstream_states": upstream_states,
+        "mixed_terminal_outcomes": mixed_terminal_outcomes,
         "ordered": ordered,
         "stale_superseded": stale_superseded,
         "transient_clean": transient_clean,
