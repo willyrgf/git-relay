@@ -710,7 +710,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Tighten P03 to assert mixed terminal per-upstream outcomes explicitly, not only upstream count and ordering.
 - [x] Tighten P04 to assert repository safety degradation explicitly when `require_atomic = true` cannot be admitted.
 - [x] Tighten P05 to prove recovery and later convergence do not depend on replayed push history.
-- [ ] Tighten P06 to assert divergence-marker persistence before repair clears it.
+- [x] Tighten P06 to assert divergence-marker persistence before repair clears it.
 - [ ] Tighten P08 so hidden-object leakage proof is mandatory whenever same-repo hidden-ref admission relies on SSH transport probing.
 - [ ] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
 - [ ] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.

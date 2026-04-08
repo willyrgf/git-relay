@@ -14,6 +14,7 @@ pub fn definition() -> CaseDefinition {
         required_assertions: &[
             "p06.baseline.reconcile",
             "p06.divergence.detected",
+            "p06.divergence_marker.persisted",
             "p06.hooks.installed",
             "p06.push.blocked",
             "p06.repair.reconciled",
@@ -21,6 +22,7 @@ pub fn definition() -> CaseDefinition {
         required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
             "divergence is detected from fresh upstream observation",
+            "divergence marker persists while repository remains divergent",
             "authoritative writes are blocked while divergent",
             "repair plus reconcile restores healthy state",
         ],
@@ -170,6 +172,12 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             &[],
         )
         .map_err(|error| error.to_string())?;
+    let divergence_marker_before_repair = lab
+        .git_ref_exists(
+            &lab.authoritative_repo,
+            "refs/git-relay/safety/divergent/alpha",
+        )
+        .map_err(|error| error.to_string())?;
 
     let blocked_work = lab
         .case_root("P06")
@@ -278,6 +286,17 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     } else {
         ProofAssertion::fail("p06.hooks.installed", install.summary())
     });
+    report.assertions.push(if divergence_marker_before_repair {
+        ProofAssertion::pass(
+            "p06.divergence_marker.persisted",
+            Some("divergence marker existed before repair cleared it".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p06.divergence_marker.persisted",
+            "divergence marker was missing before repair",
+        )
+    });
     report.assertions.push(if blocked_while_divergent {
         ProofAssertion::pass(
             "p06.push.blocked",
@@ -308,6 +327,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
 
     report.details = json!({
         "divergence_detected": divergence_detected,
+        "divergence_marker_before_repair": divergence_marker_before_repair,
         "blocked_while_divergent": blocked_while_divergent,
         "repaired_healthy": repaired_healthy,
         "divergence_marker_remaining": divergence_marker,
