@@ -14,6 +14,7 @@ pub fn definition() -> CaseDefinition {
         required_assertions: &[
             "p10.runtime_validation.passed",
             "p10.runtime_validation.fail_closed",
+            "p10.runtime_validation.rejects_nix_store",
             "p10.service_render.deterministic",
             "p10.hooks.installed",
             "p10.force_command.routing",
@@ -86,6 +87,46 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         )
         .map_err(|error| error.to_string())?;
     let runtime_fail_closed = !runtime_bad.success();
+
+    let nix_store_config = case_root.join("nix-store-runtime-config.toml");
+    let nix_store_source = config_source.replace(
+        &runtime_line,
+        "runtime_env_file = \"/nix/store/fake-runtime.env\"",
+    );
+    fs::write(&nix_store_config, nix_store_source).map_err(|error| error.to_string())?;
+    let runtime_nix_store = lab
+        .run_git_relay(
+            &[
+                "deploy".to_owned(),
+                "validate-runtime".to_owned(),
+                "--config".to_owned(),
+                nix_store_config.display().to_string(),
+                "--repo".to_owned(),
+                AUTHORITATIVE_REPO_ID.to_owned(),
+                "--json".to_owned(),
+            ],
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    let runtime_nix_store_rejected = !runtime_nix_store.success()
+        && parse_json(&runtime_nix_store.stdout)
+            .ok()
+            .map(|json| {
+                json["status"] == "failed"
+                    && json["issues"]
+                        .as_array()
+                        .map(|items| {
+                            items.iter().any(|issue| {
+                                issue["code"] == "deployment.runtime_env_file"
+                                    && issue["message"]
+                                        .as_str()
+                                        .map(|message| message.contains("outside /nix/store"))
+                                        .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
 
     let systemd_first = render_service(lab, "systemd")?;
     let systemd_second = render_service(lab, "systemd")?;
@@ -364,6 +405,17 @@ authoritative_prune_ttl = "168h"
     } else {
         ProofAssertion::fail("p10.runtime_validation.fail_closed", runtime_bad.summary())
     });
+    report.assertions.push(if runtime_nix_store_rejected {
+        ProofAssertion::pass(
+            "p10.runtime_validation.rejects_nix_store",
+            Some("runtime env path under /nix/store was rejected".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p10.runtime_validation.rejects_nix_store",
+            runtime_nix_store.summary(),
+        )
+    });
     report.assertions.push(if render_deterministic {
         ProofAssertion::pass(
             "p10.service_render.deterministic",
@@ -445,6 +497,7 @@ authoritative_prune_ttl = "168h"
     report.details = json!({
         "runtime_ok": runtime_ok.summary(),
         "runtime_bad": runtime_bad.summary(),
+        "runtime_nix_store": runtime_nix_store.summary(),
         "render_deterministic": render_deterministic,
         "hooks_installed": hooks_installed,
         "force_routing_ok": force_routing_ok,
