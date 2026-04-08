@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +37,15 @@ pub struct TerminalEvidencePruneReport {
     pub reconcile_runs_removed: usize,
     pub upstream_probe_runs_removed: usize,
     pub matrix_probe_runs_removed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct ProofArtifactPruneReport {
+    suite_runs_removed: usize,
+    failure_capture_sets_removed: usize,
+    non_admitted_conformance_removed: usize,
+    pinned_admitted_conformance: usize,
+    pinned_release_git_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +195,7 @@ pub fn run_retention_maintenance(
     descriptors: &[RepositoryDescriptor],
 ) -> Vec<RepositoryMaintenanceReport> {
     let mut reports = Vec::new();
+    let mut proof_artifacts_maintained = false;
     for descriptor in descriptors {
         if descriptor.lifecycle != RepositoryLifecycle::Ready {
             continue;
@@ -193,6 +205,19 @@ pub fn run_retention_maintenance(
             .unwrap_or(true);
         if !due_now {
             continue;
+        }
+
+        if !proof_artifacts_maintained {
+            proof_artifacts_maintained = true;
+            let now_ms = current_time_ms();
+            match prune_proof_artifacts(config, now_ms) {
+                Ok(report) => record_proof_artifact_event(config, &report, None),
+                Err(error) => record_proof_artifact_event(
+                    config,
+                    &ProofArtifactPruneReport::default(),
+                    Some(error.to_string()),
+                ),
+            }
         }
 
         let report = match execute_maintenance(config, descriptor) {
@@ -401,6 +426,354 @@ fn prune_terminal_evidence(
     })
 }
 
+fn prune_proof_artifacts(
+    config: &AppConfig,
+    now_ms: u128,
+) -> Result<ProofArtifactPruneReport, MaintenanceError> {
+    let keep_count = config.retention.terminal_run_keep_count;
+    let ttl = config.retention.terminal_run_ttl;
+    let failure_capture_sets_removed =
+        prune_failure_capture_sets(&config.paths.state_root, keep_count, ttl, now_ms)?;
+    let suite_runs_removed =
+        prune_proof_suite_runs(&config.paths.state_root, keep_count, ttl, now_ms)?;
+    let (non_admitted_conformance_removed, pinned_admitted_conformance, pinned_release_git_version) =
+        prune_non_admitted_conformance_artifacts(&config.paths.state_root, keep_count, ttl, now_ms)?;
+    Ok(ProofArtifactPruneReport {
+        suite_runs_removed,
+        failure_capture_sets_removed,
+        non_admitted_conformance_removed,
+        pinned_admitted_conformance,
+        pinned_release_git_version,
+    })
+}
+
+fn prune_proof_suite_runs(
+    state_root: &Path,
+    keep_count: usize,
+    ttl: HumanDuration,
+    now_ms: u128,
+) -> Result<usize, MaintenanceError> {
+    let root = state_root.join("proof-e2e");
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|error| MaintenanceError::Read {
+        path: root.clone(),
+        error,
+    })? {
+        let entry = entry.map_err(|error| MaintenanceError::Read {
+            path: root.clone(),
+            error,
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| MaintenanceError::Read {
+            path: path.clone(),
+            error,
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        runs.push((suite_run_timestamp(&path), path));
+    }
+
+    runs.sort_by(|left, right| right.cmp(left));
+    let cutoff = now_ms.saturating_sub(ttl.as_duration().as_millis());
+    let mut removed = 0usize;
+    for (index, (timestamp, path)) in runs.into_iter().enumerate() {
+        if index < keep_count || timestamp >= cutoff {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|error| MaintenanceError::Remove {
+            path: path.clone(),
+            error,
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn prune_failure_capture_sets(
+    state_root: &Path,
+    keep_count: usize,
+    ttl: HumanDuration,
+    now_ms: u128,
+) -> Result<usize, MaintenanceError> {
+    let root = state_root.join("proof-e2e");
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut captures = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|error| MaintenanceError::Read {
+        path: root.clone(),
+        error,
+    })? {
+        let entry = entry.map_err(|error| MaintenanceError::Read {
+            path: root.clone(),
+            error,
+        })?;
+        let suite_path = entry.path();
+        let file_type = entry.file_type().map_err(|error| MaintenanceError::Read {
+            path: suite_path.clone(),
+            error,
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let failure_root = suite_path.join("failures");
+        if !failure_root.exists() {
+            continue;
+        }
+        let metadata = fs::metadata(&failure_root).map_err(|error| MaintenanceError::Read {
+            path: failure_root.clone(),
+            error,
+        })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        captures.push((suite_run_timestamp(&suite_path), failure_root));
+    }
+
+    captures.sort_by(|left, right| right.cmp(left));
+    let cutoff = now_ms.saturating_sub(ttl.as_duration().as_millis());
+    let mut removed = 0usize;
+    for (index, (timestamp, path)) in captures.into_iter().enumerate() {
+        if index < keep_count || timestamp >= cutoff {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|error| MaintenanceError::Remove {
+            path: path.clone(),
+            error,
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn prune_non_admitted_conformance_artifacts(
+    state_root: &Path,
+    keep_count: usize,
+    ttl: HumanDuration,
+    now_ms: u128,
+) -> Result<(usize, usize, Option<String>), MaintenanceError> {
+    let root = state_root.join("release").join("git-conformance");
+    if !root.exists() {
+        return Ok((0, 0, None));
+    }
+
+    let records = collect_conformance_artifacts(&root)?;
+    let pinned_release_git_version = latest_admitted_release_git_version(&records);
+    let mut pinned_admitted_conformance = 0usize;
+    let mut candidates = Vec::new();
+    for record in records {
+        let pinned = pinned_release_git_version.as_ref().is_some_and(|version| {
+            record.admitted_candidate
+                && record.git_version.as_deref() == Some(version.as_str())
+                && record.platform.is_some()
+        });
+        if pinned {
+            pinned_admitted_conformance += 1;
+        } else {
+            candidates.push((record.timestamp_ms, record.path));
+        }
+    }
+
+    candidates.sort_by(|left, right| right.cmp(left));
+    let cutoff = now_ms.saturating_sub(ttl.as_duration().as_millis());
+    let mut removed = 0usize;
+    for (index, (timestamp, path)) in candidates.into_iter().enumerate() {
+        if index < keep_count || timestamp >= cutoff {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| MaintenanceError::Remove {
+            path: path.clone(),
+            error,
+        })?;
+        removed += 1;
+    }
+
+    Ok((
+        removed,
+        pinned_admitted_conformance,
+        pinned_release_git_version,
+    ))
+}
+
+fn collect_conformance_artifacts(
+    root: &Path,
+) -> Result<Vec<ConformanceArtifactRecord>, MaintenanceError> {
+    let mut records = Vec::new();
+    for platform_entry in fs::read_dir(root).map_err(|error| MaintenanceError::Read {
+        path: root.to_path_buf(),
+        error,
+    })? {
+        let platform_entry = platform_entry.map_err(|error| MaintenanceError::Read {
+            path: root.to_path_buf(),
+            error,
+        })?;
+        let platform_path = platform_entry.path();
+        let platform_file_type =
+            platform_entry
+                .file_type()
+                .map_err(|error| MaintenanceError::Read {
+                    path: platform_path.clone(),
+                    error,
+                })?;
+        if !platform_file_type.is_dir() {
+            continue;
+        }
+        let platform_name = platform_entry.file_name().to_string_lossy().to_string();
+        let platform_supported = matches!(platform_name.as_str(), "macos" | "linux");
+
+        for entry in fs::read_dir(&platform_path).map_err(|error| MaintenanceError::Read {
+            path: platform_path.clone(),
+            error,
+        })? {
+            let entry = entry.map_err(|error| MaintenanceError::Read {
+                path: platform_path.clone(),
+                error,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+
+            let timestamp_ms = file_modified_time_ms(&path);
+            let mut platform = None;
+            let mut git_version = None;
+            let mut admitted_candidate = false;
+
+            let source = fs::read_to_string(&path).map_err(|error| MaintenanceError::Read {
+                path: path.clone(),
+                error,
+            })?;
+            if let Ok(parsed) = serde_json::from_str::<Value>(&source) {
+                let profile = parsed.get("profile").and_then(Value::as_str).unwrap_or("");
+                let all_mandatory_cases_passed = parsed
+                    .get("all_mandatory_cases_passed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let payload_platform = parsed.get("platform").and_then(Value::as_str).unwrap_or("");
+                if platform_supported && payload_platform == platform_name {
+                    platform = Some(platform_name.clone());
+                }
+
+                if let Some(version) = parsed
+                    .get("git_version")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                {
+                    let file_key = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("");
+                    if sanitize_component(&version) == file_key {
+                        admitted_candidate = platform.is_some()
+                            && profile == "deterministic-core"
+                            && all_mandatory_cases_passed;
+                    }
+                    git_version = Some(version);
+                }
+            }
+
+            records.push(ConformanceArtifactRecord {
+                path,
+                timestamp_ms,
+                platform,
+                git_version,
+                admitted_candidate,
+            });
+        }
+    }
+    Ok(records)
+}
+
+fn latest_admitted_release_git_version(records: &[ConformanceArtifactRecord]) -> Option<String> {
+    let mut admitted = BTreeMap::<String, BTreeSet<String>>::new();
+    for record in records {
+        if !record.admitted_candidate {
+            continue;
+        }
+        let (Some(platform), Some(git_version)) =
+            (record.platform.as_ref(), record.git_version.as_ref())
+        else {
+            continue;
+        };
+        admitted
+            .entry(git_version.clone())
+            .or_default()
+            .insert(platform.clone());
+    }
+
+    let mut candidates = admitted
+        .into_iter()
+        .filter(|(_, platforms)| platforms.contains("macos") && platforms.contains("linux"))
+        .map(|(git_version, _)| git_version)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| git_version_cmp(left, right));
+    candidates.pop()
+}
+
+fn git_version_cmp(left: &str, right: &str) -> Ordering {
+    parse_git_version_components(left)
+        .cmp(&parse_git_version_components(right))
+        .then_with(|| left.cmp(right))
+}
+
+fn parse_git_version_components(value: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            numbers.push(current.parse().unwrap_or(0));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current.parse().unwrap_or(0));
+    }
+    numbers
+}
+
+fn suite_run_timestamp(path: &Path) -> u128 {
+    parse_suite_summary_timestamp(&path.join("summary.raw.json"))
+        .or_else(|| parse_suite_summary_timestamp(&path.join("summary.normalized.json")))
+        .unwrap_or_else(|| file_modified_time_ms(path))
+}
+
+fn parse_suite_summary_timestamp(path: &Path) -> Option<u128> {
+    if !path.exists() {
+        return None;
+    }
+    let source = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&source).ok()?;
+    value
+        .get("completed_at_ms")
+        .and_then(Value::as_u64)
+        .map(u128::from)
+        .or_else(|| {
+            value
+                .get("started_at_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+        })
+}
+
+fn file_modified_time_ms(path: &Path) -> u128 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or_default()
+}
+
 fn persist_report(
     config: &AppConfig,
     report: &RepositoryMaintenanceReport,
@@ -420,6 +793,25 @@ fn record_report_event(config: &AppConfig, report: &RepositoryMaintenanceReport)
         "cache": report.cache,
         "authoritative": report.authoritative,
         "error": report.error,
+    });
+    let _ = record_structured_log(&config.paths.state_root, &event);
+}
+
+fn record_proof_artifact_event(
+    config: &AppConfig,
+    report: &ProofArtifactPruneReport,
+    error: Option<String>,
+) {
+    let mut event = new_structured_log_event("maintenance.proof-artifacts");
+    event.payload = serde_json::json!({
+        "ttl": config.retention.terminal_run_ttl,
+        "keep_count": config.retention.terminal_run_keep_count,
+        "suite_runs_removed": report.suite_runs_removed,
+        "failure_capture_sets_removed": report.failure_capture_sets_removed,
+        "non_admitted_conformance_removed": report.non_admitted_conformance_removed,
+        "pinned_admitted_conformance": report.pinned_admitted_conformance,
+        "pinned_release_git_version": report.pinned_release_git_version,
+        "error": error,
     });
     let _ = record_structured_log(&config.paths.state_root, &event);
 }
@@ -695,6 +1087,15 @@ struct GitProcessOutput {
     stdout: String,
     stderr: String,
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConformanceArtifactRecord {
+    path: PathBuf,
+    timestamp_ms: u128,
+    platform: Option<String>,
+    git_version: Option<String>,
+    admitted_candidate: bool,
 }
 
 fn current_time_ms() -> u128 {

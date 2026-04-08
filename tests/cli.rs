@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::thread;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use git_relay::audit::structured_log_file_path;
@@ -785,6 +787,63 @@ fn write_git_conformance_evidence_fixture(
     git_version: &str,
     all_mandatory_cases_passed: bool,
 ) -> PathBuf {
+    write_git_conformance_evidence_value_fixture(
+        temp,
+        platform,
+        git_version,
+        &git_conformance_evidence_value(
+            platform,
+            git_version,
+            "deterministic-core",
+            all_mandatory_cases_passed,
+            0,
+        ),
+    )
+}
+
+fn git_conformance_evidence_value(
+    platform: &str,
+    git_version: &str,
+    profile: &str,
+    all_mandatory_cases_passed: bool,
+    recorded_at_ms: u64,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "profile": profile,
+        "git_version_key": sanitize_git_conformance_key(git_version),
+        "platform": platform,
+        "nix_system": "x86_64-linux",
+        "service_manager": if platform == "macos" { "launchd" } else { "systemd" },
+        "git_version": git_version,
+        "openssh_version": "OpenSSH_10.0p1",
+        "filesystem_profile": format!("synthetic-{platform}"),
+        "git_relay_commit": "test-commit",
+        "flake_lock_sha256": "test-lock",
+        "binary_digests": {
+            "git-relay": "digest-a",
+            "git-relayd": "digest-b",
+            "git-relay-install-hooks": "digest-c",
+            "git-relay-ssh-force-command": "digest-d"
+        },
+        "cases": [
+            {
+                "case_id": "P01",
+                "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
+            }
+        ],
+        "all_mandatory_cases_passed": all_mandatory_cases_passed,
+        "normalized_summary_sha256": "synthetic-summary",
+        "recorded_at_ms": recorded_at_ms
+    })
+}
+
+fn write_git_conformance_evidence_value_fixture(
+    temp: &TempDir,
+    platform: &str,
+    git_version: &str,
+    value: &Value,
+) -> PathBuf {
     let path = temp
         .path()
         .join("release")
@@ -797,35 +856,7 @@ fn write_git_conformance_evidence_fixture(
     fs::create_dir_all(path.parent().expect("git conformance dir")).expect("git conformance dir");
     fs::write(
         &path,
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1,
-            "profile": "deterministic-core",
-            "git_version_key": sanitize_git_conformance_key(git_version),
-            "platform": platform,
-            "nix_system": "x86_64-linux",
-            "service_manager": if platform == "macos" { "launchd" } else { "systemd" },
-            "git_version": git_version,
-            "openssh_version": "OpenSSH_10.0p1",
-            "filesystem_profile": format!("synthetic-{platform}"),
-            "git_relay_commit": "test-commit",
-            "flake_lock_sha256": "test-lock",
-            "binary_digests": {
-                "git-relay": "digest-a",
-                "git-relayd": "digest-b",
-                "git-relay-install-hooks": "digest-c",
-                "git-relay-ssh-force-command": "digest-d"
-            },
-            "cases": [
-                {
-                    "case_id": "P01",
-                    "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
-                }
-            ],
-            "all_mandatory_cases_passed": all_mandatory_cases_passed,
-            "normalized_summary_sha256": "synthetic-summary",
-            "recorded_at_ms": 0
-        }))
-        .expect("git conformance json"),
+        serde_json::to_vec_pretty(value).expect("git conformance json"),
     )
     .expect("git conformance file");
     path
@@ -900,6 +931,46 @@ fn matrix_probe_run_dir(state_root: &Path, repo_id: &str) -> PathBuf {
         .join("upstream-probes")
         .join("matrix-runs")
         .join(sanitize_repo_state_component(repo_id))
+}
+
+fn proof_suite_dir(state_root: &Path, suite_id: &str) -> PathBuf {
+    state_root.join("proof-e2e").join(suite_id)
+}
+
+fn seed_proof_suite_run(
+    state_root: &Path,
+    suite_id: &str,
+    completed_at_ms: u64,
+    include_failure_capture: bool,
+) -> PathBuf {
+    let suite_dir = proof_suite_dir(state_root, suite_id);
+    fs::create_dir_all(&suite_dir).expect("suite dir");
+    fs::write(
+        suite_dir.join("summary.raw.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "suite": "rfc-proof-e2e",
+            "mode": "full",
+            "started_at_ms": completed_at_ms.saturating_sub(1),
+            "completed_at_ms": completed_at_ms,
+        }))
+        .expect("summary json"),
+    )
+    .expect("summary file");
+    if include_failure_capture {
+        let failure_dir = suite_dir.join("failures").join("P10");
+        fs::create_dir_all(&failure_dir).expect("failure dir");
+        fs::write(
+            failure_dir.join("p10.retention.stderr.txt"),
+            "redacted failure evidence\n",
+        )
+        .expect("failure file");
+    }
+    suite_dir
+}
+
+fn sleep_for_fs_tick() {
+    thread::sleep(Duration::from_millis(5));
 }
 
 fn read_git_ref(repo_path: &Path, ref_name: &str) -> String {
@@ -3113,6 +3184,167 @@ authoritative_prune_ttl = "168h"
 }
 
 #[test]
+fn git_relayd_serve_once_prunes_proof_artifacts_and_pins_admitted_release_evidence() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    rewrite_retention_config(
+        &config_path,
+        r#"[retention]
+maintenance_interval = "0s"
+cache_idle_ttl = "336h"
+terminal_run_ttl = "0s"
+terminal_run_keep_count = 2
+authoritative_reflog_ttl = "720h"
+authoritative_prune_ttl = "168h"
+"#,
+    );
+
+    let repo_path = temp.path().join("repos").join("repo.git");
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let suite_old_a = seed_proof_suite_run(temp.path(), "suite-old-a", 1, true);
+    let suite_old_b = seed_proof_suite_run(temp.path(), "suite-old-b", 2, true);
+    let suite_keep_c = seed_proof_suite_run(temp.path(), "suite-keep-c", 3, true);
+    let suite_keep_d = seed_proof_suite_run(temp.path(), "suite-keep-d", 4, true);
+
+    let admitted_old_macos = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "macos",
+        "git version 2.52.0",
+        &git_conformance_evidence_value(
+            "macos",
+            "git version 2.52.0",
+            "deterministic-core",
+            true,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let admitted_old_linux = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "linux",
+        "git version 2.52.0",
+        &git_conformance_evidence_value(
+            "linux",
+            "git version 2.52.0",
+            "deterministic-core",
+            true,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let stale_non_admitted = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "macos",
+        "git version 2.51.0",
+        &git_conformance_evidence_value(
+            "macos",
+            "git version 2.51.0",
+            "deterministic-core",
+            false,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let retained_non_admitted_linux = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "linux",
+        "git version 2.50.0",
+        &git_conformance_evidence_value(
+            "linux",
+            "git version 2.50.0",
+            "provider-admission",
+            true,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let retained_non_admitted_macos = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "macos",
+        "git version 2.49.0",
+        &git_conformance_evidence_value(
+            "macos",
+            "git version 2.49.0",
+            "deterministic-core",
+            false,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let admitted_current_macos = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "macos",
+        "git version 2.53.0",
+        &git_conformance_evidence_value(
+            "macos",
+            "git version 2.53.0",
+            "deterministic-core",
+            true,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
+    let admitted_current_linux = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "linux",
+        "git version 2.53.0",
+        &git_conformance_evidence_value(
+            "linux",
+            "git version 2.53.0",
+            "deterministic-core",
+            true,
+            0,
+        ),
+    );
+
+    let output = Command::cargo_bin("git-relayd")
+        .expect("cargo bin")
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("serve report");
+    let maintenance = report["maintenance_reports"]
+        .as_array()
+        .expect("maintenance reports");
+    assert!(
+        maintenance
+            .iter()
+            .any(|entry| entry["repo_id"] == "github.com/example/repo.git"),
+        "expected maintenance report for authoritative repository"
+    );
+
+    assert!(!suite_old_a.exists());
+    assert!(!suite_old_b.exists());
+    assert!(suite_keep_c.exists());
+    assert!(suite_keep_d.exists());
+    assert_eq!(
+        fs::read_dir(temp.path().join("proof-e2e"))
+            .expect("proof-e2e entries")
+            .count(),
+        2
+    );
+
+    assert!(admitted_current_macos.exists());
+    assert!(admitted_current_linux.exists());
+    assert!(!admitted_old_macos.exists());
+    assert!(!admitted_old_linux.exists());
+    assert!(!stale_non_admitted.exists());
+    assert!(retained_non_admitted_linux.exists());
+    assert!(retained_non_admitted_macos.exists());
+}
+
+#[test]
 fn replication_status_reports_pending_and_latest_run_state() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = write_config_fixture(&temp);
@@ -4161,4 +4393,136 @@ fn release_report_closes_exact_git_floor_from_machine_readable_conformance_evide
             .as_str()
             .map(|value| value.contains("Git floor evidence remains open"))
             .unwrap_or(false)));
+}
+
+#[test]
+fn release_report_fails_closed_for_missing_git_conformance_required_field() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let git_version = "git version 2.53.0";
+    write_git_conformance_evidence_value_fixture(
+        &temp,
+        "macos",
+        git_version,
+        &json!({
+            "schema_version": 1,
+            "profile": "deterministic-core",
+            "git_version_key": sanitize_git_conformance_key(git_version),
+            "platform": "macos",
+            "nix_system": "x86_64-linux",
+            "service_manager": "launchd",
+            "git_version": git_version,
+            "openssh_version": "OpenSSH_10.0p1",
+            "filesystem_profile": "synthetic-macos",
+            "git_relay_commit": "test-commit",
+            "flake_lock_sha256": "test-lock",
+            "cases": [{ "case_id": "P01", "status": "pass" }],
+            "all_mandatory_cases_passed": true,
+            "normalized_summary_sha256": "synthetic-summary",
+            "recorded_at_ms": 0
+        }),
+    );
+
+    let unused_lock = temp.path().join("release-invalid-schema-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-invalid-schema",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid git conformance evidence"))
+        .stderr(predicate::str::contains("missing field `binary_digests`"));
+}
+
+#[test]
+fn release_report_fails_closed_for_invalid_git_conformance_required_value() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let git_version = "git version 2.53.0";
+    write_git_conformance_evidence_value_fixture(
+        &temp,
+        "linux",
+        git_version,
+        &json!({
+            "schema_version": 1,
+            "profile": "deterministic-core",
+            "git_version_key": sanitize_git_conformance_key(git_version),
+            "platform": "linux",
+            "nix_system": "x86_64-linux",
+            "service_manager": "launchd",
+            "git_version": git_version,
+            "openssh_version": "OpenSSH_10.0p1",
+            "filesystem_profile": "synthetic-linux",
+            "git_relay_commit": "test-commit",
+            "flake_lock_sha256": "test-lock",
+            "binary_digests": {
+                "git-relay": "digest-a",
+                "git-relayd": "digest-b",
+                "git-relay-install-hooks": "digest-c",
+                "git-relay-ssh-force-command": "digest-d"
+            },
+            "cases": [{ "case_id": "P01", "status": "pass" }],
+            "all_mandatory_cases_passed": true,
+            "normalized_summary_sha256": "synthetic-summary",
+            "recorded_at_ms": 0
+        }),
+    );
+
+    let unused_lock = temp.path().join("release-invalid-value-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-invalid-value",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid git conformance evidence"))
+        .stderr(predicate::str::contains(
+            "service_manager launchd did not match expected systemd for platform linux",
+        ));
 }

@@ -877,8 +877,46 @@ url = "{read_url}"
         self.persist_ref_snapshots()?;
         self.persist_release_manifest_snapshot()?;
         self.persist_git_conformance_manifest(summary, &normalized_hash)?;
+        self.assert_no_private_key_material_in_suite_artifacts()?;
 
         Ok(self.suite_root.clone())
+    }
+
+    pub fn cleanup_case_transport_lifecycle_files(&self, case_id: &str) -> Result<(), LabError> {
+        let case_root = self.suite_root.join("cases").join(case_id);
+        if !case_root.exists() {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(&case_root).map_err(|source| LabError::Read {
+            path: case_root.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| LabError::Read {
+                path: case_root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| LabError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("transport-") {
+                fs::remove_dir_all(&path).map_err(|source| LabError::Write {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn persist_structured_events(&self) -> Result<(), LabError> {
@@ -965,6 +1003,10 @@ url = "{read_url}"
             return Ok(());
         }
         copy_dir_recursive(&source, &target)
+    }
+
+    fn assert_no_private_key_material_in_suite_artifacts(&self) -> Result<(), LabError> {
+        assert_no_private_key_material_in_path(&self.suite_root)
     }
 
     fn persist_git_conformance_manifest(
@@ -1398,6 +1440,62 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), LabError> {
             })?;
         }
     }
+    Ok(())
+}
+
+fn assert_no_private_key_material_in_path(root: &Path) -> Result<(), LabError> {
+    let mut entries = fs::read_dir(root)
+        .map_err(|source| LabError::Read {
+            path: root.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| LabError::Read {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|source| LabError::Read {
+            path: path.clone(),
+            source,
+        })?;
+
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("transport-") {
+                return Err(LabError::CommandFailure {
+                    detail: format!(
+                        "persisted suite artifacts retained transport lifecycle directory {}",
+                        path.display()
+                    ),
+                });
+            }
+            assert_no_private_key_material_in_path(&path)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let bytes = fs::read(&path).map_err(|source| LabError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        let source = String::from_utf8_lossy(&bytes);
+        if source.contains("PRIVATE KEY-----") || source.contains("BEGIN OPENSSH PRIVATE KEY") {
+            return Err(LabError::CommandFailure {
+                detail: format!(
+                    "persisted suite artifacts retained private key material in {}",
+                    path.display()
+                ),
+            });
+        }
+    }
+
     Ok(())
 }
 

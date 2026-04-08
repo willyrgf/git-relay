@@ -297,9 +297,11 @@ fn load_git_conformance_evidence(
                 error,
             })?;
             let parsed: StoredGitConformanceEvidence =
-                serde_json::from_str(&source).map_err(|error| ReleaseError::ParseJson {
-                    path: path.clone(),
-                    error,
+                serde_json::from_str(&source).map_err(|error| {
+                    ReleaseError::InvalidGitConformanceEvidence {
+                        path: path.clone(),
+                        detail: format!("schema parse failed: {error}"),
+                    }
                 })?;
             validate_git_conformance_evidence(&path, &platform_name, &parsed)?;
             evidence.push(StoredGitConformanceEvidenceRecord { evidence: parsed });
@@ -326,13 +328,20 @@ fn validate_git_conformance_evidence(
             detail: format!("unsupported schema_version {}", evidence.schema_version),
         });
     }
-    if evidence.platform != platform_name {
+    if platform_label(evidence.platform) != platform_name {
         return Err(ReleaseError::InvalidGitConformanceEvidence {
             path: path.to_path_buf(),
             detail: format!(
                 "payload platform {} did not match directory platform {}",
-                evidence.platform, platform_name
+                platform_label(evidence.platform),
+                platform_name
             ),
+        });
+    }
+    if evidence.git_version.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "git_version must not be empty".to_owned(),
         });
     }
     let expected_key = sanitize_path_component(&evidence.git_version);
@@ -358,6 +367,108 @@ fn validate_git_conformance_evidence(
             ),
         });
     }
+    if evidence.nix_system.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "nix_system must not be empty".to_owned(),
+        });
+    }
+    let expected_service_manager = match evidence.platform {
+        SupportedPlatform::Macos => ServiceManager::Launchd,
+        SupportedPlatform::Linux => ServiceManager::Systemd,
+    };
+    if evidence.service_manager != expected_service_manager {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "service_manager {} did not match expected {} for platform {}",
+                service_manager_label(evidence.service_manager),
+                service_manager_label(expected_service_manager),
+                platform_label(evidence.platform),
+            ),
+        });
+    }
+    if evidence.openssh_version.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "openssh_version must not be empty".to_owned(),
+        });
+    }
+    if evidence.filesystem_profile.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "filesystem_profile must not be empty".to_owned(),
+        });
+    }
+    if evidence.git_relay_commit.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "git_relay_commit must not be empty".to_owned(),
+        });
+    }
+    if evidence.flake_lock_sha256.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "flake_lock_sha256 must not be empty".to_owned(),
+        });
+    }
+    for (binary_name, digest) in evidence.binary_digests.entries() {
+        if digest.trim().is_empty() {
+            return Err(ReleaseError::InvalidGitConformanceEvidence {
+                path: path.to_path_buf(),
+                detail: format!("binary_digests.{} must not be empty", binary_name),
+            });
+        }
+    }
+    if evidence.cases.is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "cases must contain at least one case result".to_owned(),
+        });
+    }
+    let mut seen_case_ids = BTreeSet::new();
+    for case in &evidence.cases {
+        if case.case_id.trim().is_empty() {
+            return Err(ReleaseError::InvalidGitConformanceEvidence {
+                path: path.to_path_buf(),
+                detail: "cases[*].case_id must not be empty".to_owned(),
+            });
+        }
+        if !seen_case_ids.insert(case.case_id.clone()) {
+            return Err(ReleaseError::InvalidGitConformanceEvidence {
+                path: path.to_path_buf(),
+                detail: format!("duplicate case_id {} in cases", case.case_id),
+            });
+        }
+    }
+    if evidence.all_mandatory_cases_passed
+        && evidence
+            .cases
+            .iter()
+            .any(|case| case.status == StoredGitConformanceCaseStatus::Fail)
+    {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail:
+                "all_mandatory_cases_passed=true conflicted with at least one failing case status"
+                    .to_owned(),
+        });
+    }
+    if evidence.normalized_summary_sha256.trim().is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: "normalized_summary_sha256 must not be empty".to_owned(),
+        });
+    }
+    if evidence.recorded_at_ms != 0 {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "recorded_at_ms must be deterministic zero for release-admitting evidence, found {}",
+                evidence.recorded_at_ms
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -365,13 +476,15 @@ fn exact_git_floor_from_evidence(records: &[StoredGitConformanceEvidenceRecord])
     let mut admitted = BTreeMap::<String, BTreeSet<String>>::new();
     for record in records {
         let evidence = &record.evidence;
-        if evidence.profile != "deterministic-core" || !evidence.all_mandatory_cases_passed {
+        if evidence.profile != StoredGitConformanceProfile::DeterministicCore
+            || !evidence.all_mandatory_cases_passed
+        {
             continue;
         }
         admitted
             .entry(evidence.git_version.clone())
             .or_default()
-            .insert(evidence.platform.clone());
+            .insert(platform_label(evidence.platform).to_owned());
     }
 
     let mut candidates = admitted
@@ -521,6 +634,13 @@ fn platform_label(platform: SupportedPlatform) -> &'static str {
     }
 }
 
+fn service_manager_label(service_manager: ServiceManager) -> &'static str {
+    match service_manager {
+        ServiceManager::Launchd => "launchd",
+        ServiceManager::Systemd => "systemd",
+    }
+}
+
 fn current_time_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -540,14 +660,76 @@ struct StoredReleaseManifestEntry {
     admitted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoredGitConformanceProfile {
+    DeterministicCore,
+    ProviderAdmission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredGitConformanceCaseStatus {
+    Pass,
+    Fail,
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredGitConformanceCase {
+    case_id: String,
+    status: StoredGitConformanceCaseStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredGitConformanceBinaryDigests {
+    #[serde(rename = "git-relay")]
+    git_relay: String,
+    #[serde(rename = "git-relayd")]
+    git_relayd: String,
+    #[serde(rename = "git-relay-install-hooks")]
+    git_relay_install_hooks: String,
+    #[serde(rename = "git-relay-ssh-force-command")]
+    git_relay_ssh_force_command: String,
+}
+
+impl StoredGitConformanceBinaryDigests {
+    fn entries(&self) -> [(&'static str, &str); 4] {
+        [
+            ("git-relay", self.git_relay.as_str()),
+            ("git-relayd", self.git_relayd.as_str()),
+            (
+                "git-relay-install-hooks",
+                self.git_relay_install_hooks.as_str(),
+            ),
+            (
+                "git-relay-ssh-force-command",
+                self.git_relay_ssh_force_command.as_str(),
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredGitConformanceEvidence {
     schema_version: u64,
-    profile: String,
+    profile: StoredGitConformanceProfile,
     git_version_key: String,
-    platform: String,
+    platform: SupportedPlatform,
+    nix_system: String,
+    service_manager: ServiceManager,
     git_version: String,
+    openssh_version: String,
+    filesystem_profile: String,
+    git_relay_commit: String,
+    flake_lock_sha256: String,
+    binary_digests: StoredGitConformanceBinaryDigests,
+    cases: Vec<StoredGitConformanceCase>,
     all_mandatory_cases_passed: bool,
+    normalized_summary_sha256: String,
+    recorded_at_ms: u128,
 }
 
 #[derive(Debug)]

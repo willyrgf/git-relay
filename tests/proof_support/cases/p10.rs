@@ -1,4 +1,7 @@
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -22,6 +25,8 @@ pub fn definition() -> CaseDefinition {
             "p10.serve_once.pending_detected",
             "p10.serve_once.drains_pending",
             "p10.retention.pruning",
+            "p10.retention.proof_artifacts",
+            "p10.retention.release_evidence_pinned",
         ],
         required_artifacts: STANDARD_CASE_ARTIFACTS,
         pass_criteria: &[
@@ -29,6 +34,7 @@ pub fn definition() -> CaseDefinition {
             "service render output is deterministic",
             "hook install plus force-command routing are operational",
             "serve --once drains pending reconcile and retention pruning follows policy",
+            "proof artifact retention prunes stale suite/failure/conformance evidence while keeping current admitted release evidence pinned",
         ],
         fail_criteria: &[
             "runtime env contract bypassed",
@@ -336,6 +342,74 @@ authoritative_prune_ttl = "168h"
         seed_run_record(&matrix_dir, name, started, completed)?;
     }
 
+    let proof_suite_old_a = seed_proof_suite_run(&lab.state_root, "p10-suite-old-a", 1, true)?;
+    let proof_suite_old_b = seed_proof_suite_run(&lab.state_root, "p10-suite-old-b", 2, true)?;
+    let proof_suite_keep_c = seed_proof_suite_run(&lab.state_root, "p10-suite-keep-c", 3, true)?;
+    let stale_failure_capture = proof_suite_old_a.join("failures");
+
+    let admitted_old_macos = seed_git_conformance_manifest(
+        &lab.state_root,
+        "macos",
+        "git version 2.52.0",
+        "deterministic-core",
+        true,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let admitted_old_linux = seed_git_conformance_manifest(
+        &lab.state_root,
+        "linux",
+        "git version 2.52.0",
+        "deterministic-core",
+        true,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let stale_non_admitted = seed_git_conformance_manifest(
+        &lab.state_root,
+        "macos",
+        "git version 2.51.0",
+        "deterministic-core",
+        false,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let retained_non_admitted_linux = seed_git_conformance_manifest(
+        &lab.state_root,
+        "linux",
+        "git version 2.50.0",
+        "provider-admission",
+        true,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let retained_non_admitted_macos = seed_git_conformance_manifest(
+        &lab.state_root,
+        "macos",
+        "git version 2.49.0",
+        "deterministic-core",
+        false,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let admitted_current_macos = seed_git_conformance_manifest(
+        &lab.state_root,
+        "macos",
+        "git version 2.53.0",
+        "deterministic-core",
+        true,
+        0,
+    )?;
+    sleep_for_fs_tick();
+    let admitted_current_linux = seed_git_conformance_manifest(
+        &lab.state_root,
+        "linux",
+        "git version 2.53.0",
+        "deterministic-core",
+        true,
+        0,
+    )?;
+
     let prune_once = lab
         .run_git_relayd(
             &[
@@ -388,6 +462,35 @@ authoritative_prune_ttl = "168h"
         };
     let retention_keep_count_ok =
         remaining_reconcile == 2 && remaining_upstream == 2 && remaining_matrix == 2;
+    let remaining_proof_suites = count_entries(&lab.state_root.join("proof-e2e"))?;
+    let proof_suites_pruned = !proof_suite_old_a.exists()
+        && !proof_suite_old_b.exists()
+        && proof_suite_keep_c.exists()
+        && lab.suite_root.exists()
+        && remaining_proof_suites == 2;
+    let stale_failure_capture_pruned = !stale_failure_capture.exists();
+    let proof_artifacts_pruned =
+        proof_suites_pruned && stale_failure_capture_pruned && !stale_non_admitted.exists();
+    let release_evidence_pinned = admitted_current_macos.exists()
+        && admitted_current_linux.exists()
+        && !admitted_old_macos.exists()
+        && !admitted_old_linux.exists()
+        && retained_non_admitted_linux.exists()
+        && retained_non_admitted_macos.exists();
+    cleanup_case_retention_fixtures(&[
+        proof_suite_old_a.as_path(),
+        proof_suite_old_b.as_path(),
+        proof_suite_keep_c.as_path(),
+    ])?;
+    cleanup_case_retention_fixtures(&[
+        admitted_old_macos.as_path(),
+        admitted_old_linux.as_path(),
+        admitted_current_macos.as_path(),
+        admitted_current_linux.as_path(),
+        stale_non_admitted.as_path(),
+        retained_non_admitted_linux.as_path(),
+        retained_non_admitted_macos.as_path(),
+    ])?;
 
     report.assertions.push(if runtime_ok_passed {
         ProofAssertion::pass(
@@ -493,6 +596,39 @@ authoritative_prune_ttl = "168h"
             ),
         )
     });
+    report.assertions.push(if proof_artifacts_pruned {
+        ProofAssertion::pass(
+            "p10.retention.proof_artifacts",
+            Some("stale suite runs, failure captures, and non-admitted conformance artifacts were pruned".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p10.retention.proof_artifacts",
+            format!(
+                "proof_suites_pruned={proof_suites_pruned} stale_failure_capture_pruned={stale_failure_capture_pruned} stale_non_admitted_exists={}",
+                stale_non_admitted.exists()
+            ),
+        )
+    });
+    report.assertions.push(if release_evidence_pinned {
+        ProofAssertion::pass(
+            "p10.retention.release_evidence_pinned",
+            Some("latest admitted release evidence remained pinned while superseded admitted evidence was pruned".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p10.retention.release_evidence_pinned",
+            format!(
+                "current=({}, {}) old=({}, {}) retained_non_admitted=({}, {})",
+                admitted_current_macos.exists(),
+                admitted_current_linux.exists(),
+                admitted_old_macos.exists(),
+                admitted_old_linux.exists(),
+                retained_non_admitted_linux.exists(),
+                retained_non_admitted_macos.exists(),
+            ),
+        )
+    });
 
     report.details = json!({
         "runtime_ok": runtime_ok.summary(),
@@ -506,6 +642,18 @@ authoritative_prune_ttl = "168h"
         "pending_before_serve": pending_before_serve,
         "pending_after_serve": pending_after_serve,
         "retention_pruned": retention_pruned,
+        "proof_suites_pruned": proof_suites_pruned,
+        "stale_failure_capture_pruned": stale_failure_capture_pruned,
+        "proof_artifacts_pruned": proof_artifacts_pruned,
+        "release_evidence_pinned": release_evidence_pinned,
+        "remaining_proof_suites": remaining_proof_suites,
+        "admitted_old_macos": admitted_old_macos,
+        "admitted_old_linux": admitted_old_linux,
+        "admitted_current_macos": admitted_current_macos,
+        "admitted_current_linux": admitted_current_linux,
+        "stale_non_admitted": stale_non_admitted,
+        "retained_non_admitted_linux": retained_non_admitted_linux,
+        "retained_non_admitted_macos": retained_non_admitted_macos,
         "remaining_reconcile_runs": remaining_reconcile,
         "remaining_upstream_runs": remaining_upstream,
         "remaining_matrix_runs": remaining_matrix,
@@ -539,7 +687,7 @@ fn render_service(lab: &ProofLab, format: &str) -> Result<String, String> {
 }
 
 fn seed_run_record(
-    directory: &std::path::Path,
+    directory: &Path,
     run_id: &str,
     started_at_ms: u64,
     completed_at_ms: u64,
@@ -559,12 +707,143 @@ fn seed_run_record(
     .map_err(|error| error.to_string())
 }
 
-fn count_entries(path: &std::path::Path) -> Result<usize, String> {
+fn count_entries(path: &Path) -> Result<usize, String> {
     fs::read_dir(path)
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map(|entries| entries.len())
         .map_err(|error| error.to_string())
+}
+
+fn seed_proof_suite_run(
+    state_root: &Path,
+    suite_id: &str,
+    completed_at_ms: u64,
+    include_failure_capture: bool,
+) -> Result<PathBuf, String> {
+    let suite_dir = state_root.join("proof-e2e").join(suite_id);
+    fs::create_dir_all(&suite_dir).map_err(|error| error.to_string())?;
+    fs::write(
+        suite_dir.join("summary.raw.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "suite": "rfc-proof-e2e",
+            "mode": "full",
+            "started_at_ms": completed_at_ms.saturating_sub(1),
+            "completed_at_ms": completed_at_ms,
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if include_failure_capture {
+        let failure_dir = suite_dir.join("failures").join("P10");
+        fs::create_dir_all(&failure_dir).map_err(|error| error.to_string())?;
+        fs::write(
+            failure_dir.join("p10.retention.stderr.txt"),
+            "redacted failure evidence\n",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(suite_dir)
+}
+
+fn seed_git_conformance_manifest(
+    state_root: &Path,
+    platform: &str,
+    git_version: &str,
+    profile: &str,
+    all_mandatory_cases_passed: bool,
+    recorded_at_ms: u64,
+) -> Result<PathBuf, String> {
+    let path = state_root
+        .join("release")
+        .join("git-conformance")
+        .join(platform)
+        .join(format!("{}.json", sanitize_key(git_version)));
+    fs::create_dir_all(path.parent().expect("conformance parent"))
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&git_conformance_evidence_value(
+            platform,
+            git_version,
+            profile,
+            all_mandatory_cases_passed,
+            recorded_at_ms,
+        ))
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn git_conformance_evidence_value(
+    platform: &str,
+    git_version: &str,
+    profile: &str,
+    all_mandatory_cases_passed: bool,
+    recorded_at_ms: u64,
+) -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "profile": profile,
+        "git_version_key": sanitize_key(git_version),
+        "platform": platform,
+        "nix_system": "x86_64-linux",
+        "service_manager": if platform == "macos" { "launchd" } else { "systemd" },
+        "git_version": git_version,
+        "openssh_version": "OpenSSH_10.0p1",
+        "filesystem_profile": format!("synthetic-{platform}"),
+        "git_relay_commit": "test-commit",
+        "flake_lock_sha256": "test-lock",
+        "binary_digests": {
+            "git-relay": "digest-a",
+            "git-relayd": "digest-b",
+            "git-relay-install-hooks": "digest-c",
+            "git-relay-ssh-force-command": "digest-d"
+        },
+        "cases": [
+            {
+                "case_id": "P01",
+                "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
+            }
+        ],
+        "all_mandatory_cases_passed": all_mandatory_cases_passed,
+        "normalized_summary_sha256": "synthetic-summary",
+        "recorded_at_ms": recorded_at_ms
+    })
+}
+
+fn sanitize_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sleep_for_fs_tick() {
+    thread::sleep(Duration::from_millis(5));
+}
+
+fn cleanup_case_retention_fixtures(paths: &[&Path]) -> Result<(), String> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        } else {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_json(source: &str) -> Result<serde_json::Value, String> {

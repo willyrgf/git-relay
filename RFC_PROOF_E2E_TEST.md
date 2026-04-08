@@ -694,7 +694,7 @@ Acceptance:
 1. Linux + macOS host-side `full` pass required for release admission
 2. declared supported provider targets cannot be admitted without passing `provider-admission`
 
-### Current repository status checklist (updated 2026-04-08)
+### Current repository status checklist (updated 2026-04-08, re-audited)
 
 Completed in the current repository state:
 
@@ -703,7 +703,7 @@ Completed in the current repository state:
 - [x] P01-P11 case modules exist and run in the proof harness on the current host.
 - [x] `flake.nix` wires `rfc-proof-e2e-fast`, `rfc-proof-e2e-full`, and `rfc-proof-provider-admission`, with deterministic-core flake checks validating the pure contract subset and live host-side proof gates exposed through `nix run .#test` and enforced separately in CI.
 
-Still required before this RFC proof contract is fully satisfied:
+Addressed from the previous remaining-work checklist:
 
 - [x] Remove SSH skip-to-pass behavior and require SSH evidence in deterministic-core proof runs.
 - [x] Align `fast` mode with the mandatory-scenarios contract for P01 crash-boundary coverage, or narrow the mode contract if crash-boundary coverage remains `full`-only.
@@ -719,6 +719,14 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
 - [x] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
 - [x] Align normalization and failure-capture outputs with the documented contract, including `repo_id` semantic ordering, per-step failure capture naming, and deterministic git-conformance timestamps or an explicitly narrowed determinism claim.
+
+Still required before this RFC proof contract is fully satisfied:
+
+- [x] Prevent proof artifact persistence of transport auth material and private keys by cleaning or relocating `cases/*/transport-*` lifecycle files from kept suite outputs, and add a fail-closed assertion that no private key material remains in persisted proof artifacts.
+- [x] Enforce full machine-readable Git conformance schema validation in release-report ingestion (fail closed for missing or invalid required fields), not just the current subset used for floor computation.
+- [x] Implement and gate the full proof-artifact retention contract from section 8: raw suite runs, redacted failure captures, non-admitted conformance artifacts (`ttl=720h`, `keep_count=20`), and admitted release evidence pinned until superseded.
+- [ ] Enforce deterministic harness behavior by explicitly disabling opportunistic Git auto-GC in harness-driven repository/worktree mutations.
+- [ ] Align `full` mode contract and implementation by either adding explicit full-only extended crash/retention variants or narrowing the documented `full` mode claims.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
 

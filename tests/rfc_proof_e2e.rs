@@ -125,6 +125,7 @@ fn run_case(
             }
         }
     }
+    lab.cleanup_case_transport_lifecycle_files(case.case_id)?;
 
     let raw_case_path = lab
         .case_root(case.case_id)?
@@ -604,6 +605,8 @@ fn proof_e2e_fast_profile_contract_declared() {
             "p10.runtime_validation.rejects_nix_store",
             "p10.serve_once.drains_pending",
             "p10.retention.pruning",
+            "p10.retention.proof_artifacts",
+            "p10.retention.release_evidence_pinned",
         ],
     );
     assert_required_assertions(

@@ -259,7 +259,8 @@ Under `state_root`:
 - `upstream-probes/runs/<repo>`: per-repo upstream probe records
 - `upstream-probes/matrix-runs/<repo>`: matrix probe records
 - `upstream-probes/release-manifests/<repo>`: admitted release manifests
-- `release/git-conformance/<platform>`: admitted deterministic-core Git conformance evidence used by `release report`
+- `proof-e2e/<suite>`: RFC proof suite artifacts, including case evidence and redacted failure captures
+- `release/git-conformance/<platform>`: machine-readable Git conformance evidence used by `release report` and retention pinning/pruning
 - `release/hosts`: host version evidence used by `release report`
 - `retention/maintenance/<repo>.json`: latest maintenance result per repo
 
@@ -284,6 +285,8 @@ Current behavior:
 - manual `git-relay cache evict` still evicts a pinned cache repository
 - caches with no recorded activity evidence are retained rather than evicted speculatively
 - reconcile runs, upstream probe runs, and matrix probe runs are pruned by age while keeping at least `terminal_run_keep_count` records per repo
+- proof suite runs under `proof-e2e/`, redacted failure capture sets, and non-admitted git-conformance artifacts use the same `terminal_run_ttl` + `terminal_run_keep_count` policy
+- admitted release evidence in `release/git-conformance` remains pinned until superseded by a newer admitted release
 - authoritative repos run reflog expiration and `git gc` during maintenance sweeps
 
 ## Operator Workflows
