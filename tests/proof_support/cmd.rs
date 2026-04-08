@@ -75,6 +75,12 @@ impl ProofCommandRunner {
         base_env.insert("LANG".to_owned(), "C".to_owned());
         base_env.insert("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned());
         base_env.insert("GIT_CONFIG_SYSTEM".to_owned(), "/dev/null".to_owned());
+        // Force deterministic no-auto-gc behavior for all harness-driven Git processes.
+        base_env.insert("GIT_CONFIG_COUNT".to_owned(), "2".to_owned());
+        base_env.insert("GIT_CONFIG_KEY_0".to_owned(), "gc.auto".to_owned());
+        base_env.insert("GIT_CONFIG_VALUE_0".to_owned(), "0".to_owned());
+        base_env.insert("GIT_CONFIG_KEY_1".to_owned(), "receive.autogc".to_owned());
+        base_env.insert("GIT_CONFIG_VALUE_1".to_owned(), "false".to_owned());
         base_env.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
         base_env.insert("GIT_AUTHOR_NAME".to_owned(), "Git Relay Proof".to_owned());
         base_env.insert(
@@ -152,5 +158,49 @@ impl ProofCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::ProofCommandRunner;
+
+    #[test]
+    fn runner_disables_auto_gc_for_git_processes() {
+        let home = TempDir::new().expect("home tempdir");
+        let xdg = TempDir::new().expect("xdg tempdir");
+        let runner = ProofCommandRunner::new(home.path(), xdg.path());
+
+        let gc_auto = runner
+            .run(
+                "git",
+                &[
+                    "config".to_owned(),
+                    "--get".to_owned(),
+                    "gc.auto".to_owned(),
+                ],
+                None,
+                &[],
+            )
+            .expect("read gc.auto");
+        assert!(gc_auto.success());
+        assert_eq!(gc_auto.stdout.trim(), "0");
+
+        let receive_autogc = runner
+            .run(
+                "git",
+                &[
+                    "config".to_owned(),
+                    "--get".to_owned(),
+                    "receive.autogc".to_owned(),
+                ],
+                None,
+                &[],
+            )
+            .expect("read receive.autogc");
+        assert!(receive_autogc.success());
+        assert_eq!(receive_autogc.stdout.trim(), "false");
     }
 }

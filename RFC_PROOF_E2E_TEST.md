@@ -725,7 +725,7 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Prevent proof artifact persistence of transport auth material and private keys by cleaning or relocating `cases/*/transport-*` lifecycle files from kept suite outputs, and add a fail-closed assertion that no private key material remains in persisted proof artifacts.
 - [x] Enforce full machine-readable Git conformance schema validation in release-report ingestion (fail closed for missing or invalid required fields), not just the current subset used for floor computation.
 - [x] Implement and gate the full proof-artifact retention contract from section 8: raw suite runs, redacted failure captures, non-admitted conformance artifacts (`ttl=720h`, `keep_count=20`), and admitted release evidence pinned until superseded.
-- [ ] Enforce deterministic harness behavior by explicitly disabling opportunistic Git auto-GC in harness-driven repository/worktree mutations.
+- [x] Enforce deterministic harness behavior by explicitly disabling opportunistic Git auto-GC in harness-driven repository/worktree mutations.
 - [ ] Align `full` mode contract and implementation by either adding explicit full-only extended crash/retention variants or narrowing the documented `full` mode claims.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
