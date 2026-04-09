@@ -29,7 +29,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Run full proof gate
+      - name: Run full proof gate (nix run .#test default=full)
         shell: bash
         run: |
           set -euo pipefail

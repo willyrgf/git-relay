@@ -586,6 +586,7 @@ Execution contract:
 
 1. `checks.<system>.rfc-proof-e2e-fast` and `checks.<system>.rfc-proof-e2e-full` run in pure Nix derivations and validate the deterministic-core proof contract statically.
 2. live deterministic-core gate runs execute host-side in CI or release automation through a flake app entrypoint (`nix run .#test`) with Nix-built relay binaries and pinned Git/OpenSSH/Python/Cargo/Rustc tool paths, not cargo-bin fallbacks in gate mode.
+- `nix run .#test` is the canonical full deterministic-core validation command (`nix run .#test -- full` is equivalent).
 3. this split is required because mandatory SSH transport proof may fail under sandbox builder accounts that cannot execute the Git command path over SSH, while the release gate still requires the live SSH + smart-HTTP evidence on supported hosts.
 4. SSH and smart HTTP ingress validation are mandatory in deterministic-core modes (`fast` and `full`) for those live host-side gate runs.
 5. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials.

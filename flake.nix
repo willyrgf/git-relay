@@ -271,8 +271,8 @@ PY
               usage() {
                 cat <<'EOF'
 Usage:
-  nix run .#test
-  nix run .#test -- full
+  nix run .#test                       # canonical full deterministic-core gate
+  nix run .#test -- full              # equivalent explicit form
   nix run .#test -- provider-admission [manifest_path]
 EOF
               }
