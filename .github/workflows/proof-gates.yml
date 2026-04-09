@@ -2,9 +2,13 @@ name: proof-gates
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
   push:
     branches:
-      - main
+      - "**"
 
 permissions:
   contents: read
@@ -47,13 +51,16 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Materialize explicit provider-admission inputs
-        if: ${{ secrets.GIT_RELAY_PROVIDER_TARGETS_JSON != '' && secrets.GIT_RELAY_PROVIDER_CREDENTIALS_ENV != '' }}
         shell: bash
         env:
           TARGETS_JSON: ${{ secrets.GIT_RELAY_PROVIDER_TARGETS_JSON }}
           CREDENTIALS_ENV: ${{ secrets.GIT_RELAY_PROVIDER_CREDENTIALS_ENV }}
         run: |
           set -euo pipefail
+          if [[ -z "${TARGETS_JSON:-}" || -z "${CREDENTIALS_ENV:-}" ]]; then
+            echo "provider-admission secrets not configured; continuing with fixture-only inputs"
+            exit 0
+          fi
           targets_file="$RUNNER_TEMP/provider-targets.json"
           credentials_file="$RUNNER_TEMP/provider-credentials.env"
           printf '%s' "$TARGETS_JSON" > "$targets_file"
