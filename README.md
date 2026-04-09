@@ -400,8 +400,8 @@ nix build .#git-relay-ssh-force-command
 nix build .#git-relay-service-templates
 ```
 
-GitHub Actions enforces the release-gate matrix in [`.github/workflows/proof-gates.yml`](./.github/workflows/proof-gates.yml): Linux `full`, macOS `full`, and a provider-admission policy job. The provider job runs the flake `rfc-proof-provider-admission` check while `fixtures/hosted/targets.json` is still placeholder-only, and it fails closed if real hosted targets are declared without explicit `GIT_RELAY_PROVIDER_TARGETS_JSON` and `GIT_RELAY_PROVIDER_CREDENTIALS_ENV` secrets.
-Pure `nix flake check` keeps `rfc-proof-e2e-fast` and `rfc-proof-e2e-full` as static proof-contract checks. The live deterministic-core proof suite runs host-side through `nix run .#test`, which is the canonical full validation command (defaulting to `full`; `nix run .#test -- full` is equivalent). It uses flake-locked relay binaries plus pinned `git`, `openssh`, `python3`, `cargo`, and `rustc` paths so mandatory localhost SSH and smart-HTTP evidence is collected without falling back to developer tooling. The same app also exposes provider policy enforcement with `nix run .#test -- provider-admission fixtures/hosted/targets.json`.
+GitHub Actions enforces the release-gate matrix in [`.github/workflows/proof-gates.yml`](./.github/workflows/proof-gates.yml): Linux `full`, macOS `full`, and an explicit provider-admission policy job for declared hosted targets.
+Pure `nix flake check` keeps `rfc-proof-e2e-fast` and `rfc-proof-e2e-full` as static proof-contract checks. The live host-side gate runs through `nix run .#test`, which is the canonical full validation command and now includes provider-admission policy enforcement by default. It uses flake-locked relay binaries plus pinned `git`, `openssh`, `python3`, `cargo`, and `rustc` paths so mandatory localhost SSH and smart-HTTP evidence is collected without falling back to developer tooling. `nix run .#test -- provider-admission fixtures/hosted/targets.json` remains available for targeted provider-admission execution.
 
 ## Current Source-Truth Notes
 

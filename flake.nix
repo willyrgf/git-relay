@@ -271,22 +271,19 @@ PY
               usage() {
                 cat <<'EOF'
 Usage:
-  nix run .#test                       # canonical full deterministic-core gate
-  nix run .#test -- full              # equivalent explicit form
+  nix run .#test                       # canonical full deterministic-core gate + provider-admission policy
   nix run .#test -- provider-admission [manifest_path]
 EOF
               }
 
-              command="''${1:-full}"
+              if [[ "$#" -eq 0 ]]; then
+                run_full_gate
+                run_provider_admission_gate fixtures/hosted/targets.json
+                exit 0
+              fi
+
+              command="$1"
               case "$command" in
-                full)
-                  shift || true
-                  if [[ "$#" -ne 0 ]]; then
-                    usage >&2
-                    exit 1
-                  fi
-                  run_full_gate
-                  ;;
                 provider-admission)
                   shift || true
                   if [[ "$#" -gt 1 ]]; then
