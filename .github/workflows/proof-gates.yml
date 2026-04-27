@@ -33,7 +33,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Run full proof gate (nix run .#test includes provider policy baseline)
+      - name: Run full proof gate with provider policy baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${TARGETS_JSON:-}" || -z "${CREDENTIALS_ENV:-}" ]]; then
-            echo "provider-admission secrets not configured; continuing with fixture-only inputs"
+            echo "provider-admission secrets not configured; running fixture-only policy baseline, not real declared-target admission"
             exit 0
           fi
           targets_file="$RUNNER_TEMP/provider-targets.json"

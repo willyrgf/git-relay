@@ -826,16 +826,20 @@ fn git_conformance_evidence_value(
             "git-relay-install-hooks": "digest-c",
             "git-relay-ssh-force-command": "digest-d"
         },
-        "cases": [
-            {
-                "case_id": "P01",
-                "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
-            }
-        ],
+        "cases": mandatory_case_ids().iter().map(|case_id| json!({
+            "case_id": case_id,
+            "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
+        })).collect::<Vec<_>>(),
         "all_mandatory_cases_passed": all_mandatory_cases_passed,
         "normalized_summary_sha256": "synthetic-summary",
         "recorded_at_ms": recorded_at_ms
     })
+}
+
+fn mandatory_case_ids() -> [&'static str; 11] {
+    [
+        "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10", "P11",
+    ]
 }
 
 fn write_git_conformance_evidence_value_fixture(
@@ -859,6 +863,30 @@ fn write_git_conformance_evidence_value_fixture(
         serde_json::to_vec_pretty(value).expect("git conformance json"),
     )
     .expect("git conformance file");
+    path
+}
+
+fn write_host_evidence_fixture(temp: &TempDir, platform: &str, host_id: &str) -> PathBuf {
+    let path = temp
+        .path()
+        .join("release")
+        .join("hosts")
+        .join(platform)
+        .join(format!("{host_id}.json"));
+    fs::create_dir_all(path.parent().expect("host evidence dir")).expect("host evidence dir");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "host_id": host_id,
+            "platform": platform,
+            "service_manager": if platform == "macos" { "launchd" } else { "systemd" },
+            "observed_git_version": "git version 2.53.0",
+            "observed_nix_version": "nix (Determinate Nix 3.0.0) 2.26.3",
+            "recorded_at_ms": 0
+        }))
+        .expect("host evidence json"),
+    )
+    .expect("host evidence file");
     path
 }
 
@@ -3274,6 +3302,19 @@ authoritative_prune_ttl = "168h"
         ),
     );
     sleep_for_fs_tick();
+    let retained_non_admitted_extra = write_git_conformance_evidence_value_fixture(
+        &temp,
+        "linux",
+        "git version 2.48.0",
+        &git_conformance_evidence_value(
+            "linux",
+            "git version 2.48.0",
+            "deterministic-core",
+            false,
+            0,
+        ),
+    );
+    sleep_for_fs_tick();
     let admitted_current_macos = write_git_conformance_evidence_value_fixture(
         &temp,
         "macos",
@@ -3342,6 +3383,7 @@ authoritative_prune_ttl = "168h"
     assert!(!stale_non_admitted.exists());
     assert!(retained_non_admitted_linux.exists());
     assert!(retained_non_admitted_macos.exists());
+    assert!(retained_non_admitted_extra.exists());
 }
 
 #[test]
@@ -4272,17 +4314,25 @@ fn release_report_records_host_evidence_and_manifest_admission_state() {
             .map(|value| value.contains("Git floor evidence remains open"))
             .unwrap_or(false)));
 
-    let host_evidence_path =
+    let host_evidence_dir =
         temp.path()
             .join("release")
             .join("hosts")
             .join(match std::env::consts::OS {
-                "macos" => "macos.json",
-                "linux" => "linux.json",
+                "macos" => "macos",
+                "linux" => "linux",
                 other => panic!("unsupported host {other}"),
             });
     assert!(
-        host_evidence_path.exists(),
+        host_evidence_dir
+            .read_dir()
+            .expect("host evidence dir")
+            .any(|entry| entry
+                .expect("host evidence entry")
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("json")),
         "release report should persist current host evidence"
     );
 }
@@ -4352,6 +4402,8 @@ fn release_report_closes_exact_git_floor_from_machine_readable_conformance_evide
         .success();
 
     let exact_git_floor = "git version 2.53.0";
+    write_host_evidence_fixture(&temp, "macos", "macos-release-host");
+    write_host_evidence_fixture(&temp, "linux", "linux-release-host");
     write_git_conformance_evidence_fixture(&temp, "macos", exact_git_floor, true);
     write_git_conformance_evidence_fixture(&temp, "linux", exact_git_floor, true);
 
@@ -4525,4 +4577,94 @@ fn release_report_fails_closed_for_invalid_git_conformance_required_value() {
         .stderr(predicate::str::contains(
             "service_manager launchd did not match expected systemd for platform linux",
         ));
+}
+
+#[test]
+fn release_report_rejects_incomplete_git_conformance_case_set() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let git_version = "git version 2.53.0";
+    let mut value =
+        git_conformance_evidence_value("macos", git_version, "deterministic-core", true, 0);
+    value["cases"] = json!([{ "case_id": "P01", "status": "pass" }]);
+    write_git_conformance_evidence_value_fixture(&temp, "macos", git_version, &value);
+
+    let unused_lock = temp.path().join("release-incomplete-cases-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-incomplete-cases",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid git conformance evidence"))
+        .stderr(predicate::str::contains("cases missing mandatory case ids"));
+}
+
+#[test]
+fn release_report_rejects_duplicate_git_conformance_case_ids() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config_fixture(&temp);
+    let repo_path = temp.path().join("repos").join("repo.git");
+    let repo_id = "github.com/example/repo.git";
+    init_bare_repo(&repo_path);
+    configure_authoritative_repo(&repo_path);
+    write_authoritative_descriptor(&temp, &repo_path, false);
+
+    let git_version = "git version 2.53.0";
+    let mut value =
+        git_conformance_evidence_value("macos", git_version, "deterministic-core", true, 0);
+    let mut cases = value["cases"].as_array().expect("cases").clone();
+    cases.push(json!({ "case_id": "P01", "status": "pass" }));
+    value["cases"] = json!(cases);
+    write_git_conformance_evidence_value_fixture(&temp, "macos", git_version, &value);
+
+    let unused_lock = temp.path().join("release-duplicate-cases-unused.lock");
+    fs::write(&unused_lock, migration_lock_source()).expect("unused lock");
+    let (fake_nix, _log_path) = write_fake_nix_command(
+        &temp,
+        "fake-nix-release-duplicate-cases",
+        "nix (Determinate Nix 3.0.0) 2.26.3",
+        &unused_lock,
+        None,
+    );
+
+    Command::cargo_bin("git-relay")
+        .expect("cargo bin")
+        .env("GIT_RELAY_NIX_BIN", &fake_nix)
+        .args([
+            "release",
+            "report",
+            "--config",
+            config_path.to_str().expect("config"),
+            "--repo",
+            repo_id,
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid git conformance evidence"))
+        .stderr(predicate::str::contains("duplicate case_id P01"));
 }

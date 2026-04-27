@@ -2,22 +2,10 @@
   description = "Git Relay";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.flake-utils.url = "github:numtide/flake-utils";
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, flake-utils }:
     let
-      supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
-
-      forAllSystems = f:
-        builtins.listToAttrs (map (system: {
-          name = system;
-          value = f system;
-        }) supportedSystems);
-
       exampleConfig = ./packaging/example/git-relay.example.toml;
       exampleEnv = ./packaging/example/git-relay.env.example;
 
@@ -237,7 +225,7 @@ PY
                 )"
 
                 if [[ "$placeholder_only" == "placeholder" ]]; then
-                  echo "provider-admission policy: placeholder-only manifest, running flake provider-admission check"
+                  echo "provider-admission policy: placeholder-only manifest, running static fixture baseline (not declared-target admission evidence)"
                   nix build ".#checks.${system}.rfc-proof-provider-admission"
                   return 0
                 fi
@@ -271,7 +259,7 @@ PY
               usage() {
                 cat <<'EOF'
 Usage:
-  nix run .#test                       # canonical full deterministic-core gate + provider-admission policy
+  nix run .#test                       # canonical full deterministic-core gate + provider-admission policy baseline
   nix run .#test -- provider-admission [manifest_path]
 EOF
               }
@@ -354,12 +342,6 @@ EOF
           };
         };
 
-      perSystem = forAllSystems mkArtifacts;
     in
-    {
-      packages = builtins.mapAttrs (_: artifacts: artifacts.packages) perSystem;
-      apps = builtins.mapAttrs (_: artifacts: artifacts.apps) perSystem;
-      checks = builtins.mapAttrs (_: artifacts: artifacts.checks) perSystem;
-      devShells = builtins.mapAttrs (_: artifacts: artifacts.devShells) perSystem;
-    };
+    flake-utils.lib.eachSystem flake-utils.lib.allSystems mkArtifacts;
 }

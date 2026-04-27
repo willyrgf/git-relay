@@ -392,6 +392,15 @@ authoritative_prune_ttl = "168h"
         0,
     )?;
     sleep_for_fs_tick();
+    let retained_non_admitted_extra = seed_git_conformance_manifest(
+        &lab.state_root,
+        "linux",
+        "git version 2.48.0",
+        "deterministic-core",
+        false,
+        0,
+    )?;
+    sleep_for_fs_tick();
     let admitted_current_macos = seed_git_conformance_manifest(
         &lab.state_root,
         "macos",
@@ -490,6 +499,7 @@ authoritative_prune_ttl = "168h"
         stale_non_admitted.as_path(),
         retained_non_admitted_linux.as_path(),
         retained_non_admitted_macos.as_path(),
+        retained_non_admitted_extra.as_path(),
     ])?;
 
     report.assertions.push(if runtime_ok_passed {
@@ -654,6 +664,7 @@ authoritative_prune_ttl = "168h"
         "stale_non_admitted": stale_non_admitted,
         "retained_non_admitted_linux": retained_non_admitted_linux,
         "retained_non_admitted_macos": retained_non_admitted_macos,
+        "retained_non_admitted_extra": retained_non_admitted_extra,
         "remaining_reconcile_runs": remaining_reconcile,
         "remaining_upstream_runs": remaining_upstream,
         "remaining_matrix_runs": remaining_matrix,
@@ -802,16 +813,20 @@ fn git_conformance_evidence_value(
             "git-relay-install-hooks": "digest-c",
             "git-relay-ssh-force-command": "digest-d"
         },
-        "cases": [
-            {
-                "case_id": "P01",
-                "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
-            }
-        ],
+        "cases": mandatory_case_ids().iter().map(|case_id| json!({
+            "case_id": case_id,
+            "status": if all_mandatory_cases_passed { "pass" } else { "fail" }
+        })).collect::<Vec<_>>(),
         "all_mandatory_cases_passed": all_mandatory_cases_passed,
         "normalized_summary_sha256": "synthetic-summary",
         "recorded_at_ms": recorded_at_ms
     })
+}
+
+fn mandatory_case_ids() -> [&'static str; 11] {
+    [
+        "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10", "P11",
+    ]
 }
 
 fn sanitize_key(value: &str) -> String {

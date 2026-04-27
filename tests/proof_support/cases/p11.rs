@@ -11,14 +11,14 @@ pub fn definition() -> CaseDefinition {
     CaseDefinition {
         case_id: "P11",
         setup: "Prepare release matrix targets with one admitted candidate and one unadmitted target.",
-        action: "Run release-manifest build + release report, assert floor status remains open without complete admitted evidence, then record complete git-conformance evidence and assert exact Git floor closure.",
+        action: "Run release-manifest build + release report, assert floor status remains open without complete admitted evidence, then record synthetic dual-platform conformance files and assert they do not close the real release floor.",
         required_assertions: &[
             "p11.seed.push",
             "p11.release_manifest.fail_closed",
             "p11.release_manifest.supported_target_admitted",
             "p11.release_manifest.persisted",
             "p11.release_floor.open_without_full_evidence",
-            "p11.release_floor.closed_with_full_evidence",
+            "p11.release_floor.synthetic_cross_platform_rejected",
             "p11.release_blocking_reason.machine_readable",
             "p11.host_evidence.persisted",
             "p11.provider_inputs.validated",
@@ -28,11 +28,11 @@ pub fn definition() -> CaseDefinition {
         pass_criteria: &[
             "release manifest evidence is persisted",
             "missing or unadmitted targets keep floor status open",
-            "exact Git floor closes when admitted machine-readable conformance evidence exists for both supported platforms",
-            "host evidence persists per platform",
+            "synthetic dual-platform conformance files do not satisfy real host-admitted release closure",
+            "host evidence persists per host under its platform",
         ],
         fail_criteria: &[
-            "release floor closes without complete machine-readable evidence",
+            "release floor closes from synthetic cross-platform files inside a single host-local test",
         ],
         contract_refs: &[
             "RFC_PROOF_E2E_TEST.md#P11",
@@ -54,6 +54,7 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         true,
     )])
     .map_err(|error| error.to_string())?;
+    configure_same_repo_hidden_target(lab, &lab.upstream_alpha)?;
 
     let work_repo = case_root.join("release-work");
     if work_repo.exists() {
@@ -226,29 +227,36 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
                     })
                 })
                 .unwrap_or(false);
-            let host_evidence = lab
-                .state_root
-                .join("release")
-                .join("hosts")
-                .join(match std::env::consts::OS {
-                    "macos" => "macos.json",
-                    "linux" => "linux.json",
-                    other => return Err(format!("unsupported host platform {other}")),
+            let host_evidence_dir =
+                lab.state_root
+                    .join("release")
+                    .join("hosts")
+                    .join(match std::env::consts::OS {
+                        "macos" => "macos",
+                        "linux" => "linux",
+                        other => return Err(format!("unsupported host platform {other}")),
+                    });
+            let host_evidence = host_evidence_dir
+                .read_dir()
+                .map(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                    })
                 })
-                .exists();
+                .unwrap_or(false);
             (git_open, repo_open, blocking, host_evidence)
         } else {
             (false, false, false, false)
         };
 
-    let closed_git_version = lab.toolchain.git_version.clone();
+    let synthetic_git_version = lab.toolchain.git_version.clone();
     let macos_conformance = lab
-        .persist_release_git_conformance_evidence("macos", &closed_git_version, true)
+        .persist_release_git_conformance_evidence("macos", &synthetic_git_version, true)
         .map_err(|error| error.to_string())?;
     let linux_conformance = lab
-        .persist_release_git_conformance_evidence("linux", &closed_git_version, true)
+        .persist_release_git_conformance_evidence("linux", &synthetic_git_version, true)
         .map_err(|error| error.to_string())?;
-    let release_report_closed = lab
+    let release_report_after_synthetic = lab
         .run_git_relay(
             &[
                 "release".to_owned(),
@@ -265,27 +273,23 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
             )],
         )
         .map_err(|error| error.to_string())?;
-    let (git_floor_closed, exact_git_floor_matches, git_floor_blocking_cleared) =
-        if release_report_closed.success() {
-            let parsed = parse_json(&release_report_closed.stdout)?;
-            let blocking_cleared = !parsed["blocking_reasons"]
+    let (synthetic_floor_still_open, synthetic_floor_blocked_on_hosts) =
+        if release_report_after_synthetic.success() {
+            let parsed = parse_json(&release_report_after_synthetic.stdout)?;
+            let host_blocking = parsed["blocking_reasons"]
                 .as_array()
                 .map(|items| {
                     items.iter().any(|entry| {
                         entry
                             .as_str()
-                            .map(|value| value.contains("Git floor evidence remains open"))
+                            .map(|value| value.contains("host evidence does not yet cover"))
                             .unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
-            (
-                parsed["exact_git_floor_status"] == "closed",
-                parsed["exact_git_floor"] == json!(closed_git_version),
-                blocking_cleared,
-            )
+            (parsed["exact_git_floor_status"] == "open", host_blocking)
         } else {
-            (false, false, false)
+            (false, false)
         };
 
     let provider_inputs_checked = if mode == ProofMode::ProviderAdmission {
@@ -357,22 +361,21 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         },
     );
     report.assertions.push(
-        if release_report_closed.success()
-            && git_floor_closed
-            && exact_git_floor_matches
-            && git_floor_blocking_cleared
+        if release_report_after_synthetic.success()
+            && synthetic_floor_still_open
+            && synthetic_floor_blocked_on_hosts
         {
             ProofAssertion::pass(
-                "p11.release_floor.closed_with_full_evidence",
+                "p11.release_floor.synthetic_cross_platform_rejected",
                 Some(
-                    "exact Git floor closed after admitted machine-readable conformance evidence was recorded for both supported platforms"
+                    "synthetic dual-platform conformance files did not close the release floor without real per-host platform evidence"
                         .to_owned(),
                 ),
             )
         } else {
             ProofAssertion::fail(
-                "p11.release_floor.closed_with_full_evidence",
-                release_report_closed.summary(),
+                "p11.release_floor.synthetic_cross_platform_rejected",
+                release_report_after_synthetic.summary(),
             )
         },
     );
@@ -432,11 +435,10 @@ fn run(lab: &mut ProofLab, mode: ProofMode) -> Result<CaseReport, String> {
         "manifest_persisted": manifest_persisted,
         "manifest_latest": manifest_latest,
         "release_report": release_report.summary(),
-        "release_report_closed": release_report_closed.summary(),
+        "release_report_after_synthetic": release_report_after_synthetic.summary(),
         "git_floor_open": git_floor_open,
-        "git_floor_closed": git_floor_closed,
-        "exact_git_floor_matches": exact_git_floor_matches,
-        "git_floor_blocking_cleared": git_floor_blocking_cleared,
+        "synthetic_floor_still_open": synthetic_floor_still_open,
+        "synthetic_floor_blocked_on_hosts": synthetic_floor_blocked_on_hosts,
         "repo_manifest_open": repo_manifest_open,
         "blocking_reason_open": blocking_reason_open,
         "host_evidence_persisted": host_evidence_persisted,
@@ -472,6 +474,34 @@ fn parse_manifest_open(source: &str) -> Result<(bool, bool, bool), String> {
         missing_target_unadmitted,
         supported_target_admitted,
     ))
+}
+
+fn configure_same_repo_hidden_target(lab: &ProofLab, repo: &Path) -> Result<(), String> {
+    let entries = [
+        ("receive.fsckObjects", "true"),
+        ("transfer.hideRefs", "refs/git-relay"),
+        ("uploadpack.hideRefs", "refs/git-relay"),
+        ("receive.hideRefs", "refs/git-relay"),
+        ("uploadpack.allowReachableSHA1InWant", "false"),
+        ("uploadpack.allowAnySHA1InWant", "false"),
+        ("uploadpack.allowTipSHA1InWant", "false"),
+        ("core.fsync", "all"),
+        ("core.fsyncMethod", "fsync"),
+    ];
+    for (key, value) in entries {
+        lab.run_git_expect_success(
+            &[
+                format!("--git-dir={}", repo.display()),
+                "config".to_owned(),
+                key.to_owned(),
+                value.to_owned(),
+            ],
+            None,
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn write_fake_nix_version_command(

@@ -565,14 +565,16 @@ fn prune_non_admitted_conformance_artifacts(
 
     let records = collect_conformance_artifacts(&root)?;
     let pinned_release_git_version = latest_admitted_release_git_version(&records);
+    let pinned_provider_paths = latest_admitted_provider_paths(&records);
     let mut pinned_admitted_conformance = 0usize;
     let mut candidates = Vec::new();
     for record in records {
         let pinned = pinned_release_git_version.as_ref().is_some_and(|version| {
             record.admitted_candidate
+                && record.profile.as_deref() == Some("deterministic-core")
                 && record.git_version.as_deref() == Some(version.as_str())
                 && record.platform.is_some()
-        });
+        }) || pinned_provider_paths.contains(&record.path);
         if pinned {
             pinned_admitted_conformance += 1;
         } else {
@@ -643,6 +645,7 @@ fn collect_conformance_artifacts(
             let timestamp_ms = file_modified_time_ms(&path);
             let mut platform = None;
             let mut git_version = None;
+            let mut profile_value = None;
             let mut admitted_candidate = false;
 
             let source = fs::read_to_string(&path).map_err(|error| MaintenanceError::Read {
@@ -651,10 +654,14 @@ fn collect_conformance_artifacts(
             })?;
             if let Ok(parsed) = serde_json::from_str::<Value>(&source) {
                 let profile = parsed.get("profile").and_then(Value::as_str).unwrap_or("");
+                if !profile.trim().is_empty() {
+                    profile_value = Some(profile.to_owned());
+                }
                 let all_mandatory_cases_passed = parsed
                     .get("all_mandatory_cases_passed")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let mandatory_cases_present = mandatory_case_set_present(&parsed);
                 let payload_platform = parsed.get("platform").and_then(Value::as_str).unwrap_or("");
                 if platform_supported && payload_platform == platform_name {
                     platform = Some(platform_name.clone());
@@ -673,8 +680,9 @@ fn collect_conformance_artifacts(
                         .unwrap_or("");
                     if sanitize_component(&version) == file_key {
                         admitted_candidate = platform.is_some()
-                            && profile == "deterministic-core"
-                            && all_mandatory_cases_passed;
+                            && matches!(profile, "deterministic-core" | "provider-admission")
+                            && all_mandatory_cases_passed
+                            && mandatory_cases_present;
                     }
                     git_version = Some(version);
                 }
@@ -683,6 +691,7 @@ fn collect_conformance_artifacts(
             records.push(ConformanceArtifactRecord {
                 path,
                 timestamp_ms,
+                profile: profile_value,
                 platform,
                 git_version,
                 admitted_candidate,
@@ -695,7 +704,7 @@ fn collect_conformance_artifacts(
 fn latest_admitted_release_git_version(records: &[ConformanceArtifactRecord]) -> Option<String> {
     let mut admitted = BTreeMap::<String, BTreeSet<String>>::new();
     for record in records {
-        if !record.admitted_candidate {
+        if !record.admitted_candidate || record.profile.as_deref() != Some("deterministic-core") {
             continue;
         }
         let (Some(platform), Some(git_version)) =
@@ -716,6 +725,48 @@ fn latest_admitted_release_git_version(records: &[ConformanceArtifactRecord]) ->
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| git_version_cmp(left, right));
     candidates.pop()
+}
+
+fn latest_admitted_provider_paths(records: &[ConformanceArtifactRecord]) -> BTreeSet<PathBuf> {
+    let mut latest_by_platform = BTreeMap::<String, (u128, PathBuf)>::new();
+    for record in records {
+        if !record.admitted_candidate || record.profile.as_deref() != Some("provider-admission") {
+            continue;
+        }
+        let Some(platform) = record.platform.as_ref() else {
+            continue;
+        };
+        let replace = latest_by_platform
+            .get(platform)
+            .map(|(timestamp, _)| record.timestamp_ms > *timestamp)
+            .unwrap_or(true);
+        if replace {
+            latest_by_platform.insert(platform.clone(), (record.timestamp_ms, record.path.clone()));
+        }
+    }
+    latest_by_platform
+        .into_values()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn mandatory_case_set_present(parsed: &Value) -> bool {
+    let Some(cases) = parsed.get("cases").and_then(Value::as_array) else {
+        return false;
+    };
+    let ids = cases
+        .iter()
+        .filter_map(|case| case.get("case_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    mandatory_case_ids()
+        .iter()
+        .all(|case_id| ids.contains(case_id))
+}
+
+fn mandatory_case_ids() -> [&'static str; 11] {
+    [
+        "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10", "P11",
+    ]
 }
 
 fn git_version_cmp(left: &str, right: &str) -> Ordering {
@@ -1093,6 +1144,7 @@ struct GitProcessOutput {
 struct ConformanceArtifactRecord {
     path: PathBuf,
     timestamp_ms: u128,
+    profile: Option<String>,
     platform: Option<String>,
     git_version: Option<String>,
     admitted_candidate: bool,

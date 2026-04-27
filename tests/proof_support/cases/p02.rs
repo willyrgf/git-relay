@@ -272,10 +272,24 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         )
         },
     );
-    report.assertions.push(ProofAssertion::pass(
-        "p02.contract.local_commit_only",
-        Some("verdict text remains scoped to refs Git actually committed".to_owned()),
-    ));
+    let local_commit_verdict = local_commit_contract_verdict(
+        refs_ok,
+        client_side_pruning_evident,
+        ssh_internal_ref_blocked && http_internal_ref_blocked,
+        &ssh_pruning,
+        &http_pruning,
+    );
+    report.assertions.push(if local_commit_verdict.proven {
+        ProofAssertion::pass(
+            "p02.contract.local_commit_only",
+            Some(local_commit_verdict.detail.clone()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p02.contract.local_commit_only",
+            local_commit_verdict.detail.clone(),
+        )
+    });
 
     report.transport_profiles = vec!["ssh".to_owned(), "smart-http".to_owned()];
     report.details = json!({
@@ -298,7 +312,10 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "http_branch_still_exists": http_branch_still_exists,
         "ssh_client_side_pruning": ssh_pruning.details,
         "http_client_side_pruning": http_pruning.details,
-        "verdict": "local-commit does not claim whole-push semantics for ordinary pushes",
+        "local_commit_contract_verdict": {
+            "proven": local_commit_verdict.proven,
+            "detail": local_commit_verdict.detail,
+        },
     });
 
     Ok(report)
@@ -309,6 +326,40 @@ struct ClientSidePruningEvidence {
     client_side_pruning_evident: bool,
     transmitted_refs: Vec<String>,
     details: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct LocalCommitContractVerdict {
+    proven: bool,
+    detail: String,
+}
+
+fn local_commit_contract_verdict(
+    refs_committed: bool,
+    pruning_evident: bool,
+    invalid_updates_rejected: bool,
+    ssh_pruning: &ClientSidePruningEvidence,
+    http_pruning: &ClientSidePruningEvidence,
+) -> LocalCommitContractVerdict {
+    let server_traces_show_committed_subset = ssh_pruning.client_side_pruning_evident
+        && http_pruning.client_side_pruning_evident
+        && ssh_pruning.transmitted_refs.len() == 1
+        && http_pruning.transmitted_refs.len() == 1;
+    let proven = refs_committed
+        && pruning_evident
+        && invalid_updates_rejected
+        && server_traces_show_committed_subset;
+    let detail = if proven {
+        "operator-facing trace evidence is scoped to transmitted refs Git actually committed; no whole-push atomic verdict is claimed for ordinary pushes"
+            .to_owned()
+    } else {
+        format!(
+            "refs_committed={refs_committed} pruning_evident={pruning_evident} invalid_updates_rejected={invalid_updates_rejected} ssh_transmitted={:?} http_transmitted={:?}",
+            ssh_pruning.transmitted_refs,
+            http_pruning.transmitted_refs
+        )
+    };
+    LocalCommitContractVerdict { proven, detail }
 }
 
 fn install_authoritative_hooks(

@@ -529,6 +529,7 @@ fn proof_e2e_fast_profile_contract_declared() {
             "p03.reconcile.completed",
             "p03.mixed_terminal_outcomes",
             "p03.single_run_contains_upstreams",
+            "p03.persisted_terminal_record_shape",
             "p03.stale_run_superseded",
             "p03.transient_markers_cleaned",
         ],
@@ -617,7 +618,7 @@ fn proof_e2e_fast_profile_contract_declared() {
             "p11.release_manifest.supported_target_admitted",
             "p11.release_manifest.persisted",
             "p11.release_floor.open_without_full_evidence",
-            "p11.release_floor.closed_with_full_evidence",
+            "p11.release_floor.synthetic_cross_platform_rejected",
             "p11.release_blocking_reason.machine_readable",
             "p11.host_evidence.persisted",
             "p11.provider_inputs.validated",
@@ -693,6 +694,29 @@ fn proof_e2e_fast_profile_runs_required_cases() {
     );
     assert_conformance_manifest_exists(&suite_root, summary.mode, &summary)
         .expect("conformance manifest for fast");
+}
+
+#[test]
+fn proof_e2e_p02_transport_harness_reliability_target() {
+    if should_skip_proof_tests() {
+        return;
+    }
+    let case = case_definition("P02");
+    for index in 0..3 {
+        let mut lab = ProofLab::new(
+            &LabProfile::DeterministicCore,
+            &format!("proof-p02-reliability-{index}"),
+            None,
+        )
+        .expect("p02 reliability lab");
+        let result = run_case(&mut lab, &case, ProofMode::Fast).expect("run p02 reliability case");
+        assert_eq!(
+            result.status,
+            CaseStatus::Pass,
+            "P02 reliability iteration {index} failed: {:?}",
+            result.assertions
+        );
+    }
 }
 
 #[test]

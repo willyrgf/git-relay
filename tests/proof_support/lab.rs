@@ -363,13 +363,26 @@ impl ProofLab {
 
     pub fn start_transport_harness(&mut self, case_id: &str) -> Result<TransportHarness, LabError> {
         let case_root = self.case_root(case_id)?;
-        let harness =
-            TransportHarness::start(&case_root, &self.repo_root).map_err(LabError::from)?;
+        let harness = TransportHarness::start(
+            &case_root,
+            &self.repo_root,
+            &self.config_path,
+            &self.binaries.git_relay_ssh_force_command,
+        )
+        .map_err(LabError::from)?;
         self.runner
             .register_secret("PROOF_HTTP_USERNAME", harness.smart_http.username.clone());
         self.runner
             .register_secret("PROOF_HTTP_PASSWORD", harness.smart_http.password.clone());
         Ok(harness)
+    }
+
+    pub fn start_plain_ssh_transport(
+        &mut self,
+        case_id: &str,
+    ) -> Result<super::transport::SshTransport, LabError> {
+        let case_root = self.case_root(case_id)?;
+        TransportHarness::start_plain_ssh(&case_root, &self.repo_root).map_err(LabError::from)
     }
 
     pub fn run_git(

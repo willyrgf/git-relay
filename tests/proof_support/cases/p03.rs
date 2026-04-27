@@ -16,6 +16,7 @@ pub fn definition() -> CaseDefinition {
             "p03.single_run_contains_upstreams",
             "p03.mixed_terminal_outcomes",
             "p03.deterministic_upstream_order",
+            "p03.persisted_terminal_record_shape",
             "p03.stale_run_superseded",
             "p03.transient_markers_cleaned",
         ],
@@ -245,6 +246,32 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             .unwrap_or(false);
 
     let transient_clean = !in_progress.exists() && !lock_dir.exists();
+    let persisted_run_path = run_dir.join(format!("{run_id}.json"));
+    let persisted_terminal_shape = if !run_id.is_empty() && persisted_run_path.exists() {
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(&persisted_run_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        persisted["run_id"] == run_id
+            && persisted["repo_id"] == AUTHORITATIVE_REPO_ID
+            && persisted["status"] == "completed"
+            && persisted["completed_at_ms"].as_u64().is_some()
+            && persisted["superseded_by"].is_null()
+            && persisted["desired_snapshot"]
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false)
+            && persisted["captured_upstreams"]
+                .as_array()
+                .map(|items| items.len() == 3)
+                .unwrap_or(false)
+            && persisted["upstream_results"]
+                .as_array()
+                .map(|items| items.len() == 3)
+                .unwrap_or(false)
+    } else {
+        false
+    };
 
     report.assertions.push(if capture.success() {
         ProofAssertion::pass(
@@ -292,6 +319,17 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             format!("repo_safety={repo_safety} upstream_states={upstream_states:?}"),
         )
     });
+    report.assertions.push(if persisted_terminal_shape {
+        ProofAssertion::pass(
+            "p03.persisted_terminal_record_shape",
+            Some("persisted terminal run record contains completed status, desired snapshot, captured upstreams, and per-upstream outcomes".to_owned()),
+        )
+    } else {
+        ProofAssertion::fail(
+            "p03.persisted_terminal_record_shape",
+            format!("persisted run record missing or incomplete at {}", persisted_run_path.display()),
+        )
+    });
     report.assertions.push(if stale_superseded {
         ProofAssertion::pass(
             "p03.stale_run_superseded",
@@ -326,6 +364,8 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         "upstream_states": upstream_states,
         "mixed_terminal_outcomes": mixed_terminal_outcomes,
         "ordered": ordered,
+        "persisted_terminal_shape": persisted_terminal_shape,
+        "persisted_run_path": persisted_run_path,
         "stale_superseded": stale_superseded,
         "transient_clean": transient_clean,
     });

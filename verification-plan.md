@@ -23,6 +23,13 @@ The RFC should not move into implementation-driving status until each blocker be
 - a proposed final contract,
 - and an RFC rewrite based on measured behavior.
 
+Current proof-suite narrowing, as of 2026-04-25:
+
+- SSH forced-command ingress is the supported product write-ingress proof boundary.
+- Local smart-HTTP push checks remain proof-lab parity evidence for Git boundary behavior; they do not make smart HTTP push a supported product ingress surface.
+- Release-floor closure requires complete admitted machine-readable P01-P11 evidence plus real per-host supported-platform evidence. Synthetic cross-platform fixtures may validate report ingestion logic, but they do not close the real floor.
+- Provider-admission fixture runs are a policy baseline only. Declared hosted targets require explicit target and credential inputs before their evidence can participate in release admission.
+
 ## Terminology
 
 This plan distinguishes three different properties that should not be collapsed into one word.

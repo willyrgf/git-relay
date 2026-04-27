@@ -14,7 +14,7 @@ For this project, those values must be applied to Git Relay's actual design:
 ## Read First (Non-Negotiables)
 
 - Keep changes small and local; prefer one logical change per commit or PR.
-- If you commit, use a lower-case subject line.
+- If you commit, use a minimal, lower-case, concise summary as the subject line.
 - Treat `git-relay-rfc.md` as the design contract.
 - Treat `verification-plan.md` as the evidence-backed narrowing of that draft contract.
   When the RFC is broader than measured behavior, preserve the narrower verified behavior and update both docs together.

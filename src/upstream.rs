@@ -764,7 +764,9 @@ fn evaluate_same_repo_hidden_refs(
 
 fn hidden_object_oid_probe_applicable(target: &MatrixTargetEntry) -> bool {
     match target.transport {
-        MatrixTargetTransport::Ssh => target.url.starts_with("ssh://"),
+        MatrixTargetTransport::Ssh => {
+            target.url.starts_with("ssh://") || target.url.starts_with("file://")
+        }
         MatrixTargetTransport::SmartHttp => {
             target.url.starts_with("http://") || target.url.starts_with("https://")
         }
@@ -865,6 +867,13 @@ fn local_repo_path_for_same_repo_probe(url: &str) -> Option<PathBuf> {
     let direct = PathBuf::from(url);
     if direct.exists() {
         return Some(direct);
+    }
+
+    if let Some(path) = url.strip_prefix("file://") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
     }
 
     let stripped = url.strip_prefix("ssh://")?;

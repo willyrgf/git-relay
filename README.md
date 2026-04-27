@@ -261,7 +261,7 @@ Under `state_root`:
 - `upstream-probes/release-manifests/<repo>`: admitted release manifests
 - `proof-e2e/<suite>`: RFC proof suite artifacts, including case evidence and redacted failure captures
 - `release/git-conformance/<platform>`: machine-readable Git conformance evidence used by `release report` and retention pinning/pruning
-- `release/hosts`: host version evidence used by `release report`
+- `release/hosts/<platform>/<host_id>`: per-host version evidence used by `release report`
 - `retention/maintenance/<repo>.json`: latest maintenance result per repo
 
 Locks and in-progress markers are advisory only. Recovery does not trust them as truth; it re-derives from repository config, local refs, internal observed refs, and fresh upstream observation when needed.
@@ -356,7 +356,7 @@ git-relay repo repair --config /etc/git-relay/git-relay.toml --repo github.com/e
 git-relay release report --config /etc/git-relay/git-relay.toml --json
 ```
 
-`release report` closes `exact_git_floor` only from admitted machine-readable Git conformance records under `release/git-conformance/<platform>/`.
+`release report` closes `exact_git_floor` only from admitted machine-readable Git conformance records under `release/git-conformance/<platform>/` plus per-host supported-platform evidence under `release/hosts/<platform>/<host_id>/`. Conformance evidence must include the complete mandatory P01-P11 case set.
 
 ## Observability
 
@@ -400,8 +400,10 @@ nix build .#git-relay-ssh-force-command
 nix build .#git-relay-service-templates
 ```
 
-GitHub Actions enforces the release-gate matrix in [`.github/workflows/proof-gates.yml`](./.github/workflows/proof-gates.yml): Linux `full`, macOS `full`, and an explicit provider-admission policy job for declared hosted targets.
-Pure `nix flake check` keeps `rfc-proof-e2e-fast` and `rfc-proof-e2e-full` as static proof-contract checks. The live host-side gate runs through `nix run .#test`, which is the canonical full validation command and now includes provider-admission policy enforcement by default. It uses flake-locked relay binaries plus pinned `git`, `openssh`, `python3`, `cargo`, and `rustc` paths so mandatory localhost SSH and smart-HTTP evidence is collected without falling back to developer tooling. `nix run .#test -- provider-admission fixtures/hosted/targets.json` remains available for targeted provider-admission execution.
+GitHub Actions enforces the release-gate matrix in [`.github/workflows/proof-gates.yml`](./.github/workflows/proof-gates.yml): Linux `full`, macOS `full`, and an explicit provider-admission policy job.
+Pure `nix flake check` keeps `rfc-proof-e2e-fast` and `rfc-proof-e2e-full` as static proof-contract checks. The live host-side gate runs through `nix run .#test`, which is the canonical full validation command and also enforces the provider-admission policy baseline. It uses flake-locked relay binaries plus pinned `git`, `openssh`, `python3`, `cargo`, and `rustc` paths so mandatory localhost SSH forced-command evidence and smart-HTTP proof-lab parity evidence are collected without falling back to developer tooling. Smart-HTTP push remains unsupported as a product ingress surface; the proof bridge is local parity infrastructure only.
+
+Fixture-only provider-admission is a policy baseline, not real declared-target admission evidence. When real hosted targets are declared, CI or release automation must provide explicit target and credential inputs through `GIT_RELAY_PROOF_PROVIDER_TARGETS` and `GIT_RELAY_PROOF_PROVIDER_CREDENTIALS`, or provider admission fails closed. `nix run .#test -- provider-admission fixtures/hosted/targets.json` remains available for targeted provider-admission execution.
 
 ## Current Source-Truth Notes
 

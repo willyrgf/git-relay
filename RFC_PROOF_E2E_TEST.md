@@ -1,6 +1,6 @@
 # RFC Proof E2E Test Plan (Deterministic Rust + Nix)
 
-Status: implementation-driving (partially implemented; remaining-work checklist updated 2026-04-08)  
+Status: implementation-driving (partially implemented; remaining-work checklist updated 2026-04-25)
 Audience: maintainers implementing release-gating proof for `git-relay`
 
 ## 1. Purpose
@@ -14,7 +14,7 @@ This document is the release-gating source of truth for "fully tested" behavior.
 
 The proof contract preserves the non-negotiables:
 
-- Git-first behavior boundaries (`git-receive-pack` / `git-upload-pack` / hooks / smart HTTP)
+- Git-first behavior boundaries (`git-receive-pack` / `git-upload-pack` / hooks, plus test-only smart-HTTP parity)
 - fail-closed validation and policy enforcement
 - local refs as durable authoritative truth
 - deterministic recovery from Git state plus explicit observation
@@ -142,28 +142,28 @@ Worktrees/actors:
 Ingress surfaces:
 
 1. SSH forced-command path (mandatory)
-2. Local smart HTTP path via `git-http-backend` (mandatory)
+2. Local smart-HTTP proof-lab bridge via `git-http-backend` (mandatory parity check, not supported product push ingress)
 
 Transport test servers (mandatory in proof lab):
 
 1. Ephemeral localhost `sshd` process with generated per-run host key and test client key
-2. Ephemeral localhost smart-HTTP process serving `git-http-backend`
+2. Ephemeral localhost smart-HTTP process serving `git-http-backend` for proof-lab parity
 3. Both servers wired to disposable local bare repositories under the suite temp root
 4. Both servers configured without dependence on developer machine credentials
 
 Note:
 
-- smart HTTP ingress remains an explicit deployment feature toggle in product config
-- proof gating still requires it in the test lab to validate Git boundary parity across SSH and smart HTTP
+- smart HTTP push remains outside the supported product ingress surface
+- proof gating still requires the local smart-HTTP bridge in the test lab to validate Git boundary parity where the bridge is exercised
 - containerized remotes are not required for mandatory gates; local disposable directories plus localhost daemons are the baseline
 
 Transport scope contract:
 
 1. SSH coverage is mandatory for all ingress-sensitive cases.
-2. Smart HTTP coverage is mandatory for:
+2. Smart-HTTP proof-lab coverage is mandatory for:
 - read-path parity checks (P07 and any read-sensitive checks in P01-P06/P10)
-- local write-boundary parity checks for P01/P02 in the proof lab
-3. Mandatory smart HTTP proof coverage does not change deployment defaults.
+- local write-boundary happy-path parity checks for P01/P02 in the proof lab
+3. Mandatory smart-HTTP proof coverage does not change deployment defaults or supported product ingress.
 - production enablement remains explicit policy
 - proof coverage exists to validate boundary invariants, not to silently widen product scope
 
@@ -224,7 +224,8 @@ Required checks:
 2. Crash after commit checkpoints preserves committed refs
 3. `post-receive` failure is non-critical for local acceptance
 4. `git fsck --strict` remains clean
-5. SSH and smart HTTP ingress paths both satisfy the same boundary
+5. SSH forced-command ingress satisfies the crash-boundary contract
+6. Smart-HTTP proof-lab bridge satisfies happy-path local write-boundary parity
 
 Pass:
 
@@ -244,8 +245,9 @@ Required checks:
 
 1. Relay guard rejects transmitted invalid updates early
 2. Client-side pruning cases are detected and evidence is explicit
-3. Verdict never claims whole-push local semantics for ordinary native pushes
-4. SSH and smart HTTP transport observations align
+3. Verdict is derived from operator-facing proof/system output, not hardcoded by the case
+4. Verdict never claims whole-push local semantics for ordinary native pushes
+5. SSH and smart-HTTP proof-lab transport observations align for the exercised boundary
 
 Pass:
 
@@ -267,6 +269,7 @@ Required checks:
 2. Upstream attempt order is deterministic
 3. Terminal evidence is kept while transient markers are cleaned
 4. Superseded stale runs are recorded as superseded, not silently discarded
+5. Persisted terminal run-record shape includes the desired snapshot, captured upstream set, per-upstream results, and terminal timestamps
 
 Pass:
 
@@ -307,6 +310,7 @@ Required checks:
 1. Failed non-atomic apply does not mutate observed namespace optimistically
 2. Next run recomputes desired state from current local refs and policy
 3. Later reconcile converges without replaying push history
+4. Partial apply is produced by a real non-atomic upstream outcome, not by a missing-endpoint stall
 
 Pass:
 
@@ -391,6 +395,7 @@ Required checks:
 3. Second rewrite is no-op
 4. Targeted relock only allowed for validated Nix versions and graph shapes
 5. Scope-violation and non-idempotent relock restores original files
+6. Out-of-matrix relock rejection restores original files and leaves no partial mutation
 
 Pass:
 
@@ -433,7 +438,9 @@ Required checks:
 1. matrix runs persist release-manifest evidence
 2. missing/unadmitted targets keep manifest/report open
 3. platform evidence is persisted per supported host
-4. exact floor status closes only when required machine-readable evidence exists
+4. synthetic dual-platform files produced on one host do not close the real release floor
+5. exact floor status closes only when required machine-readable evidence exists for the supported host/platform set
+6. release-manifest ingestion validates declared target coverage, target identity, and provenance
 
 Pass:
 
@@ -462,6 +469,7 @@ Required files:
 9. `manifests/release/` (release evidence snapshots)
 10. `manifests/git-conformance/` (machine-readable Git conformance evidence)
 11. `failures/<case_id>/<step>.{stdout,stderr}.txt` (redacted)
+12. `release/hosts/<platform>/<host_id>.json` (current-host version evidence used for floor closure)
 
 Top-level normalized summary schema:
 
@@ -569,8 +577,10 @@ Usage contract:
 
 1. release reporting ingests only this schema for Git floor closure
 2. exact Git floor remains open if required evidence is missing on any supported platform
-3. evidence without mandatory-case pass status is non-admitting
-4. provider-admission evidence is required for every target declared as supported in release policy
+3. evidence is non-admitting unless it contains exactly the complete mandatory P01-P11 case set with no duplicates and all required cases passing
+4. `all_mandatory_cases_passed=true` is admitted only when the case array proves the complete mandatory set
+5. provider-admission evidence is required for every target declared as supported in release policy
+6. release-manifest ingestion fails closed on missing target coverage, stale schema shape, incomplete target identity, missing provenance, or evidence paths that cannot be read
 
 ## 10. Nix Integration And Check Topology
 
@@ -580,18 +590,19 @@ Required checks:
 
 1. `checks.<system>.rfc-proof-e2e-fast`
 2. `checks.<system>.rfc-proof-e2e-full`
-3. `checks.<system>.rfc-proof-provider-admission`
+3. `checks.<system>.rfc-proof-provider-admission` as a static placeholder-policy check only
 
 Execution contract:
 
 1. `checks.<system>.rfc-proof-e2e-fast` and `checks.<system>.rfc-proof-e2e-full` run in pure Nix derivations and validate the deterministic-core proof contract statically.
 2. live deterministic-core gate runs execute host-side in CI or release automation through a flake app entrypoint (`nix run .#test`) with Nix-built relay binaries and pinned Git/OpenSSH/Python/Cargo/Rustc tool paths, not cargo-bin fallbacks in gate mode.
-- `nix run .#test` is the canonical full deterministic-core validation command and includes provider-admission policy enforcement by default.
+- `nix run .#test` is the canonical full deterministic-core validation command and also enforces the provider-admission policy baseline.
 3. this split is required because mandatory SSH transport proof may fail under sandbox builder accounts that cannot execute the Git command path over SSH, while the release gate still requires the live SSH + smart-HTTP evidence on supported hosts.
-4. SSH and smart HTTP ingress validation are mandatory in deterministic-core modes (`fast` and `full`) for those live host-side gate runs.
+4. SSH forced-command ingress validation and smart-HTTP proof-lab parity validation are mandatory in deterministic-core modes (`fast` and `full`) for those live host-side gate runs.
 5. mandatory transport checks use ephemeral localhost daemons with generated test credentials, not developer host credentials.
 6. `provider-admission` runs through the same flake app entrypoint (`nix run .#test -- provider-admission ...`) and requires explicit target manifest and credentials; if invoked without required inputs it must fail closed with actionable diagnostics.
-- targeted provider-admission invocation remains available even though default `nix run .#test` execution includes provider-admission policy enforcement.
+- fixture-only provider-admission execution is a policy baseline and does not produce real declared-target admission evidence.
+- targeted provider-admission invocation remains available for explicit release inputs and is required when real supported targets are declared.
 
 Mode contract:
 
@@ -615,7 +626,7 @@ Cross-platform release gate:
 1. `full` must pass on at least one supported Linux host
 2. `full` must pass on at least one supported macOS host
 3. `provider-admission` must pass for all declared supported provider targets
-4. release floor closure requires both platform evidence sets admitted plus admitted provider-target evidence
+4. release floor closure requires per-host platform evidence sets admitted plus admitted provider-target evidence
 
 ## 11. Failure Injection And Multi-Upstream Simulation
 
@@ -704,6 +715,10 @@ Completed in the current repository state:
 - [x] M1 harness foundation exists: `tests/rfc_proof_e2e.rs`, `tests/proof_support/*`, raw + normalized artifacts, redaction, and canonical normalization are implemented.
 - [x] P01-P11 case modules exist and run in the proof harness on the current host.
 - [x] `flake.nix` wires `rfc-proof-e2e-fast`, `rfc-proof-e2e-full`, and `rfc-proof-provider-admission`, with deterministic-core flake checks validating the pure contract subset and live host-side proof gates exposed through `nix run .#test` and enforced separately in CI.
+- [x] Transport harness readiness is process-owned: SSH readiness is proven by Git protocol reachability through the configured transport, and smart-HTTP readiness is driven by the child-published bound port plus a health probe.
+- [x] Transport startup failures report the failing component and captured daemon logs in case details.
+- [x] Ingress-sensitive SSH proof cases use the forced-command path; plain SSH is reserved for non-ingress hidden-ref/object probing.
+- [x] Smart-HTTP push coverage is explicitly proof-lab parity, not a supported product push ingress claim.
 
 Addressed from the previous remaining-work checklist:
 
@@ -711,13 +726,17 @@ Addressed from the previous remaining-work checklist:
 - [x] Align `fast` mode with the mandatory-scenarios contract for P01 crash-boundary coverage, or narrow the mode contract if crash-boundary coverage remains `full`-only.
 - [x] Add explicit P02 client-side pruning evidence.
 - [x] Tighten P03 to assert mixed terminal per-upstream outcomes explicitly, not only upstream count and ordering.
+- [x] Tighten P03 to assert the persisted terminal run-record shape.
 - [x] Tighten P04 to assert repository safety degradation explicitly when `require_atomic = true` cannot be admitted.
 - [x] Tighten P05 to prove recovery and later convergence do not depend on replayed push history.
+- [x] Tighten P05 to use a real partial non-atomic apply scenario rather than a missing-endpoint stall.
 - [x] Tighten P06 to assert divergence-marker persistence before repair clears it.
 - [x] Tighten P08 so hidden-object leakage proof is mandatory whenever same-repo hidden-ref admission relies on SSH transport probing.
 - [x] Extend P09 E2E proof to cover scope-violation and non-idempotent relock restore behavior, not only unsupported grammar and unsupported Nix version rejection.
+- [x] Extend P09 E2E proof to assert out-of-matrix restore behavior after fail-closed rejection.
 - [x] Extend P10 E2E proof to cover `/nix/store` runtime env rejection in the release-gating proof suite.
 - [x] Implement release-report ingestion of machine-readable Git conformance evidence and add the positive P11 floor-closure path once that ingestion exists.
+- [x] Narrow P11 so synthetic cross-platform evidence helpers validate report logic but do not claim real release floor closure.
 - [x] Enforce Linux + macOS `full` plus provider-admission policy in CI or release automation, not only in local `flake.nix` wiring.
 - [x] Align case metadata with the section 6 case contract template by declaring required assertions and artifacts explicitly.
 - [x] Align normalization and failure-capture outputs with the documented contract, including `repo_id` semantic ordering, per-step failure capture naming, and deterministic git-conformance timestamps or an explicitly narrowed determinism claim.
@@ -727,8 +746,11 @@ Still required before this RFC proof contract is fully satisfied:
 - [x] Prevent proof artifact persistence of transport auth material and private keys by cleaning or relocating `cases/*/transport-*` lifecycle files from kept suite outputs, and add a fail-closed assertion that no private key material remains in persisted proof artifacts.
 - [x] Enforce full machine-readable Git conformance schema validation in release-report ingestion (fail closed for missing or invalid required fields), not just the current subset used for floor computation.
 - [x] Implement and gate the full proof-artifact retention contract from section 8: raw suite runs, redacted failure captures, non-admitted conformance artifacts (`ttl=720h`, `keep_count=20`), and admitted release evidence pinned until superseded.
+- [x] Pin admitted provider-admission evidence until superseded rather than treating it like ordinary non-admitted conformance evidence.
 - [x] Enforce deterministic harness behavior by explicitly disabling opportunistic Git auto-GC in harness-driven repository/worktree mutations.
 - [x] Align `full` mode contract and implementation by either adding explicit full-only extended crash/retention variants or narrowing the documented `full` mode claims.
+- [x] Require complete mandatory P01-P11 Git conformance evidence before `all_mandatory_cases_passed=true` can admit a release floor input.
+- [x] Store host evidence under per-platform/per-host paths and require real supported-platform host evidence for release floor closure.
 
 ## 13. Validation Matrix (Release Gate vs Extended)
 
@@ -737,7 +759,7 @@ Mandatory release-gate scenarios:
 1. P01-P11 on supported platform hosts
 2. multi-upstream fan-out semantics are mandatory:
 - one local accepted push must drive one reconcile execution unit over a captured upstream set with mixed per-upstream outcomes allowed
-3. ingress-sensitive cases must cover SSH and smart HTTP
+3. ingress-sensitive cases must cover SSH forced-command ingress; smart-HTTP coverage is mandatory proof-lab parity only
 4. machine-readable conformance artifacts must be present and admitted
 5. for every upstream/provider target declared as supported in release policy, conformance evidence is mandatory before admission
 

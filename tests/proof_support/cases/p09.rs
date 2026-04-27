@@ -349,15 +349,18 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
             "unsupported grammar was treated as rewritable migration input",
         )
     });
-    report.assertions.push(if !migrate_bad_nix.success() {
+    report.assertions.push(if !migrate_bad_nix.success() && unsupported_nix_restored {
         ProofAssertion::pass(
             "p09.out_of_matrix_nix.fail_closed",
-            Some("targeted relock refused unsupported nix version".to_owned()),
+            Some("targeted relock refused unsupported nix version and restored original flake files".to_owned()),
         )
     } else {
         ProofAssertion::fail(
             "p09.out_of_matrix_nix.fail_closed",
-            "targeted relock unexpectedly ran outside validated matrix",
+            format!(
+                "targeted relock did not fail closed cleanly: success={} restored={unsupported_nix_restored}",
+                migrate_bad_nix.success()
+            ),
         )
     });
     report.assertions.push(if scope_violation_restored {

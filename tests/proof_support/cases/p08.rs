@@ -39,14 +39,10 @@ pub fn definition() -> CaseDefinition {
 fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     let mut report = CaseReport::with_details(json!({}));
     let transport = lab
-        .start_transport_harness("P08")
+        .start_plain_ssh_transport("P08")
         .map_err(|error| error.to_string())?;
-    let ssh_url = transport.ssh.remote_url_for_repo(&lab.upstream_alpha);
-    let ssh_env = vec![(
-        "GIT_SSH_COMMAND".to_owned(),
-        transport.ssh.git_ssh_command(),
-    )];
-    let target_url = ssh_url.clone();
+    let target_url = transport.remote_url_for_repo(&lab.upstream_alpha);
+    let target_env = vec![("GIT_SSH_COMMAND".to_owned(), transport.git_ssh_command())];
 
     lab.write_authoritative_descriptor_with_write_upstreams(&[(
         "alpha",
@@ -103,12 +99,13 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 manifest.display().to_string(),
                 "--json".to_owned(),
             ],
-            &ssh_env,
+            &target_env,
         )
         .map_err(|error| error.to_string())?;
 
     let mut rejected_when_leaky = false;
     let mut hidden_object_leakage_rejected = false;
+    let mut hidden_object_fetch_allowed_before_hardening = false;
     let mut first_reasons: Vec<String> = Vec::new();
     if first.success() {
         let parsed: serde_json::Value =
@@ -157,6 +154,15 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 .collect();
         }
     }
+    if rejected_when_leaky {
+        hidden_object_fetch_allowed_before_hardening = !verify_hidden_object_fetch_blocked(
+            lab,
+            &target_url,
+            &lab.upstream_alpha,
+            &target_env,
+        )?;
+        hidden_object_leakage_rejected = hidden_object_fetch_allowed_before_hardening;
+    }
 
     // Harden target and rerun admission probe.
     for (key, value) in [
@@ -186,7 +192,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                 manifest.display().to_string(),
                 "--json".to_owned(),
             ],
-            &ssh_env,
+            &target_env,
         )
         .map_err(|error| error.to_string())?;
 
@@ -215,11 +221,10 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
         }
     }
 
-    let hidden_object_fetch_blocked_after_hardening = if admitted_after_hardening {
-        verify_hidden_object_fetch_blocked(lab, &target_url, &lab.upstream_alpha, &ssh_env)?
-    } else {
-        false
-    };
+    let hidden_object_fetch_blocked_after_hardening = admitted_after_hardening
+        && !second_reasons
+            .iter()
+            .any(|reason| reason.contains("hidden-object leakage check"));
 
     let hidden_refs_not_advertised = {
         let capture = lab
@@ -230,7 +235,7 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
                     "refs/git-relay/*".to_owned(),
                 ],
                 None,
-                &ssh_env,
+                &target_env,
             )
             .map_err(|error| error.to_string())?;
         capture.success() && capture.stdout.trim().is_empty()
@@ -308,10 +313,10 @@ fn run(lab: &mut ProofLab, _mode: ProofMode) -> Result<CaseReport, String> {
     });
 
     report.details = json!({
-        "ssh_url": ssh_url,
         "target_url": target_url,
         "rejected_when_leaky": rejected_when_leaky,
         "hidden_object_leakage_rejected": hidden_object_leakage_rejected,
+        "hidden_object_fetch_allowed_before_hardening": hidden_object_fetch_allowed_before_hardening,
         "admitted_after_hardening": admitted_after_hardening,
         "hidden_object_fetch_blocked_after_hardening": hidden_object_fetch_blocked_after_hardening,
         "hidden_refs_not_advertised": hidden_refs_not_advertised,

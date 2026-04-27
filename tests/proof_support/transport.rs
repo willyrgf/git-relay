@@ -1,5 +1,6 @@
 use std::fs;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -46,6 +47,7 @@ pub struct SshTransport {
     pub client_key: PathBuf,
     pub known_hosts: PathBuf,
     pub ssh_bin: PathBuf,
+    pub log_path: PathBuf,
     child: Child,
 }
 
@@ -107,7 +109,12 @@ pub struct TransportHarness {
 }
 
 impl TransportHarness {
-    pub fn start(case_root: &Path, repo_root: &Path) -> Result<Self, TransportError> {
+    pub fn start(
+        case_root: &Path,
+        repo_root: &Path,
+        config_path: &Path,
+        forced_command_wrapper: &Path,
+    ) -> Result<Self, TransportError> {
         let sshd_bin = find_binary("GIT_RELAY_PROOF_SSHD_BIN", "sshd")?;
         let ssh_bin = find_binary("GIT_RELAY_PROOF_SSH_BIN", "ssh")?;
         let ssh_keygen_bin = find_binary("GIT_RELAY_PROOF_SSH_KEYGEN_BIN", "ssh-keygen")?;
@@ -116,25 +123,46 @@ impl TransportHarness {
 
         let ssh = start_sshd(
             case_root,
+            repo_root,
             &sshd_bin,
             &ssh_bin,
             &ssh_keygen_bin,
+            Some((config_path, forced_command_wrapper)),
             current_user(),
         )?;
-        probe_git_ssh_ready(repo_root, &ssh)?;
 
         let smart_http =
             start_smart_http(case_root, repo_root, &python_bin, &git_http_backend_bin)?;
 
         Ok(Self { ssh, smart_http })
     }
+
+    pub fn start_plain_ssh(
+        case_root: &Path,
+        repo_root: &Path,
+    ) -> Result<SshTransport, TransportError> {
+        let sshd_bin = find_binary("GIT_RELAY_PROOF_SSHD_BIN", "sshd")?;
+        let ssh_bin = find_binary("GIT_RELAY_PROOF_SSH_BIN", "ssh")?;
+        let ssh_keygen_bin = find_binary("GIT_RELAY_PROOF_SSH_KEYGEN_BIN", "ssh-keygen")?;
+        start_sshd(
+            case_root,
+            repo_root,
+            &sshd_bin,
+            &ssh_bin,
+            &ssh_keygen_bin,
+            None,
+            current_user(),
+        )
+    }
 }
 
 fn start_sshd(
     case_root: &Path,
+    repo_root: &Path,
     sshd_bin: &Path,
     ssh_bin: &Path,
     ssh_keygen_bin: &Path,
+    forced_command: Option<(&Path, &Path)>,
     user: String,
 ) -> Result<SshTransport, TransportError> {
     let ssh_root = case_root.join("transport-ssh");
@@ -146,7 +174,7 @@ fn start_sshd(
     let host_key = ssh_root.join("host_ed25519");
     let client_key = ssh_root.join("client_ed25519");
     let authorized_keys = ssh_root.join("authorized_keys");
-    let config_path = ssh_root.join("sshd_config");
+    let sshd_config_path = ssh_root.join("sshd_config");
     let log_path = ssh_root.join("sshd.log");
     let known_hosts = ssh_root.join("known_hosts");
     let pid_path = ssh_root.join("sshd.pid");
@@ -180,7 +208,21 @@ fn start_sshd(
             path: client_pub_path.clone(),
             source,
         })?;
-    fs::write(&authorized_keys, client_pub).map_err(|source| TransportError::Write {
+    let authorized_key = if let Some((config_path, forced_command_wrapper)) = forced_command {
+        let forced_command = format!(
+            "{} --config {}",
+            forced_command_wrapper.display(),
+            config_path.display()
+        );
+        format!(
+            "command=\"{}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {}\n",
+            authorized_keys_quote(&forced_command),
+            client_pub.trim(),
+        )
+    } else {
+        format!("{}\n", client_pub.trim())
+    };
+    fs::write(&authorized_keys, authorized_key).map_err(|source| TransportError::Write {
         path: authorized_keys.clone(),
         source,
     })?;
@@ -192,15 +234,15 @@ fn start_sshd(
         pid_file = pid_path.display(),
         authorized_keys = authorized_keys.display(),
     );
-    fs::write(&config_path, config).map_err(|source| TransportError::Write {
-        path: config_path.clone(),
+    fs::write(&sshd_config_path, config).map_err(|source| TransportError::Write {
+        path: sshd_config_path.clone(),
         source,
     })?;
 
-    let mut child = Command::new(sshd_bin)
+    let child = Command::new(sshd_bin)
         .arg("-D")
         .arg("-f")
-        .arg(&config_path)
+        .arg(&sshd_config_path)
         .arg("-E")
         .arg(&log_path)
         .stdin(Stdio::null())
@@ -211,8 +253,6 @@ fn start_sshd(
             program: sshd_bin.display().to_string(),
             source,
         })?;
-
-    wait_for_port(port)?;
 
     let host_pub = fs::read_to_string(format!("{}.pub", host_key.display())).map_err(|source| {
         TransportError::Read {
@@ -228,23 +268,17 @@ fn start_sshd(
         }
     })?;
 
-    if let Some(status) = child.try_wait().map_err(|source| TransportError::Spawn {
-        program: sshd_bin.display().to_string(),
-        source,
-    })? {
-        return Err(TransportError::Readiness {
-            detail: format!("sshd exited early with status {status}"),
-        });
-    }
-
-    Ok(SshTransport {
+    let mut transport = SshTransport {
         port,
         user,
         client_key,
         known_hosts,
         ssh_bin: ssh_bin.to_path_buf(),
+        log_path: log_path.clone(),
         child,
-    })
+    };
+    wait_for_git_ssh_ready(repo_root, &mut transport)?;
+    Ok(transport)
 }
 
 fn start_smart_http(
@@ -260,14 +294,25 @@ fn start_smart_http(
     })?;
 
     let script_path = http_root.join("smart_http_server.py");
+    let ready_path = http_root.join("ready.json");
+    let stdout_path = http_root.join("smart-http.stdout.log");
+    let stderr_path = http_root.join("smart-http.stderr.log");
     fs::write(&script_path, SMART_HTTP_BRIDGE).map_err(|source| TransportError::Write {
         path: script_path.clone(),
         source,
     })?;
 
-    let port = pick_free_port()?;
+    let port = 0u16;
     let username = format!("proof-user-{}", std::process::id());
     let password = format!("proof-pass-{}-{}", std::process::id(), current_time_ms());
+    let stdout = fs::File::create(&stdout_path).map_err(|source| TransportError::Write {
+        path: stdout_path.clone(),
+        source,
+    })?;
+    let stderr = fs::File::create(&stderr_path).map_err(|source| TransportError::Write {
+        path: stderr_path.clone(),
+        source,
+    })?;
 
     let mut child = Command::new(python_bin)
         .arg(&script_path)
@@ -276,25 +321,23 @@ fn start_smart_http(
         .arg(&username)
         .arg(&password)
         .arg(git_http_backend_bin)
+        .arg(&ready_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|source| TransportError::Spawn {
             program: python_bin.display().to_string(),
             source,
         })?;
 
-    wait_for_port(port)?;
-
-    if let Some(status) = child.try_wait().map_err(|source| TransportError::Spawn {
-        program: python_bin.display().to_string(),
-        source,
-    })? {
-        return Err(TransportError::Readiness {
-            detail: format!("smart-http bridge exited early with status {status}"),
-        });
-    }
+    let port = wait_for_smart_http_ready(
+        &mut child,
+        python_bin,
+        &ready_path,
+        &stdout_path,
+        &stderr_path,
+    )?;
 
     Ok(SmartHttpTransport {
         port,
@@ -374,39 +417,54 @@ fn run_command(program: &Path, args: &[String]) -> Result<(), TransportError> {
     })
 }
 
-fn probe_git_ssh_ready(repo_root: &Path, ssh: &SshTransport) -> Result<(), TransportError> {
+fn wait_for_git_ssh_ready(repo_root: &Path, ssh: &mut SshTransport) -> Result<(), TransportError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     let probe_repo = repo_root.join("relay-authoritative.git");
-    let output = Command::new("git")
-        .env("GIT_SSH_COMMAND", ssh.git_ssh_command())
-        .arg("ls-remote")
-        .arg(ssh.remote_url_for_repo(&probe_repo))
-        .arg("HEAD")
-        .output()
-        .map_err(|source| TransportError::Spawn {
-            program: "git".to_owned(),
-            source,
-        })?;
+    let mut last_detail = String::new();
+    while Instant::now() < deadline {
+        if let Some(status) = ssh
+            .child
+            .try_wait()
+            .map_err(|source| TransportError::Spawn {
+                program: "sshd".to_owned(),
+                source,
+            })?
+        {
+            return Err(TransportError::Readiness {
+                detail: format!(
+                    "ssh forced-command daemon exited early with status {status}; {}",
+                    read_log_detail("sshd.log", &ssh.log_path)
+                ),
+            });
+        }
 
-    if output.status.success() {
-        return Ok(());
+        let output = Command::new("git")
+            .env("GIT_SSH_COMMAND", ssh.git_ssh_command())
+            .arg("ls-remote")
+            .arg(ssh.remote_url_for_repo(&probe_repo))
+            .arg("HEAD")
+            .output()
+            .map_err(|source| TransportError::Spawn {
+                program: "git".to_owned(),
+                source,
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_detail = summarize_process_output(&output.stdout, &output.stderr);
+        thread::sleep(Duration::from_millis(75));
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if stderr.is_empty() && stdout.is_empty() {
-        "git ls-remote over SSH failed without output".to_owned()
-    } else if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{stderr} | {stdout}")
-    };
 
     Err(TransportError::Readiness {
         detail: format!(
-            "git-over-ssh readiness probe against {} failed: {detail}",
-            probe_repo.display()
+            "ssh forced-command readiness probe against {} timed out; last probe: {}; {}",
+            probe_repo.display(),
+            if last_detail.is_empty() {
+                "no process output".to_owned()
+            } else {
+                last_detail
+            },
+            read_log_detail("sshd.log", &ssh.log_path)
         ),
     })
 }
@@ -425,18 +483,110 @@ fn pick_free_port() -> Result<u16, TransportError> {
     Ok(address.port())
 }
 
-fn wait_for_port(port: u16) -> Result<(), TransportError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+fn wait_for_smart_http_ready(
+    child: &mut Child,
+    program: &Path,
+    ready_path: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<u16, TransportError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return Ok(());
+        if let Some(status) = child.try_wait().map_err(|source| TransportError::Spawn {
+            program: program.display().to_string(),
+            source,
+        })? {
+            return Err(TransportError::Readiness {
+                detail: format!(
+                    "smart-http bridge exited early with status {status}; {}; {}",
+                    read_log_detail("stdout", stdout_path),
+                    read_log_detail("stderr", stderr_path)
+                ),
+            });
+        }
+        if ready_path.exists() {
+            let source = fs::read_to_string(ready_path).map_err(|source| TransportError::Read {
+                path: ready_path.to_path_buf(),
+                source,
+            })?;
+            let port = parse_ready_port(&source).ok_or_else(|| TransportError::Readiness {
+                detail: format!(
+                    "smart-http bridge wrote malformed readiness file {}; {}; {}",
+                    ready_path.display(),
+                    read_log_detail("stdout", stdout_path),
+                    read_log_detail("stderr", stderr_path)
+                ),
+            })?;
+            if probe_http_ready(port).is_ok() {
+                return Ok(port);
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
     Err(TransportError::Readiness {
-        detail: format!("port {port} did not become reachable before timeout"),
+        detail: format!(
+            "smart-http bridge did not publish readiness before timeout; {}; {}",
+            read_log_detail("stdout", stdout_path),
+            read_log_detail("stderr", stderr_path)
+        ),
     })
+}
+
+fn parse_ready_port(source: &str) -> Option<u16> {
+    let parsed: serde_json::Value = serde_json::from_str(source).ok()?;
+    parsed.get("port")?.as_u64()?.try_into().ok()
+}
+
+fn probe_http_ready(port: u16) -> Result<(), std::io::Error> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(
+        b"GET /__git_relay_ready__ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    if response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "smart-http readiness endpoint returned non-200",
+        ))
+    }
+}
+
+fn summarize_process_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    if stderr.is_empty() && stdout.is_empty() {
+        String::new()
+    } else if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stderr} | {stdout}")
+    }
+}
+
+fn read_log_detail(label: &str, path: &Path) -> String {
+    let source = fs::read_to_string(path).unwrap_or_default();
+    let tail = source
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tail.trim().is_empty() {
+        format!("{label} {} is empty", path.display())
+    } else {
+        format!("{label} {}:\n{tail}", path.display())
+    }
+}
+
+fn authorized_keys_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn current_user() -> String {
@@ -474,16 +624,18 @@ fn current_time_ms() -> u128 {
 
 const SMART_HTTP_BRIDGE: &str = r#"#!/usr/bin/env python3
 import base64
+import json
 import os
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 repo_root = sys.argv[1]
-port = int(sys.argv[2])
+requested_port = int(sys.argv[2])
 username = sys.argv[3]
 password = sys.argv[4]
 backend = sys.argv[5]
+ready_path = sys.argv[6]
 
 expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
 
@@ -498,6 +650,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def handle_all(self):
+        if self.path == "/__git_relay_ready__":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ready\n")
+            return
+
         auth = self.headers.get("Authorization", "")
         if auth != expected:
             self.send_response(401)
@@ -562,5 +720,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+httpd = HTTPServer(("127.0.0.1", requested_port), Handler)
+actual_port = httpd.server_address[1]
+with open(ready_path, "w", encoding="utf-8") as fh:
+    json.dump({"port": actual_port}, fh)
+    fh.write("\n")
+httpd.serve_forever()
 "#;

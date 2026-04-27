@@ -8,8 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{AppConfig, RepositoryDescriptor, ServiceManager, SupportedPlatform};
+use crate::config::{
+    AppConfig, RepositoryDescriptor, RepositoryMode, ServiceManager, SupportedPlatform,
+};
 use crate::migration::validated_targeted_relock_nix_versions;
+use crate::upstream::MatrixTargetManifest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +23,7 @@ pub enum FloorStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostVersionEvidence {
+    pub host_id: String,
     pub platform: SupportedPlatform,
     pub service_manager: ServiceManager,
     pub observed_git_version: String,
@@ -78,6 +82,8 @@ pub enum ReleaseError {
     },
     #[error("invalid git conformance evidence at {path}: {detail}", path = path.display())]
     InvalidGitConformanceEvidence { path: PathBuf, detail: String },
+    #[error("invalid release manifest evidence at {path}: {detail}", path = path.display())]
+    InvalidReleaseManifest { path: PathBuf, detail: String },
     #[error("failed to spawn {program} with args {args:?}: {error}")]
     SpawnCommand {
         program: String,
@@ -101,6 +107,7 @@ pub fn build_release_conformance_report(
 ) -> Result<ReleaseConformanceReport, ReleaseError> {
     let generated_at_ms = current_time_ms();
     let current_host = HostVersionEvidence {
+        host_id: detect_host_id(),
         platform: config.deployment.platform,
         service_manager: config.deployment.service_manager,
         observed_git_version: read_command(
@@ -119,13 +126,15 @@ pub fn build_release_conformance_report(
     };
     persist_host_evidence(&config.paths.state_root, &current_host)?;
     let mut platform_evidence = load_host_evidence(&config.paths.state_root)?;
-    platform_evidence
-        .sort_by(|left, right| platform_label(left.platform).cmp(platform_label(right.platform)));
-    let git_conformance = load_git_conformance_evidence(&config.paths.state_root)?;
-    let exact_git_floor = exact_git_floor_from_evidence(&git_conformance);
+    platform_evidence.sort_by(|left, right| {
+        platform_label(left.platform)
+            .cmp(platform_label(right.platform))
+            .then_with(|| left.host_id.cmp(&right.host_id))
+    });
 
     let selected = descriptors
         .iter()
+        .filter(|descriptor| descriptor.mode == RepositoryMode::Authoritative)
         .filter(|descriptor| target_repo.is_none_or(|repo_id| descriptor.repo_id == repo_id))
         .collect::<Vec<_>>();
     let repo_manifests = selected
@@ -143,6 +152,12 @@ pub fn build_release_conformance_report(
         && platform_evidence
             .iter()
             .any(|entry| entry.platform == SupportedPlatform::Linux);
+    let git_conformance = load_git_conformance_evidence(&config.paths.state_root)?;
+    let exact_git_floor = if supported_platforms_complete {
+        exact_git_floor_from_evidence(&git_conformance)
+    } else {
+        None
+    };
     let nix_versions_validated = platform_evidence.iter().all(|entry| {
         validated_targeted_relock_nix_versions()
             .iter()
@@ -184,7 +199,7 @@ pub fn build_release_conformance_report(
         platform_evidence,
         repo_manifests,
         exact_git_floor: exact_git_floor.clone(),
-        exact_git_floor_status: if exact_git_floor.is_some() {
+        exact_git_floor_status: if exact_git_floor.is_some() && all_manifests_admitted {
             FloorStatus::Closed
         } else {
             FloorStatus::Open
@@ -208,7 +223,7 @@ fn persist_host_evidence(
     state_root: &Path,
     evidence: &HostVersionEvidence,
 ) -> Result<(), ReleaseError> {
-    let path = host_evidence_path(state_root, evidence.platform);
+    let path = host_evidence_path(state_root, evidence.platform, &evidence.host_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| ReleaseError::CreateDir {
             path: parent.to_path_buf(),
@@ -242,20 +257,36 @@ fn load_host_evidence(state_root: &Path) -> Result<Vec<HostVersionEvidence>, Rel
             error,
         })?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+        if path.is_dir() {
+            for nested in fs::read_dir(&path).map_err(|error| ReleaseError::Read {
+                path: path.clone(),
+                error,
+            })? {
+                let nested = nested.map_err(|error| ReleaseError::Read {
+                    path: path.clone(),
+                    error,
+                })?;
+                let nested_path = nested.path();
+                if nested_path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    evidence.push(read_host_evidence_file(&nested_path)?);
+                }
+            }
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            evidence.push(read_host_evidence_file(&path)?);
         }
-        let source = fs::read_to_string(&path).map_err(|error| ReleaseError::Read {
-            path: path.clone(),
-            error,
-        })?;
-        let parsed = serde_json::from_str(&source).map_err(|error| ReleaseError::ParseJson {
-            path: path.clone(),
-            error,
-        })?;
-        evidence.push(parsed);
     }
     Ok(evidence)
+}
+
+fn read_host_evidence_file(path: &Path) -> Result<HostVersionEvidence, ReleaseError> {
+    let source = fs::read_to_string(path).map_err(|error| ReleaseError::Read {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    serde_json::from_str(&source).map_err(|error| ReleaseError::ParseJson {
+        path: path.to_path_buf(),
+        error,
+    })
 }
 
 fn load_git_conformance_evidence(
@@ -427,6 +458,7 @@ fn validate_git_conformance_evidence(
         });
     }
     let mut seen_case_ids = BTreeSet::new();
+    let mut case_status_by_id = BTreeMap::new();
     for case in &evidence.cases {
         if case.case_id.trim().is_empty() {
             return Err(ReleaseError::InvalidGitConformanceEvidence {
@@ -440,6 +472,21 @@ fn validate_git_conformance_evidence(
                 detail: format!("duplicate case_id {} in cases", case.case_id),
             });
         }
+        case_status_by_id.insert(case.case_id.clone(), case.status);
+    }
+    let missing_mandatory = mandatory_case_ids()
+        .iter()
+        .filter(|case_id| !seen_case_ids.contains(**case_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_mandatory.is_empty() {
+        return Err(ReleaseError::InvalidGitConformanceEvidence {
+            path: path.to_path_buf(),
+            detail: format!(
+                "cases missing mandatory case ids {}",
+                missing_mandatory.join(", ")
+            ),
+        });
     }
     if evidence.all_mandatory_cases_passed
         && evidence
@@ -453,6 +500,26 @@ fn validate_git_conformance_evidence(
                 "all_mandatory_cases_passed=true conflicted with at least one failing case status"
                     .to_owned(),
         });
+    }
+    if evidence.all_mandatory_cases_passed {
+        let failing_mandatory = mandatory_case_ids()
+            .iter()
+            .filter(|case_id| {
+                case_status_by_id
+                    .get(**case_id)
+                    .is_some_and(|status| *status == StoredGitConformanceCaseStatus::Fail)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !failing_mandatory.is_empty() {
+            return Err(ReleaseError::InvalidGitConformanceEvidence {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "all_mandatory_cases_passed=true conflicted with failing mandatory cases {}",
+                    failing_mandatory.join(", ")
+                ),
+            });
+        }
     }
     if evidence.normalized_summary_sha256.trim().is_empty() {
         return Err(ReleaseError::InvalidGitConformanceEvidence {
@@ -548,6 +615,7 @@ fn load_repo_manifest_summary(
             path: path.clone(),
             error,
         })?;
+    validate_stored_release_manifest(&path, repo_id, &manifest)?;
     let admitted_entries = manifest
         .entries
         .iter()
@@ -562,6 +630,200 @@ fn load_repo_manifest_summary(
         admitted_entries,
         total_entries: manifest.entries.len(),
     })
+}
+
+fn validate_stored_release_manifest(
+    path: &Path,
+    repo_id: &str,
+    manifest: &StoredReleaseManifest,
+) -> Result<(), ReleaseError> {
+    if manifest.repo_id != repo_id {
+        return Err(invalid_release_manifest(
+            path,
+            format!(
+                "payload repo_id {} did not match selected repo_id {}",
+                manifest.repo_id, repo_id
+            ),
+        ));
+    }
+    if manifest.generated_at_ms == 0 {
+        return Err(invalid_release_manifest(
+            path,
+            "generated_at_ms must be non-zero".to_owned(),
+        ));
+    }
+    if manifest.repo_path.as_os_str().is_empty()
+        || manifest.manifest_path.as_os_str().is_empty()
+        || manifest.probe_run_id.trim().is_empty()
+        || manifest.probe_run_path.as_os_str().is_empty()
+    {
+        return Err(invalid_release_manifest(
+            path,
+            "manifest provenance fields must not be empty".to_owned(),
+        ));
+    }
+    if !manifest.manifest_path.exists() {
+        return Err(invalid_release_manifest(
+            path,
+            format!(
+                "declared target manifest {} is missing",
+                manifest.manifest_path.display()
+            ),
+        ));
+    }
+    if !manifest.probe_run_path.exists() {
+        return Err(invalid_release_manifest(
+            path,
+            format!(
+                "probe run evidence {} is missing",
+                manifest.probe_run_path.display()
+            ),
+        ));
+    }
+    if manifest.entries.is_empty() {
+        return Err(invalid_release_manifest(
+            path,
+            "entries must not be empty".to_owned(),
+        ));
+    }
+    let computed_all_admitted = manifest.entries.iter().all(|entry| entry.admitted);
+    if manifest.all_entries_admitted != computed_all_admitted {
+        return Err(invalid_release_manifest(
+            path,
+            format!(
+                "all_entries_admitted={} did not match entry admission state {}",
+                manifest.all_entries_admitted, computed_all_admitted
+            ),
+        ));
+    }
+
+    let source =
+        fs::read_to_string(&manifest.manifest_path).map_err(|error| ReleaseError::Read {
+            path: manifest.manifest_path.clone(),
+            error,
+        })?;
+    let declared: MatrixTargetManifest =
+        serde_json::from_str(&source).map_err(|error| ReleaseError::ParseJson {
+            path: manifest.manifest_path.clone(),
+            error,
+        })?;
+    if declared.schema_version != 1 {
+        return Err(invalid_release_manifest(
+            path,
+            format!(
+                "declared target manifest schema_version {} is unsupported",
+                declared.schema_version
+            ),
+        ));
+    }
+    if declared.targets.is_empty() {
+        return Err(invalid_release_manifest(
+            path,
+            "declared target manifest must contain at least one target".to_owned(),
+        ));
+    }
+
+    let mut declared_by_id = BTreeMap::new();
+    for target in declared.targets {
+        if target.target_id.trim().is_empty() {
+            return Err(invalid_release_manifest(
+                path,
+                "declared target_id must not be empty".to_owned(),
+            ));
+        }
+        if declared_by_id
+            .insert(target.target_id.clone(), target)
+            .is_some()
+        {
+            return Err(invalid_release_manifest(
+                path,
+                "declared target manifest contains duplicate target_id".to_owned(),
+            ));
+        }
+    }
+
+    let mut entry_ids = BTreeSet::new();
+    for entry in &manifest.entries {
+        if entry.target_id.trim().is_empty()
+            || entry.product.trim().is_empty()
+            || entry.url.trim().is_empty()
+            || entry.evidence_path.as_os_str().is_empty()
+        {
+            return Err(invalid_release_manifest(
+                path,
+                "entry target identity and evidence_path fields must not be empty".to_owned(),
+            ));
+        }
+        if !entry.evidence_path.exists() {
+            return Err(invalid_release_manifest(
+                path,
+                format!(
+                    "entry evidence_path {} is missing",
+                    entry.evidence_path.display()
+                ),
+            ));
+        }
+        if entry
+            .admission_reasons
+            .iter()
+            .any(|reason| reason.trim().is_empty())
+        {
+            return Err(invalid_release_manifest(
+                path,
+                format!(
+                    "entry target_id {} contains an empty admission reason",
+                    entry.target_id
+                ),
+            ));
+        }
+        if !entry_ids.insert(entry.target_id.clone()) {
+            return Err(invalid_release_manifest(
+                path,
+                format!("duplicate entry target_id {}", entry.target_id),
+            ));
+        }
+        let Some(target) = declared_by_id.get(&entry.target_id) else {
+            return Err(invalid_release_manifest(
+                path,
+                format!(
+                    "entry target_id {} is not present in declared target manifest",
+                    entry.target_id
+                ),
+            ));
+        };
+        if entry.product != target.product
+            || entry.class != target.class
+            || entry.transport != target.transport
+            || entry.url != target.url
+            || entry.require_atomic != target.require_atomic
+            || entry.same_repo_hidden_refs != target.same_repo_hidden_refs
+        {
+            return Err(invalid_release_manifest(
+                path,
+                format!(
+                    "entry target_id {} identity no longer matches declared target manifest",
+                    entry.target_id
+                ),
+            ));
+        }
+    }
+
+    let declared_ids = declared_by_id.keys().cloned().collect::<BTreeSet<_>>();
+    if entry_ids != declared_ids {
+        return Err(invalid_release_manifest(
+            path,
+            "release manifest entry coverage does not match declared targets".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn invalid_release_manifest(path: &Path, detail: String) -> ReleaseError {
+    ReleaseError::InvalidReleaseManifest {
+        path: path.to_path_buf(),
+        detail,
+    }
 }
 
 fn git_binary() -> PathBuf {
@@ -602,11 +864,33 @@ fn read_command(program: &str, args: &[String]) -> Result<String, ReleaseError> 
     })
 }
 
-fn host_evidence_path(state_root: &Path, platform: SupportedPlatform) -> PathBuf {
+fn host_evidence_path(state_root: &Path, platform: SupportedPlatform, host_id: &str) -> PathBuf {
     state_root
         .join("release")
         .join("hosts")
-        .join(format!("{}.json", platform_label(platform)))
+        .join(platform_label(platform))
+        .join(format!("{}.json", sanitize_path_component(host_id)))
+}
+
+fn detect_host_id() -> String {
+    if let Ok(value) = std::env::var("GIT_RELAY_HOST_ID") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+
+    let output = Command::new("hostname").output();
+    if let Ok(capture) = output {
+        if capture.status.success() {
+            let value = String::from_utf8_lossy(&capture.stdout).trim().to_owned();
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+
+    "unknown-host".to_owned()
 }
 
 fn sanitize_path_component(value: &str) -> String {
@@ -648,16 +932,38 @@ fn current_time_ms() -> u128 {
         .as_millis()
 }
 
+fn mandatory_case_ids() -> [&'static str; 11] {
+    [
+        "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10", "P11",
+    ]
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredReleaseManifest {
+    generated_at_ms: u128,
+    repo_id: String,
+    repo_path: PathBuf,
+    manifest_path: PathBuf,
+    probe_run_id: String,
+    probe_run_path: PathBuf,
     all_entries_admitted: bool,
-    #[serde(default)]
     entries: Vec<StoredReleaseManifestEntry>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredReleaseManifestEntry {
+    target_id: String,
+    product: String,
+    class: crate::upstream::MatrixTargetClass,
+    transport: crate::upstream::MatrixTargetTransport,
+    url: String,
+    require_atomic: bool,
+    same_repo_hidden_refs: bool,
     admitted: bool,
+    evidence_path: PathBuf,
+    admission_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
